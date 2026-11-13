@@ -762,6 +762,7 @@ func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (in
 	if err != nil {
 		return 0, nil, nil, err
 	}
+	setChromeHeaders(req.Header)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -794,36 +795,116 @@ func flattenFHeaders(h fhttp.Header) map[string]string {
 // 取回音乐/视频产物要用它去 hNvQHb 拿这次生成的历史。
 func extractConversationID(raw string) string {
 	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "[[") {
-			continue
-		}
-		var arr []interface{}
-		if json.Unmarshal([]byte(line), &arr) != nil {
-			continue
-		}
-		for _, it := range arr {
-			row, ok := it.([]interface{})
-			if !ok || len(row) < 3 || row[0] != "wrb.fr" {
-				continue
-			}
-			payload, ok := row[2].(string)
-			if !ok {
-				continue
-			}
-			var inner []interface{}
-			if json.Unmarshal([]byte(payload), &inner) != nil || len(inner) < 2 {
-				continue
-			}
-			meta, ok := inner[1].([]interface{})
-			if ok && len(meta) > 0 {
-				if cid, ok := meta[0].(string); ok && cid != "" {
-					return cid
-				}
-			}
+		if c := convIDInLine(line); c != "" {
+			return c
 		}
 	}
 	return ""
+}
+
+// convIDInLine 从单行 wrb.fr 里取会话 id，取不到返回 ""。
+func convIDInLine(line string) string {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "[[") {
+		return ""
+	}
+	var arr []interface{}
+	if json.Unmarshal([]byte(line), &arr) != nil {
+		return ""
+	}
+	for _, it := range arr {
+		row, ok := it.([]interface{})
+		if !ok || len(row) < 3 || row[0] != "wrb.fr" {
+			continue
+		}
+		payload, ok := row[2].(string)
+		if !ok {
+			continue
+		}
+		var inner []interface{}
+		if json.Unmarshal([]byte(payload), &inner) != nil || len(inner) < 2 {
+			continue
+		}
+		if cid, _ := convIDFromPayload(inner); cid != "" {
+			return cid
+		}
+	}
+	return ""
+}
+
+// convIDFromPayload 从一个已解码的 wrb.fr 内层数组里取 cid（[1][0] 位置）。
+// 幽灵会话的 cid 也在这里 —— 服务端在首帧就写死了它，正文能不能加载是另一回事。
+func convIDFromPayload(inner []interface{}) (string, bool) {
+	meta, ok := inner[1].([]interface{})
+	if !ok || len(meta) == 0 {
+		return "", false
+	}
+	cid, ok := meta[0].(string)
+	if !ok || cid == "" {
+		return "", false
+	}
+	return cid, true
+}
+
+// phantomCleanup 收集一次 streamGenerateOnce 里出现过的所有 cid，收尾统一删。
+//
+// 为什么挂 defer 而不只在 200 分支删：服务端建幽灵会话跟请求结果无关 —— 带附件
+// （message.txt 上溢）或 mode-8 时，temporary_chat(inner[45]=1) 照样被服务端落一条
+// 「hNvQHb 报 1167、打不开」的索引残片。它只认响应帧里的 c_xxx，不认 HTTP 状态。
+// 客户端断开 / 上游超时 / 出错话术等任何 return 路径，只要首帧已带 c_xxx 就要删。
+//
+// 线程安全：feed 只在请求 goroutine 里调，flush 由 defer 在返回前调一次，删是 go 出去
+// 的 best-effort。同一 cid 只删一次（map 去重）。
+type phantomCleanup struct {
+	enabled bool
+	cids    map[string]bool
+	proxy   string
+	// creds 每次删除前按最新值取：400/XSRF 自愈拿到新 token 后会更新 xsrfToken，
+	// 用闭包取到的总是当前值，不会拿到上游已拒的旧 token。
+	creds func() (cookie, sapisid, xsrf string, authuser int)
+}
+
+// phantomCleanupFunc 构造收尾器。条件：(TemporaryChat||AutoDeleteConversation) &&
+// !MultiTurn && cookie!="" —— 这就是「这条会话本来就不该留在账号里」的充要条件。
+// multi_turn 开着时整个返回 no-op（会话要留给续接）。xsrf 拿不到时也退化成 no-op。
+// creds 由调用方闭包提供，flush 时按需取最新 cookie/XSRF（XSRF 可能被自愈换掉）。
+func phantomCleanupFunc(creds func() (cookie, sapisid, xsrf string, authuser int), proxyURL string) *phantomCleanup {
+	cookie, _, xsrf, _ := creds()
+	p := &phantomCleanup{proxy: proxyURL, creds: creds}
+	p.enabled = (rtCfg().TemporaryChat || rtCfg().AutoDeleteConversation) && !rtCfg().MultiTurn && cookie != "" && xsrf != ""
+	return p
+}
+
+// feed 吃进一段 raw 响应（可多次调，每次一段）。cid 提取即存即去重。
+func (p *phantomCleanup) feed(raw string) {
+	if !p.enabled || raw == "" {
+		return
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		if c := convIDInLine(line); c != "" {
+			if p.cids == nil {
+				p.cids = map[string]bool{}
+			}
+			p.cids[c] = true
+			break // 一行一个 payload，拿到就换下一行
+		}
+	}
+}
+
+// deleteConversationFn 是删会话的实现，测试打桩观察 GzXR5e 是否发出。
+var deleteConversationFn = deleteConversation
+
+// flush 在请求返回前调一次，把收集到的 cid 逐条 GzXR5e 删掉（异步）。
+// 幂等：多次调用无副作用（map 只在 feed 里写，这里只读）。
+func (p *phantomCleanup) flush() {
+	if !p.enabled || len(p.cids) == 0 {
+		return
+	}
+	cookie, sapisid, xsrf, authuser := p.creds()
+	for cid := range p.cids {
+		logf("[phantom] 删残留会话 %s", cid)
+		go deleteConversationFn(cid, cookie, sapisid, xsrf, p.proxy, authuser)
+	}
 }
 
 // artifactSeen 判断这份字节是不是已经收过（按内容比，收掉同图不同 token 的重复）。

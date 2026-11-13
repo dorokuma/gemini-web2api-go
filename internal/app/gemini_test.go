@@ -16,6 +16,7 @@ func TestModelHeader(t *testing.T) {
 		{"gemini-3.6-flash", hexFlash36},
 		{"gemini-3.5-flash-lite", hexFlashLite},
 		{"gemini-3.1-pro", hexPro31},
+		{"gemini-4-argon", hexArgon4},
 	}
 	for _, c := range cases {
 		name, mc, err := resolveModel(c.name)

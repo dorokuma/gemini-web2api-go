@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -71,7 +72,7 @@ func mcpGenerateMedia(model, prompt string, refs []string) (map[string]interface
 		}
 		images = append(images, img)
 	}
-	_, _, res, err := callGemini(prompt, prompt, mc, nil, images, nil, nil)
+	_, _, res, err := callGemini(context.Background(), prompt, promptCtx{Latest: prompt}, mc, nil, images, nil, nil)
 	if err != nil {
 		return nil, err
 	}

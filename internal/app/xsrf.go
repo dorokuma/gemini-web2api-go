@@ -29,14 +29,22 @@ var (
 )
 
 type xsrfEntry struct {
-	token   string
-	pushID  string // 上传文件用的 Push-ID 头
-	pctx    string // 上传文件用的 X-Client-Pctx 头
-	fetched time.Time
+	token      string
+	pushID     string // 上传文件用的 Push-ID 头
+	pctx       string // 上传文件用的 X-Client-Pctx 头
+	fetched    time.Time
+	refreshing bool // 后台刷新正在飞，避免并发请求重复抓页面
 }
 
 // 页面上的 token 没写明有效期，取个保守值定期重取。
 const xsrfTTL = 20 * time.Minute
+
+// xsrfRefreshAfter 之后命中缓存时照常返回，但在后台重抓一次页面。
+//
+// /app 页面约 770KB，抓一次 1-3 秒，不能放在请求的关键路径上；但同步重抓顺带
+// 起到「cookie 还活着吗」的探测作用（失效的号抓不到 SNlM0e）。后台刷新把这个探测
+// 挪出关键路径：刷新失败就丢掉缓存，下一个请求同步重取时照样报出失效、走换号逻辑。
+const xsrfRefreshAfter = 5 * time.Minute
 
 var snlm0eRe = regexp.MustCompile(`"SNlM0e":"([^"]{10,200})"`)
 
@@ -46,8 +54,18 @@ var pushIDRe = regexp.MustCompile(`"qKIAYe":"([^"]{4,400})"`)
 var pctxRe = regexp.MustCompile(`"Ylro7b":"([^"]{4,400})"`)
 
 // cookieKey 用 cookie 的短摘要当缓存键，避免把整串凭证塞进 map key。
+//
+// 摘要只取账号身份（SAPISID + __Secure-1PSID，见 cookieIdentity），不取整串：
+// 上游几乎每个响应都刷新 *SIDCC，streamGenerate 合并 Set-Cookie 后写回账号，
+// 按整串取键的话下一个请求必然 miss，每次都要多抓一次 /app 页面（实测登录态每个
+// 请求多出约 0.9 秒，且不计入 ttfb_ms / total_ms）。token 跟会话绑定、不跟 SIDCC
+// 绑定；真过期了上游回 xsrf 错误，调用方 invalidate 后重取。
 func cookieKey(cookie string) string {
-	sum := sha1.Sum([]byte(cookie))
+	id := cookieIdentity(cookie)
+	if id == "|" { // 两项都没有：退回整串，至少不同 cookie 不会撞键
+		id = cookie
+	}
+	sum := sha1.Sum([]byte(id))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -91,12 +109,9 @@ func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
 	}
 	key := xsrfKey(cookie, authuser)
 
-	xsrfMu.Lock()
-	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
-		xsrfMu.Unlock()
+	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL); ok {
 		return e.token, nil
 	}
-	xsrfMu.Unlock()
 
 	e, err := fetchAppTokens(cookie, authuser, proxyURL)
 	if err != nil {
@@ -108,16 +123,48 @@ func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
 	return e.token, nil
 }
 
+// cachedAppTokens 返回未过期的缓存项；过了 xsrfRefreshAfter 时顺带踢一次后台刷新。
+func cachedAppTokens(key, cookie string, authuser int, proxyURL string) (xsrfEntry, bool) {
+	xsrfMu.Lock()
+	defer xsrfMu.Unlock()
+	e, ok := xsrfCache[key]
+	if !ok || time.Since(e.fetched) >= xsrfTTL {
+		return xsrfEntry{}, false
+	}
+	if !e.refreshing && time.Since(e.fetched) >= xsrfRefreshAfter {
+		e.refreshing = true
+		xsrfCache[key] = e
+		go refreshAppTokens(key, cookie, authuser, proxyURL)
+	}
+	return e, true
+}
+
+// refreshAppTokens 后台重抓页面。失败就丢掉缓存，让下一个请求同步重取并报出失效。
+func refreshAppTokens(key, cookie string, authuser int, proxyURL string) {
+	if err := storeAppTokens(key, cookie, authuser, proxyURL); err != nil {
+		logf("[xsrf] 后台刷新失败，已作废缓存: %v", err)
+	}
+}
+
+func storeAppTokens(key, cookie string, authuser int, proxyURL string) error {
+	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+	xsrfMu.Lock()
+	defer xsrfMu.Unlock()
+	if err != nil {
+		delete(xsrfCache, key)
+		return err
+	}
+	xsrfCache[key] = e
+	return nil
+}
+
 // getUploadTokens 取上传要用的 Push-ID / X-Client-Pctx，跟 XSRF token 同一份缓存。
 func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx string, err error) {
 	key := xsrfKey(cookie, authuser)
 
-	xsrfMu.Lock()
-	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
-		xsrfMu.Unlock()
+	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL); ok {
 		return e.pushID, e.pctx, nil
 	}
-	xsrfMu.Unlock()
 
 	e, err := fetchAppTokens(cookie, authuser, proxyURL)
 	if err != nil {
@@ -171,6 +218,7 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 		if err != nil {
 			return nil, err
 		}
+		setChromeHeaders(req.Header)
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}

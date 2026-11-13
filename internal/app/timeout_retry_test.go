@@ -63,6 +63,9 @@ func TestIsUpstreamTimeout(t *testing.T) {
 	if !isUpstreamTimeout(fmt.Errorf("processSession 超时（3m0s）: %w", errUpstreamTimeout)) {
 		t.Error("新协议超时没认出来")
 	}
+	if !isUpstreamTimeout(&StallError{Limit: time.Second}) {
+		t.Error("沉默超时（StallError）没认出来")
+	}
 	for _, e := range []error{nil, errUpstreamFailureReply, errors.New("EOF"),
 		fmt.Errorf("upstream returned no content frame (raw 216 bytes)")} {
 		if isUpstreamTimeout(e) {

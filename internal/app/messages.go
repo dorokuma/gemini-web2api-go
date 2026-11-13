@@ -49,8 +49,50 @@ type ToolCallFunction struct {
 // 出口才知道能不能做，所以判断放在 streamGenerate 里。最新那条消息单独返回，
 // 转附件时用来内联，好让模型不必去文件里找问题。
 func messagesToPrompt(messages []map[string]interface{}, tools []map[string]interface{},
-	toolChoice interface{}) (string, string) {
-	return buildPrompt(messages, tools, toolChoice), latestUserMessage(messages)
+	toolChoice interface{}) (string, promptCtx) {
+	pp := buildPromptParts(messages, tools, toolChoice)
+	return pp.join(), promptCtx{Latest: latestUserMessage(messages), Head: pp.head, Tail: pp.tail}
+}
+
+// promptCtx 是拼好的 prompt 之外、超长转附件时仍要内联的部分。
+//
+// 工具协议（Head：格式说明 + schema；Tail：末尾锚点提醒）不能跟着历史一起进附件：
+// 末尾锚点是模型肯吐 ```tool_call``` 的关键（见 buildPromptParts 里的判据），
+// 整段塞进 message.txt 后正文只剩一句「去读附件」，锚点就失效了。
+type promptCtx struct {
+	Latest string // 最新那条用户消息
+	Head   string // 工具格式说明与定义，没有工具时为空
+	Tail   string // 末尾的工具锚点提醒，没有工具时为空
+}
+
+// promptParts 是 prompt 的三段：工具说明、对话历史、末尾提醒。
+type promptParts struct {
+	head string
+	body []string
+	tail string
+}
+
+func (pp promptParts) join() string {
+	var nonEmpty []string
+	for _, p := range append(append([]string{pp.head}, pp.body...), pp.tail) {
+		if p != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	return strings.Join(nonEmpty, "\n\n")
+}
+
+// compactJSON 不缩进、不转义 HTML 字符。工具 schema 原来用 MarshalIndent，
+// 缩进空白和 \u003c 这类转义全算进 prompt 字节预算，agentic 客户端几十个工具时
+// 很容易把请求推过转附件的门槛。
+func compactJSON(v interface{}) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // latestUserMessage 取最后一条 user 消息的正文，没有则返回空串。
@@ -68,6 +110,12 @@ func latestUserMessage(messages []map[string]interface{}) string {
 
 func buildPrompt(messages []map[string]interface{}, tools []map[string]interface{},
 	toolChoice interface{}) string {
+	return buildPromptParts(messages, tools, toolChoice).join()
+}
+
+func buildPromptParts(messages []map[string]interface{}, tools []map[string]interface{},
+	toolChoice interface{}) promptParts {
+	var pp promptParts
 	var parts []string
 
 	toolsInjected := false
@@ -92,7 +140,7 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 			})
 		}
 		if len(defs) > 0 {
-			defsJSON, _ := json.MarshalIndent(defs, "", "  ")
+			defsJSON := compactJSON(defs)
 			rule := "Only use tool_call blocks when needed."
 			switch {
 			case forced != "":
@@ -105,13 +153,13 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 					"and nothing else — do not answer the question yourself, even if you " +
 					"know the answer."
 			}
-			parts = append(parts, fmt.Sprintf(
+			pp.head = fmt.Sprintf(
 				"[System instruction]: You have access to tools. "+
 					"To call a tool, respond with:\n"+
 					"```tool_call\n{\"name\": \"func_name\", \"arguments\": {...}}\n```\n"+
 					"%s\n\n"+
-					"Available tools:\n%s", rule, string(defsJSON),
-			))
+					"Available tools:\n%s", rule, defsJSON,
+			)
 			toolsInjected = true
 		}
 	}
@@ -168,33 +216,27 @@ func buildPrompt(messages []map[string]interface{}, tools []map[string]interface
 	// 工具名（shell_command）0/4 抄假名 —— 示例教的是「动作」不是名字，故不必按客户端
 	// 动态生成 schema。
 	if toolsInjected {
-		parts = append(parts,
-			"[System instruction — highest priority]: To run a command or read a file you MUST "+
-				"output a ```tool_call``` block — this is the ONLY execution channel. A "+
-				"```powershell/```bash/```cmd/```python code block is NOT executed, it is only shown "+
-				"to the user; never use one to run anything, and never claim you lack tools.\n"+
-				"Act, do not explain: when the request needs a tool, your reply is ONE ```tool_call``` "+
-				"block and nothing else — do not list the commands you 'would' run, do not output more "+
-				"than one tool_call, do not add prose. If several steps are needed, do the FIRST one "+
-				"now; you will be called again with its result to continue.\n"+
-				"Know when to STOP: once a tool result shows a step succeeded (for example it exited "+
-				"with code 0, even with no printed output), that step is DONE — do not run it again and "+
-				"do not retry the same thing a different way. When the whole request is accomplished, "+
-				"stop calling tools and reply with a short final answer instead of another tool_call.\n"+
-				"Example of a correct turn — user asks \"list the files here and tell me the size of "+
-				"README.md\", you reply with exactly one block and nothing else:\n"+
-				"```tool_call\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls -la\"}}\n```\n"+
-				"(In your block use one of the real tool names listed above with its own arguments.) "+
-				"When the request needs a tool, emit the tool_call block now.")
+		pp.tail = "[System instruction — highest priority]: To run a command or read a file you MUST " +
+			"output a ```tool_call``` block — this is the ONLY execution channel. A " +
+			"```powershell/```bash/```cmd/```python code block is NOT executed, it is only shown " +
+			"to the user; never use one to run anything, and never claim you lack tools.\n" +
+			"Act, do not explain: when the request needs a tool, your reply is ONE ```tool_call``` " +
+			"block and nothing else — do not list the commands you 'would' run, do not output more " +
+			"than one tool_call, do not add prose. If several steps are needed, do the FIRST one " +
+			"now; you will be called again with its result to continue.\n" +
+			"Know when to STOP: once a tool result shows a step succeeded (for example it exited " +
+			"with code 0, even with no printed output), that step is DONE — do not run it again and " +
+			"do not retry the same thing a different way. When the whole request is accomplished, " +
+			"stop calling tools and reply with a short final answer instead of another tool_call.\n" +
+			"Example of a correct turn — user asks \"list the files here and tell me the size of " +
+			"README.md\", you reply with exactly one block and nothing else:\n" +
+			"```tool_call\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls -la\"}}\n```\n" +
+			"(In your block use one of the real tool names listed above with its own arguments.) " +
+			"When the request needs a tool, emit the tool_call block now."
 	}
 
-	var nonEmpty []string
-	for _, p := range parts {
-		if p != "" {
-			nonEmpty = append(nonEmpty, p)
-		}
-	}
-	return strings.Join(nonEmpty, "\n\n")
+	pp.body = parts
+	return pp
 }
 
 func contentToString(content interface{}) string {
@@ -509,6 +551,45 @@ func argsObject(v interface{}) (string, bool) {
 		return "", false
 	}
 	return string(b), true
+}
+
+// toolCallComplete 返回一个判定函数：累积正文里出现了**闭合且能解析**、函数名在
+// tools 里的 ```tool_call``` 块时为真，表示这一轮的工具调用已经确定，可以不等上游
+// 收尾。没有工具时返回 nil（不做判定）。
+//
+// 提示词要求一轮只出一个 tool_call 块、不带别的正文（见 buildPromptParts 末尾锚点），
+// 所以第一个合法块闭合就收尾。函数名不认识或 JSON 不完整时不收尾，照旧等上游
+// 结束 —— 宁可慢，不把半截或错的调用当成结果。
+func toolCallComplete(tools []map[string]interface{}) func(string) bool {
+	names := map[string]bool{}
+	for _, tool := range tools {
+		fn := tool
+		if f, ok := tool["function"].(map[string]interface{}); ok {
+			fn = f
+		}
+		if n := getStr(fn, "name"); n != "" {
+			names[n] = true
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return func(text string) bool {
+		i := strings.Index(text, toolFenceOpen)
+		if i < 0 {
+			return false
+		}
+		after := text[i+len(toolFenceOpen):]
+		body, _, ok := toolFenceEnd(after, false)
+		if !ok {
+			return false
+		}
+		var raw map[string]interface{}
+		if json.Unmarshal([]byte(strings.TrimSpace(after[:body])), &raw) != nil || raw == nil {
+			return false
+		}
+		return names[toolCallName(raw)]
+	}
 }
 
 // parseToolChoice 解析 OpenAI 的 tool_choice。

@@ -1,9 +1,11 @@
 package app
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,8 +13,10 @@ import (
 	"sync"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"golang.org/x/net/proxy"
 )
 
 var (
@@ -56,10 +60,20 @@ func resolveProfile(name string) profiles.ClientProfile {
 // For proxied connections we use stdlib (see getStdlibClient) — tls-client's SOCKS5
 // implementation is fragile compared to net/http.
 func getTLSClient() tls_client.HttpClient {
+	return tlsClientWithin(rtCfg().RequestTimeout)
+}
+
+// getTLSStreamClient 同 getTLSClient，但不限整次请求的时长，给 StreamGenerate 用：
+// 还在出字的回复可以比 request_timeout_sec 长，上游沉默太久由 stallWatch 掐掉。
+func getTLSStreamClient() tls_client.HttpClient {
+	return tlsClientWithin(0)
+}
+
+// tlsClientWithin 是整次请求限时 timeout 秒（0 = 不限）的 tls-client。
+func tlsClientWithin(timeout int) tls_client.HttpClient {
 	imp := effectiveImpersonate()
 	// 缓存 key 带上超时：超时是建客户端时定死的，面板改了 request_timeout_sec
 	// 要换一个新客户端才生效（只按 imp 缓存时要重启进程才生效）。
-	timeout := rtCfg().RequestTimeout
 	key := fmt.Sprintf("%s|%d", imp, timeout)
 	clientCacheMu.RLock()
 	if c, ok := clientCache[key]; ok {
@@ -73,18 +87,74 @@ func getTLSClient() tls_client.HttpClient {
 	if c, ok := clientCache[key]; ok {
 		return c
 	}
-	opts := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(timeout),
-		tls_client.WithClientProfile(resolveProfile(imp)),
-		tls_client.WithNotFollowRedirects(),
-	}
-	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+	client, err := newTLSClient(imp, timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[client] tls-client init failed: %v\n", err)
 		os.Exit(1)
 	}
 	clientCache[key] = client
 	return client
+}
+
+// newTLSClient 新建一个指纹 imp、整次请求限时 timeout 秒（0 = 不限）的 tls-client，
+// 拨号用 tlsDialer（见下）。测试在 extra 里加上不校验证书，别的配置跟线上同一套。
+func newTLSClient(imp string, timeout int, extra ...tls_client.HttpClientOption) (tls_client.HttpClient, error) {
+	opts := append([]tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(timeout),
+		tls_client.WithClientProfile(resolveProfile(imp)),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithProxyDialerFactory(newTLSDialer),
+	}, extra...)
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+}
+
+// ─── tls-client 的拨号 ───────────────────────────────────────────────────────
+//
+// tls-client 的 HTTP/2 连接断了（空闲被关、对端 GOAWAY）之后，下一个请求要重新拨号，
+// 这一步却不带请求的 ctx：tls-client 的 dialTLSHTTP2 传的是 context.Background()，fhttp
+// 的连接池也只是干等拨号结束。整次请求的超时、stallWatch、客户端断开都管不到它；拨号时
+// 它还占着这个客户端的锁，同一个客户端里要新建连接的请求都得等它。tls-client 自带的
+// 拨号器只拿整次请求的超时去限 TCP 连接（不限时的客户端就完全不限），TLS 握手从来不限：
+// 对方连上了却不回话，这个客户端就一直卡死。
+//
+// 所以换成自己的拨号器，两步各自限时，数值同 Go 标准库 http.DefaultTransport 的拨号、
+// 握手超时：TCP 30 秒连不上算失败；连上后对方 10 秒内一个字节都没回（握手没有回音）就
+// 断开。tls-client 只连 Google 的 https，对方回的第一个字节总是握手。
+var (
+	dialTimeout      = 30 * time.Second
+	handshakeTimeout = 10 * time.Second
+)
+
+// newTLSDialer 当 tls-client 的 ProxyDialerFactory 用。我们不给 tls-client 配代理（走代理
+// 用 stdlib，见下），它就只管直连，tls-client 传进来的参数都用不上。
+func newTLSDialer(string, time.Duration, *net.TCPAddr, fhttp.Header, tls_client.Logger) (proxy.ContextDialer, error) {
+	return tlsDialer{}, nil
+}
+
+type tlsDialer struct{}
+
+func (tlsDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	conn, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	return &answeredConn{Conn: conn}, nil
+}
+
+// answeredConn 在对方头一回回话时撤掉拨号时设的读超时，之后这条连接怎么用都不再限时。
+type answeredConn struct {
+	net.Conn
+	once sync.Once
+}
+
+func (c *answeredConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.once.Do(func() { c.Conn.SetReadDeadline(time.Time{}) })
+	}
+	return n, err
 }
 
 // ─── Stdlib HTTP client for proxied requests ─────────────────────────────────
@@ -112,13 +182,26 @@ var (
 // getStdlibClient returns an http.Client routed through proxyURL.
 // proxyURL must not be empty (caller checks).
 func getStdlibClient(proxyURL string) *http.Client {
+	return stdlibClientWithin(proxyURL, rtCfg().RequestTimeout)
+}
+
+// getStdlibStreamClient 同 getStdlibClient，但不限整次请求的时长（见 getTLSStreamClient）。
+func getStdlibStreamClient(proxyURL string) *http.Client {
+	return stdlibClientWithin(proxyURL, 0)
+}
+
+// stdlibClientWithin 是走 proxyURL、整次请求限时 timeout 秒（0 = 不限）的 http.Client。
+func stdlibClientWithin(proxyURL string, timeout int) *http.Client {
 	// 同 getTLSClient：超时进 key，面板改超时后换新客户端。
-	timeout := rtCfg().RequestTimeout
 	key := fmt.Sprintf("%s|%d", proxyURL, timeout)
 	if cached, ok := stdlibClientCache.Load(key); ok {
 		return cached.(*http.Client)
 	}
 	t := &http.Transport{
+		// 跟 Google 的 TLS 握手限时，同 tlsDialer：对话请求不限整次时长，握手没回音时
+		// 不必等满 stallWatch 的上限。连代理那步不另外限：配了 DialContext，Transport 会
+		// 悄悄关掉 HTTP/2；它本来就带着请求的 ctx，stallWatch 管得到。
+		TLSHandshakeTimeout: handshakeTimeout,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
@@ -200,6 +283,37 @@ func currentBrowserUA() string {
 	return ChromeUA
 }
 
+var chromeHeaders = [][2]string{
+	{"User-Agent", ChromeUA},
+	{"Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`},
+	{"Sec-CH-UA-Mobile", "?0"},
+	{"Sec-CH-UA-Platform", `"Windows"`},
+	{"Sec-Fetch-Dest", "empty"},
+	{"Sec-Fetch-Mode", "cors"},
+	{"Sec-Fetch-Site", "same-origin"},
+}
+
+// setChromeHeaders 把对应 impersonate 配置的应用层 header 填进 net/http 或 fhttp 的 Header。
+// 调用方之后再写自己的 header，同名的以调用方为准。
+func setChromeHeaders(h interface {
+	Set(key, value string)
+	Del(key string)
+}) {
+	if isFirefoxProfile() {
+		h.Set("User-Agent", FirefoxUA)
+		h.Del("Sec-CH-UA")
+		h.Del("Sec-CH-UA-Mobile")
+		h.Del("Sec-CH-UA-Platform")
+		h.Set("Sec-Fetch-Dest", "empty")
+		h.Set("Sec-Fetch-Mode", "cors")
+		h.Set("Sec-Fetch-Site", "same-origin")
+		return
+	}
+	for _, kv := range chromeHeaders {
+		h.Set(kv[0], kv[1])
+	}
+}
+
 // applyChromeHeaders 给 stdlib 请求填上应用层 header（根据 impersonate 配置自动适配 Chrome 或 Firefox）。
 func applyChromeHeaders(req *http.Request) {
 	applyBrowserHeaders(req)
@@ -207,21 +321,5 @@ func applyChromeHeaders(req *http.Request) {
 
 // applyBrowserHeaders 给 stdlib 请求填上对应 impersonate 配置的应用层 header。
 func applyBrowserHeaders(req *http.Request) {
-	if isFirefoxProfile() {
-		req.Header.Set("User-Agent", FirefoxUA)
-		req.Header.Del("Sec-CH-UA")
-		req.Header.Del("Sec-CH-UA-Mobile")
-		req.Header.Del("Sec-CH-UA-Platform")
-		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-Fetch-Mode", "cors")
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
-		return
-	}
-	req.Header.Set("User-Agent", ChromeUA)
-	req.Header.Set("Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`)
-	req.Header.Set("Sec-CH-UA-Mobile", "?0")
-	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	setChromeHeaders(req.Header)
 }

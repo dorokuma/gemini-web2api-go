@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -207,7 +208,7 @@ func getAnonSession(proxyURL string) (string, error) {
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		r.Header.Set("User-Agent", currentBrowserUA())
+		setChromeHeaders(r.Header)
 		resp, err := getTLSClient().Do(r)
 		if err != nil {
 			return nil, nil, nil, err
@@ -239,15 +240,14 @@ func getAnonSession(proxyURL string) (string, error) {
 	return strings.Join(pairs, "; "), nil
 }
 
-// webUA 是匿名 GET /app 的 User-Agent（tls-client 路径要手动带）。
-const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-	"(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-
 // streamGenerateConv 发一路会话的一轮。turn==0 是首轮（建会话），>0 是续接（只发新消息）。
 // 整条会话绑定 conv.cookie / conv.proxyID，中途不换号不换出口。成功后回填 conv 的
 // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
-func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
+func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	if err := ctx.Err(); err != nil {
+		return &StreamResult{}, err
+	}
 	p, slotOK, slotErr := acquireSlot(conv.proxyID)
 	if !slotOK {
 		return &StreamResult{}, slotErr
@@ -314,6 +314,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	if tw != thinkingNormal {
 		inner[96] = 1
 	}
+	if mc.Mode == 8 {
+		argonMode8Slots(inner)
+	}
 
 	innerJSON, _ := json.Marshal(inner)
 	outerJSON, _ := json.Marshal([]interface{}{nil, string(innerJSON)})
@@ -375,11 +378,18 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	t0 := time.Now()
 	var lastErr error
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+		if cerr := ctx.Err(); cerr != nil {
+			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
+		}
+		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil)
 		if len(setCookie) > 0 && conv.cookie != "" {
 			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
 				conv.cookie = merged
 			}
+		}
+		var aie *argonIdentityError
+		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
+			err = &ModelDowngradedError{Requested: mc.Upstream, Reported: aie.name, AccountID: conv.accountID}
 		}
 		// 降级：同一个号重试还是降级，直接交给上层（见 gemini.go 同一处）。
 		var mde *ModelDowngradedError
@@ -389,6 +399,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 				Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted}, err
 		}
 		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
+			if cerr := ctx.Err(); cerr != nil {
+				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
+			}
 			if err == nil && statusCode == 200 {
 				lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
 			} else if err != nil {
@@ -411,7 +424,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 				if errors.Is(err, errUpstreamFailureReply) {
 					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
 				}
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
+					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, werr
+				}
 			}
 			continue
 		}
@@ -423,7 +438,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
+					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, werr
+				}
 			}
 			continue
 		}
@@ -464,7 +481,7 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 //   - 没命中 → 新建会话，首轮发全量拼接的历史（含 tools 指令，把当前上下文交给服务端）。
 //
 // 支持 tools（续接里也解析 ```tool_call``` 围栏）；图片走原单轮路径（callGemini）。
-func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
+func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc ModelConfig,
 	tools []map[string]interface{}, toolChoice interface{},
 	onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
 	parentKey := convParentKey(messages)
@@ -515,7 +532,7 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 				}
 			}
 		}
-		res, err = streamGenerateConv(prompt, mc, conv, onDelta, onReasoning)
+		res, err = streamGenerateConv(ctx, prompt, mc, conv, onDelta, onReasoning)
 		if !retryOnAnotherAccount(res, err, mc, exclude) || !fresh {
 			break
 		}

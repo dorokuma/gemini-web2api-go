@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -470,6 +471,7 @@ func geminiCandidate(parts []interface{}, finish string) map[string]interface{} 
 // prepareGemini 是 generateContent / streamGenerateContent 共用的前半段：
 // 解析、选模型、收图、拼 prompt。出错时已经写好响应。
 type geminiCall struct {
+	ctx        context.Context
 	req        *geminiAPIRequest
 	modelName  string
 	modelCfg   ModelConfig
@@ -478,7 +480,7 @@ type geminiCall struct {
 	toolChoice interface{}
 	images     []pendingUpload
 	prompt     string
-	latest     string
+	pc         promptCtx
 }
 
 func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*geminiCall, bool) {
@@ -504,21 +506,21 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, err.Error())
 		return nil, false
 	}
-	prompt, latest := messagesToPrompt(messages, tools, toolChoice)
+	prompt, pc := messagesToPrompt(messages, tools, toolChoice)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeGeminiError(w, 400, "contents is empty")
 		return nil, false
 	}
-	return &geminiCall{req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
-		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, latest: latest}, true
+	return &geminiCall{ctx: r.Context(), req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
+		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc}, true
 }
 
 // run 调上游；多轮开关的分流跟 /v1/chat/completions 一致。
 func (g *geminiCall) run(onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
 	if rtCfg().MultiTurn && len(g.images) == 0 && g.modelCfg.Tool == 0 {
-		return callGeminiConv(g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
+		return callGeminiConv(g.ctx, g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
 	}
-	return callGemini(g.prompt, g.latest, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
+	return callGemini(g.ctx, g.prompt, g.pc, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
 }
 
 // runGeminiCall 是调上游那一步，测试里替换成桩。
@@ -533,6 +535,9 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 	}
 	text, calls, res, err := runGeminiCall(g, nil, nil)
 	if err != nil {
+		if clientGone(r, "gemini.generateContent", g.modelName, g.prompt, res, false) {
+			return
+		}
 		status := 502
 		if _, ok := err.(*ModelDowngradedError); ok {
 			status = 429
@@ -678,6 +683,9 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 	text, calls, res, err := runGeminiCall(g, onDelta, onReasoning)
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
 	if err != nil {
+		if clientGone(r, "gemini.streamGenerateContent", g.modelName, g.prompt, res, true) {
+			return
+		}
 		status := 502
 		if _, ok := err.(*ModelDowngradedError); ok {
 			status = 429

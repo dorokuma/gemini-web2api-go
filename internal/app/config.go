@@ -43,7 +43,10 @@ type Config struct {
 	// 是否走 Gemini 原生 conversation_id 服务端多轮。默认 false，见 conversation.go。
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
-	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 false。
+	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 true：
+	// temporary_chat(inner[45]=1) 在带附件/Mode-8 时仍会被服务端落「打不开」的索引残片
+	// （#phantom），光靠它不够，得 create-then-delete 双保险；配合 streamGenerateOnce 的
+	// phantomCleanup（取消/超时/出错也删）覆盖全路径。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
 	// 匿名优先（#20）：这次请求不需要登录态能力（纯文本、非思考、无工具、无图）时
 	// 不占用 cookie 账号，走匿名省额度；需要登录才挑号。默认 false。见 modelNeedsLogin。
@@ -111,7 +114,7 @@ func defaultConfig() Config {
 		// 135,990 字节各 1/3，141,920 字节各 1/3。取 128000 留一点余量。
 		MaxPromptBytes:         128000,
 		MultiTurn:              false,
-		AutoDeleteConversation: false,
+		AutoDeleteConversation: true,
 		AnonFirst:              false,
 		TemporaryChat:          false,
 		ImageUpscale:           false,

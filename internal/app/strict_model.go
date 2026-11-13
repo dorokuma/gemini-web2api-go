@@ -150,7 +150,8 @@ func strictLineCheck(mc ModelConfig, accountID func() int64) func(line string) e
 var modelNameFoldRe = regexp.MustCompile(`[^a-z0-9.]+`)
 
 func foldModelName(s string) string {
-	return strings.TrimSpace(modelNameFoldRe.ReplaceAllString(strings.ToLower(s), " "))
+	folded := strings.TrimSpace(modelNameFoldRe.ReplaceAllString(strings.ToLower(s), " "))
+	return strings.TrimPrefix(folded, "gemini ")
 }
 
 // modelDowngraded 判断服务端自报的显示名是不是请求的那个模型。
@@ -164,7 +165,18 @@ func foldModelName(s string) string {
 func modelDowngraded(mc ModelConfig, reported string) bool {
 	want := foldModelName(mc.Upstream)
 	got := foldModelName(reported)
+	// Google 原位改名：hex 95a4c0abcba24364 / Mode=8 那个槽位 2026-11 起自报从
+	// "4 Argon" 换成 "4 Carbon"（同 hex、同档、只是名字变了）。两个名字是同一个
+	// 模型，互相不算降级；折成一族后前缀比较照旧，跨档后缀与降级到 Flash 仍判。
+	want = strings.ReplaceAll(want, "carbon", "argon")
+	got = strings.ReplaceAll(got, "carbon", "argon")
 	if want == "" || got == "" {
+		return false
+	}
+	// hexFlash38 / Mode=1 槽位 2026-11 原位升级：显示名 "3.8 Flash" → "4 Hydrogen"
+	// （同 hex、同 Mode，只是名字变了）。是单向升级：请求旧名收到新名算同槽升级、
+	// 不算降级；反过来明确请求 4 Hydrogen 收到 Flash 族自报仍按下面前缀比较判降级。
+	if want == "3.8 flash" && (got == "4 hydrogen" || strings.HasPrefix(got, "4 hydrogen ")) {
 		return false
 	}
 	return got != want && !strings.HasPrefix(got, want+" ")
