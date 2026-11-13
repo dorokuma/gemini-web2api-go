@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 下行内容消息：X 是老响应的 inner 数组。正文要够长，textsInLine 对太短的行直接跳过。
@@ -256,5 +257,162 @@ func TestWCSendRedactsURLError(t *testing.T) {
 	}
 	if strings.Contains(canceled.Error(), "SID_PLACEHOLDER") || strings.Contains(canceled.Error(), "GSESSION_PLACEHOLDER") {
 		t.Errorf("非 *url.Error 的错误消息泄露会话值: %s", canceled)
+	}
+}
+
+// 脱敏必须覆盖整条错误链：调用方走 Unwrap()/errors.As 拿到的任何节点都不能
+// 带出原文 URL（$httpHeaders、SID、gsessionid），同时 sentinel 的 errors.Is 判定不变。
+func TestWCRedactErrChainIsRedacted(t *testing.T) {
+	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+	sessURL := wcEndpoint + "?gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER&VER=8&RID=rpc"
+
+	// 两层 fmt 包装 + sentinel 叶子：链中间节点的文本里也有 URL。
+	sentinel := errors.New("SENTINEL_MARK")
+	orig := fmt.Errorf("POST %s: %w", hsURL,
+		fmt.Errorf("inner %s: %w", sessURL, sentinel))
+	w := wcRedactErr(orig)
+	if !errors.Is(w, sentinel) {
+		t.Fatalf("errors.Is 应沿链命中 sentinel: %T", w)
+	}
+	if errors.Is(w, context.Canceled) {
+		t.Fatalf("无关 sentinel 不应误判为真")
+	}
+	for depth, cur := 0, w; cur != nil && depth < 8; depth++ {
+		msg := cur.Error()
+		for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey), "SID_PLACEHOLDER", "GSESSION_PLACEHOLDER"} {
+			if strings.Contains(msg, leak) {
+				t.Fatalf("错误链第 %d 层泄露 %q: %s", depth, leak, msg)
+			}
+		}
+		cur = errors.Unwrap(cur)
+	}
+	if got := errors.Unwrap(w).Error(); !strings.Contains(got, "SID=%3Credacted%3E") {
+		t.Errorf("Unwrap 层应保留参数名并脱敏值: %s", got)
+	}
+
+	// 链深处嵌 *url.Error：errors.As 命中的必须是脱敏副本，不能是原文。
+	nested := fmt.Errorf("req %s failed: %w", sessURL,
+		&url.Error{Op: "post", URL: hsURL, Err: sentinel})
+	w2 := wcRedactErr(nested)
+	if !errors.Is(w2, sentinel) {
+		t.Fatalf("*url.Error 子节点后 errors.Is 失效: %T", w2)
+	}
+	var ue *url.Error
+	if !errors.As(w2, &ue) {
+		t.Fatalf("链上 *url.Error 应仍能被 errors.As 命中: %T", w2)
+	}
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)} {
+		if strings.Contains(ue.URL, leak) {
+			t.Errorf("errors.As 拿到的 url.Error.URL 泄露 %q: %s", leak, ue.URL)
+		}
+	}
+	if !strings.Contains(ue.URL, "%3Credacted%3E") {
+		t.Errorf("errors.As 拿到的 url.Error.URL 应含脱敏占位符: %s", ue.URL)
+	}
+	// url.Error 底下包的 sentinel 也要原样可达。
+	if !errors.Is(ue, sentinel) {
+		t.Errorf("url.Error.Err 的 sentinel 丢失: %v", ue)
+	}
+
+	// 叶子 sentinel 文本干净时必须保持 identity；万一叶子文本带 URL，宁可牺牲
+	// identity 也不外泄。
+	dirty := wcRedactErr(fmt.Errorf("leaf %s", sessURL))
+	if strings.Contains(dirty.Error(), "SID_PLACEHOLDER") {
+		t.Errorf("叶子错误文本泄露会话值: %s", dirty)
+	}
+}
+
+// 请求构造失败（URL 含非法字符）时，*url.Error 的 Error() 带完整 URL ——
+// $httpHeaders 里有 API key 和 SAPISIDHASH，必须经 wcRedactErr 脱敏。
+func TestWCSendRedactsRequestBuildError(t *testing.T) {
+	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+	badURL := hsURL + "\x7f" // url.Parse 拒控制字符，NewRequestWithContext 返回 *url.Error
+
+	leaks := []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)}
+	// 代理分支（stdlib http.NewRequestWithContext）
+	if _, err := wcSend(context.Background(), "POST", badURL, "count=0", "SAPISID=x", "http://wcbuild.invalid:3128"); err == nil {
+		t.Fatal("非法 URL 应让请求构造失败")
+	} else {
+		for _, leak := range leaks {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("stdlib 构造错误泄露 %q: %s", leak, err)
+			}
+		}
+		var ue *url.Error
+		if errors.As(err, &ue) && strings.Contains(ue.URL, "SAPISIDHASH") {
+			t.Errorf("stdlib 构造错误链上的 URL 未脱敏: %s", ue.URL)
+		}
+	}
+	// 直连分支（fhttp.NewRequestWithContext）
+	if _, err := wcSend(context.Background(), "POST", badURL, "count=0", "SAPISID=x", ""); err == nil {
+		t.Log("fhttp 未拒绝该 URL（本环境差异），仅校验 stdlib 分支")
+	} else {
+		for _, leak := range leaks {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("fhttp 构造错误泄露 %q: %s", leak, err)
+			}
+		}
+	}
+}
+
+// 握手返 200 但 X-HTTP-Session-Id 缺失时，错误文本不能回传响应体 ——
+// 体里的 ["c","<SID>"] 帧是可复用会话值，会经 last_error 和 502 响应外泄。
+func TestWCHandshakeFailureRedactsBody(t *testing.T) {
+	const apiKey = "AIza" + "AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa1" // 35 字符，匹配 wcKeyRe
+	const probe = "SID_PROBE_VALUE"
+
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := func(status int, h http.Header, body string) *http.Response {
+			return &http.Response{
+				StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header:  h,
+				Body:    io.NopCloser(strings.NewReader(body)),
+				Request: req,
+			}
+		}
+		switch req.URL.Path {
+		case "/app", "/u/0/app":
+			return resp(200, http.Header{}, `"d2zJAe":"`+apiKey+`"`), nil
+		case "/v1/processSession":
+			// 200 但无 X-HTTP-Session-Id；body 带 c 帧（含 SID 探针值）。
+			return resp(200, http.Header{}, "40\n[[0,[\"c\",\""+probe+"\"]]]"), nil
+		}
+		return resp(404, http.Header{}, ""), nil
+	})
+	const fakeProxy = "http://wchsredact.invalid:3128"
+	stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+	defer func() {
+		stdlibClientCache.Delete(fakeProxy + "|0")
+		stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+	}()
+
+	wcKeyMu.Lock()
+	oldKey, oldAt := wcKey, wcKeyAt
+	wcKey, wcKeyAt = "", time.Time{}
+	wcKeyMu.Unlock()
+	defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
+
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
+	status, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+	if err != nil {
+		t.Fatalf("握手 200 失败应走状态码而不是 err: %v", err)
+	}
+	if status != 502 {
+		t.Fatalf("缺 gsessionid 应映射 502: status=%d body=%q", status, raw)
+	}
+	if strings.Contains(string(raw), probe) {
+		t.Fatalf("握手失败错误文本回传了响应体里的 SID: %s", raw)
+	}
+	// 仍要留可定位信息：HTTP 状态或响应体字节数。
+	msg := string(raw)
+	if !strings.Contains(msg, "200") || !strings.Contains(msg, "字节") {
+		t.Fatalf("错误文本应含状态码/字节数便于定位: %s", msg)
 	}
 }

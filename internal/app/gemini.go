@@ -791,6 +791,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 
 	// 新协议（#43）尚未接入按沉默计时（#33）、请求取消传播、工具提前收尾与扩展思考，
 	// 当前版本锁死走 StreamGenerate。
+	// 打开 useWC 前必须处理的前置清单见 .agents/notes/webchannel-enable-prerequisites.md。
 	noteWebChannelIgnored(rtCfg().WebChannel)
 	useWC := false
 	wcReq := wcRequest{

@@ -241,19 +241,49 @@ func wcRedactParam(raw, name string) string {
 
 // wcRedactErr 包装一次 wcSend 的失败：保留 *url.Error 的 Op 和底层 Err（Timeout()
 // 等行为不变），只把 URL 换成脱敏后的；不是 *url.Error 的错误按字符串脱敏后包一层。
+// Unwrap 返回的链也整体脱敏 —— 调用方 errors.As(&ue) 或 Unwrap().Error() 拿到的
+// 任何节点都不能再带出原文 URL；sentinel 的 errors.Is 判定不变。
 func wcRedactErr(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		out := *ue
 		out.URL = wcRedactURL(ue.URL)
+		out.Err = wcSanitizeErr(ue.Err)
 		return &out
 	}
 	// 非 *url.Error 也保留错误链，但不能用 fmt.Errorf("%s: %w")：那样 Error() 会
 	// 把原始消息（带未脱敏 URL）又拼回来。自定义类型让 Unwrap 走链、Error 只出脱敏文本。
-	return &wcRedactedError{msg: wcRedactURL(err.Error()), err: err}
+	return &wcRedactedError{msg: wcRedactURL(err.Error()), err: wcSanitizeErr(err)}
 }
 
-// wcRedactedError 错误消息是脱敏文本，Unwrap 仍指向原始错误，errors.Is/As 不受影响。
+// wcSanitizeErr 返回一个脱敏后的等价错误，让错误链上每个节点的 Error() 都不带
+// 敏感参数：
+//   - *url.Error：浅拷贝、URL 换成脱敏版、底层 Err 递归脱敏（类型和 Is 判定不变）；
+//   - 带 Unwrap 的 fmt 包装：脱敏各节点文本后重建整链，sentinel 的 Is 仍成立；
+//   - 文本干净的叶子直接返回原值，保证 sentinel 的 errors.Is 命中原对象；
+//   - 文本带敏感参数且不能再向下走的叶子：返回脱敏副本，此时 identity 判定
+//     不再可用（相比外泄 SID/$httpHeaders 是更优取舍）。
+func wcSanitizeErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		out := *ue
+		out.URL = wcRedactURL(ue.URL)
+		out.Err = wcSanitizeErr(ue.Err)
+		return &out
+	}
+	if inner := errors.Unwrap(err); inner != nil {
+		return &wcRedactedError{msg: wcRedactURL(err.Error()), err: wcSanitizeErr(inner)}
+	}
+	if red := wcRedactURL(err.Error()); red != err.Error() {
+		return errors.New(red)
+	}
+	return err
+}
+
+// wcRedactedError 错误消息是脱敏文本，Unwrap 指向脱敏后的错误，整条链都安全。
 type wcRedactedError struct {
 	msg string
 	err error
@@ -283,7 +313,8 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 	if proxyURL != "" {
 		req, err := http.NewRequestWithContext(ctx, method, u, rd)
 		if err != nil {
-			return nil, err
+			// URL 含非法字符时 *url.Error.Error() 带完整 URL（$httpHeaders 在里面）。
+			return nil, wcRedactErr(err)
 		}
 		applyChromeHeaders(req)
 		for k, v := range headers {
@@ -298,7 +329,7 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 	}
 	req, err := fhttp.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
-		return nil, err
+		return nil, wcRedactErr(err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -503,7 +534,11 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	})
 	gsid := hs.sessionID
 	if sid == "" || gsid == "" {
-		return 502, []byte("processSession 握手没拿到会话: " + truncate(string(hsBody), 200)), 0, setCookie, nil
+		// 不回传响应体：体里的 ["c","<SID>"] 帧是可复用会话值，原样拼进错误
+		// 会经 last_error 和 502 响应外泄。只给状态码/字节数/是否解析到 sid 的
+		// 元信息用于定位。
+		return 502, []byte(fmt.Sprintf("processSession 握手没拿到会话: HTTP %d, 响应体 %d 字节, sid=%v, gsessionid=%v",
+			hs.status, len(hsBody), sid != "", gsid != "")), 0, setCookie, nil
 	}
 	sess := fmt.Sprintf("gsessionid=%s&SID=%s", url.QueryEscape(gsid), url.QueryEscape(sid))
 

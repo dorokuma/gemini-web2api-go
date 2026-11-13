@@ -2,6 +2,17 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+### 修复
+
+- **回复只剩一个无法解析的 ```tool_call``` 围栏时不再返回空回答**。之前返回
+  200 且 `content: null`（客户端静默拿不到内容）；现在返回错误，客户端会出现 5xx，
+  OpenAI SDK 按默认策略会重试。
+- **WebChannel 握手 URL 中的 `$httpHeaders`/`SID`/`gsessionid` 在错误信息中脱敏**。
+  请求构造失败、握手失败和 `errors.Unwrap`/`errors.As` 拿到的错误链上都不再回传
+  API key、SAPISIDHASH 或会话值。当前 `web_channel` 未启用（`useWC=false`），无运行时影响。
+
 ## 4.28.0
 
 ### 新增
