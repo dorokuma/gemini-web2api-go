@@ -196,23 +196,47 @@ type wcResp struct {
 	body      io.ReadCloser
 }
 
-// wcRedactURL 把 URL 里 $httpHeaders 参数的值换成占位符，只用于错误/日志呈现。
-// 握手 URL 的这个参数里塞着 X-Goog-Api-Key 和 Authorization:SAPISIDHASH，
+// wcRedactURL 把 URL 里 wcRedactParams 所列参数的值换成占位符，只用于错误/日志呈现。
+// $httpHeaders 里塞着 X-Goog-Api-Key 和 Authorization:SAPISIDHASH；SID 和 gsessionid
+// 是会话绑定值（握手响应带出，见文件头），虽不是凭据本身但可复用会话，同样不能外泄。
 // *url.Error 的 Error() 会带完整 URL，不脱敏就直接进日志和 HTTP 响应。
 // 实际发给上游的 URL 不动 —— 只在往外报错时调用。
+var wcRedactParams = []string{"$httpHeaders", "SID", "gsessionid"}
+
 func wcRedactURL(raw string) string {
-	const key = "$httpHeaders="
-	i := strings.Index(raw, key)
-	if i < 0 {
-		return raw
+	for _, name := range wcRedactParams {
+		raw = wcRedactParam(raw, name)
 	}
-	end := strings.IndexByte(raw[i+len(key):], '&')
-	if end < 0 {
-		end = len(raw)
-	} else {
-		end += i + len(key)
+	return raw
+}
+
+// wcRedactParam 把 raw 里每个 name= 参数（参数名精确匹配、值不限）的值换成
+// %3Credacted%3E，同名参数出现多次时全部替换。
+func wcRedactParam(raw, name string) string {
+	key := name + "="
+	var b strings.Builder
+	for {
+		i := strings.Index(raw, key)
+		if i < 0 {
+			break
+		}
+		// 参数名要在值开头或 & 之后出现，才不会误伤「值里含 gsessionid= 之类」的参数。
+		if i > 0 && raw[i-1] != '&' && raw[i-1] != '?' {
+			b.WriteString(raw[:i+len(key)])
+			raw = raw[i+len(key):]
+			continue
+		}
+		end := strings.IndexByte(raw[i+len(key):], '&')
+		if end < 0 {
+			end = len(raw)
+		} else {
+			end += i + len(key)
+		}
+		b.WriteString(raw[:i+len(key)])
+		b.WriteString("%3Credacted%3E")
+		raw = raw[end:]
 	}
-	return raw[:i+len(key)] + "%3Credacted%3E" + raw[end:]
+	return b.String() + raw
 }
 
 // wcRedactErr 包装一次 wcSend 的失败：保留 *url.Error 的 Op 和底层 Err（Timeout()
@@ -224,8 +248,19 @@ func wcRedactErr(err error) error {
 		out.URL = wcRedactURL(ue.URL)
 		return &out
 	}
-	return errors.New(wcRedactURL(err.Error()))
+	// 非 *url.Error 也保留错误链，但不能用 fmt.Errorf("%s: %w")：那样 Error() 会
+	// 把原始消息（带未脱敏 URL）又拼回来。自定义类型让 Unwrap 走链、Error 只出脱敏文本。
+	return &wcRedactedError{msg: wcRedactURL(err.Error()), err: err}
 }
+
+// wcRedactedError 错误消息是脱敏文本，Unwrap 仍指向原始错误，errors.Is/As 不受影响。
+type wcRedactedError struct {
+	msg string
+	err error
+}
+
+func (e *wcRedactedError) Error() string { return e.msg }
+func (e *wcRedactedError) Unwrap() error { return e.err }
 
 // wcSend 发一条请求。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
 func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {

@@ -150,6 +150,34 @@ func TestWCRedactURL(t *testing.T) {
 	if !strings.Contains(raw, url.QueryEscape("X-Goog-Api-Key:"+apiKey)) {
 		t.Fatal("前提不成立：构造的握手 URL 没带 API key")
 	}
+
+	// 会话值 SID / gsessionid 同样要脱敏：下行/上行 URL 把它们放在裸 query 里。
+	sessURL := wcEndpoint + "?gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER&VER=8&RID=rpc&AID=3&CI=0"
+	redSess := wcRedactURL(sessURL)
+	for _, leak := range []string{"GSESSION_PLACEHOLDER", "SID_PLACEHOLDER"} {
+		if strings.Contains(redSess, leak) {
+			t.Errorf("脱敏后的 URL 还含会话值 %q: %s", leak, redSess)
+		}
+	}
+	for _, keep := range []string{"gsessionid=%3Credacted%3E", "SID=%3Credacted%3E", "VER=8", "RID=rpc", "AID=3"} {
+		if !strings.Contains(redSess, keep) {
+			t.Errorf("脱敏后的 URL 丢了 %q: %s", keep, redSess)
+		}
+	}
+	// 参数名按 name= 精确匹配：X-HTTP-Session-Id=gsessionid 的值恰好等于字符串
+	// "gsessionid"，但它不是 gsessionid 参数，不能被误伤。
+	if !strings.Contains(wcRedactURL(raw), "X-HTTP-Session-Id=gsessionid") {
+		t.Errorf("X-HTTP-Session-Id=gsessionid 被误脱敏: %s", wcRedactURL(raw))
+	}
+	// 同名参数出现多次时全部替换。
+	dup := wcEndpoint + "?SID=ONE_PLACEHOLDER&zx=abc&SID=TWO_PLACEHOLDER&t=1"
+	redDup := wcRedactURL(dup)
+	if strings.Contains(redDup, "ONE_PLACEHOLDER") || strings.Contains(redDup, "TWO_PLACEHOLDER") {
+		t.Errorf("重复的 SID 没全部脱敏: %s", redDup)
+	}
+	if strings.Count(redDup, "SID=%3Credacted%3E") != 2 {
+		t.Errorf("期望两个 SID=<redacted>: %s", redDup)
+	}
 }
 
 // 传输层失败走代理分支（stdlib）时，*url.Error 里不能再见到凭据；
@@ -167,6 +195,9 @@ func TestWCSendRedactsURLError(t *testing.T) {
 	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: fail})
 	defer stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
 
+	sess := "gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER"
+	getURL := fmt.Sprintf("%s?%s&VER=8&RID=rpc&AID=0&CI=0&TYPE=xmlhttp&zx=abc123&t=1", wcEndpoint, sess)
+
 	_, err := wcSend(context.Background(), "POST", hsURL, "count=0", "SAPISID=x", fakeProxy)
 	if err == nil {
 		t.Fatal("传输层失败应报错")
@@ -175,6 +206,20 @@ func TestWCSendRedactsURLError(t *testing.T) {
 	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey), "$httpHeaders=" + url.QueryEscape(wcHTTPHeaders(apiKey, r))} {
 		if strings.Contains(msg, leak) {
 			t.Errorf("错误信息泄露 %q: %s", leak, msg)
+		}
+	}
+	// 会话值也不能出现在错误里：下行 GET 的 URL 带着 SID/gsessionid。
+	_, err = wcSend(context.Background(), "GET", getURL, "", "SAPISID=x", fakeProxy)
+	if err == nil {
+		t.Fatal("传输层失败应报错")
+	}
+	sessMsg := err.Error()
+	if strings.Contains(sessMsg, "SID_PLACEHOLDER") || strings.Contains(sessMsg, "GSESSION_PLACEHOLDER") {
+		t.Errorf("错误信息泄露会话值: %s", sessMsg)
+	}
+	for _, keep := range []string{"SID=%3Credacted%3E", "gsessionid=%3Credacted%3E", "RID=rpc"} {
+		if !strings.Contains(sessMsg, keep) {
+			t.Errorf("错误信息里 %q 应保留参数名并脱敏值: %s", keep, sessMsg)
 		}
 	}
 	for _, keep := range []string{"geminiweb-pa.clients6.google.com", "VER=8", "connection refused"} {
@@ -196,9 +241,20 @@ func TestWCSendRedactsURLError(t *testing.T) {
 		!strings.Contains(nonURL.Error(), "%3Credacted%3E") || !strings.Contains(nonURL.Error(), "VER=8") {
 		t.Errorf("非 *url.Error 脱敏不对: %s", nonURL)
 	}
-	// 底层 error 里带 URL 原文的场景（tls-client 不包 *url.Error 时）。
+	// 底层 error 里带 URL 原文的场景（tls-client 不包 *url.Error 时）；
+	// 脱敏后错误链仍要保留，上层靠 errors.Is 判 context.Canceled 之类。
 	wrapped := wcRedactErr(fmt.Errorf("request failed: %w", io.ErrUnexpectedEOF))
 	if !strings.Contains(wrapped.Error(), "unexpected EOF") {
 		t.Errorf("底层错误信息不该丢: %s", wrapped)
+	}
+	if !errors.Is(wrapped, io.ErrUnexpectedEOF) {
+		t.Errorf("脱敏包装丢了错误链: %T", wrapped)
+	}
+	canceled := wcRedactErr(fmt.Errorf("get %s?SID=SID_PLACEHOLDER&gsessionid=GSESSION_PLACEHOLDER: %w", wcEndpoint, context.Canceled))
+	if !errors.Is(canceled, context.Canceled) {
+		t.Errorf("脱敏包装后 errors.Is(context.Canceled) 失效: %T", canceled)
+	}
+	if strings.Contains(canceled.Error(), "SID_PLACEHOLDER") || strings.Contains(canceled.Error(), "GSESSION_PLACEHOLDER") {
+		t.Errorf("非 *url.Error 的错误消息泄露会话值: %s", canceled)
 	}
 }
