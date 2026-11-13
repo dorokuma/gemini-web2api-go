@@ -44,7 +44,9 @@ var upstreamPaths = []struct {
 // 180 秒时还在写的回复被拦腰掐掉。
 func TestStallWatchKeepsAReplyThatKeepsComing(t *testing.T) {
 	withRequestTimeout(t, 1) // 整次限时的客户端 1 秒就掐，回复要写 1.2 秒
-	withStallLimit(t, 150*time.Millisecond)
+	// 沉默窗口放宽到 350ms：-race 下 TLS+HTTP/2 握手偶发 >150ms，窗口太短会在
+	// 握手阶段误掐（同 TestStallWatchWaitsThroughHeartbeats）。
+	withStallLimit(t, 350*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +81,10 @@ func TestStallWatchKeepsAReplyThatKeepsComing(t *testing.T) {
 // 上游让请求排队时只发心跳帧（实测每 60 秒一个），排得比沉默上限还久也要等到出字：
 // 以前整次请求限时，排队超过 180 秒的请求一律被掐掉重发。
 func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
-	withStallLimit(t, 150*time.Millisecond)
+	// 沉默窗口放宽到 350ms：linux/arm64 + -race 下 tls-client 首次 TLS+HTTP/2 握手
+	// 偶发 ~170ms，150ms 的窗口会在握手阶段就把请求掐掉（假红）。心跳间隔提到
+	// 180ms 让判据不变：排队心跳总时长（>1s）仍显著大于单次沉默上限。
+	withStallLimit(t, 350*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +92,7 @@ func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
 				w.Write([]byte(")]}'\nfirst frame\n"))
 				w.(http.Flusher).Flush()
 				for i := 0; i < 6; i++ {
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(180 * time.Millisecond)
 					w.Write([]byte("heartbeat\n"))
 					w.(http.Flusher).Flush()
 				}
@@ -107,7 +112,7 @@ func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
 			if len(got) == 0 || got[len(got)-1] != "answer" {
 				t.Fatalf("没等到排队之后的回复：%q", got)
 			}
-			if took := time.Since(start); took < 4*150*time.Millisecond {
+			if took := time.Since(start); took < 3*350*time.Millisecond {
 				t.Fatalf("测试前提不成立：排队只用了 %v，没比沉默上限长", took)
 			}
 		})

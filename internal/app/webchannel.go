@@ -537,8 +537,11 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	// 4) 收下行，直到结束帧。正文（ofs=1）要等下行回了对 ofs=0 的确认（[[]]）再发：
 	// 抢在确认之前发，服务端只回会话 id 和 rid、不生成（实测时有时无，是时序竞争）。
 	// 确认一直不来就按超时补发，免得卡死。
+	// 已收下行帧统一收进 raw，错误返回也要带回 —— 取消/出错路径上
+	// phantomCleanup 要靠 raw 里的 c_xxx 删幽灵会话，跟 doGeminiRequestStop 一致。
 	var raw strings.Builder
 	var ttfb int64 = -1
+	rawBytes := func() []byte { return []byte(raw.String()) }
 	closing := false
 	promptSent := false
 	sendPrompt := func() error {
@@ -553,7 +556,7 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		case <-ackTimer.C:
 			if !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, nil, 0, setCookie, err
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, err
 				}
 			}
 			continue
@@ -561,21 +564,30 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			if !ok {
 				select {
 				case e := <-getErr:
-					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, e
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, e
 				default:
 				}
 				if ctx.Err() != nil {
-					return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie,
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie,
 						fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
 				}
-				return 200, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, nil
+				return 200, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, nil
 			}
 			if ev.Err != nil {
-				return ev.Err.httpStatus(), []byte(ev.Err.Error()), ttfbOr(ttfb, sendAt), setCookie, nil
+				// body 照旧带错误文本；raw 里已收的帧一并附上，phantomCleanup 还能
+				// 从里面找到 c_xxx。
+				msg := ev.Err.Error()
+				var body []byte
+				if raw.Len() > 0 {
+					body = append(rawBytes(), msg...)
+				} else {
+					body = []byte(msg)
+				}
+				return ev.Err.httpStatus(), body, ttfbOr(ttfb, sendAt), setCookie, nil
 			}
 			if ev.Ack && !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, nil, 0, setCookie, err
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, err
 				}
 			}
 			if ev.Line != "" {
@@ -586,7 +598,7 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				raw.WriteByte('\n')
 				if onLine != nil {
 					if err := onLine(ev.Line); err != nil {
-						return 200, []byte(raw.String()), ttfb, setCookie, err
+						return 200, rawBytes(), ttfb, setCookie, err
 					}
 				}
 			}
@@ -596,10 +608,10 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				go func() { _ = post(2, ofs2) }()
 			}
 			if ev.End {
-				return 200, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie, nil
+				return 200, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, nil
 			}
 		case <-ctx.Done():
-			return 0, []byte(raw.String()), ttfbOr(ttfb, sendAt), setCookie,
+			return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie,
 				fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
 		}
 	}

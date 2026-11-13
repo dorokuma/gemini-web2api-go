@@ -1313,7 +1313,9 @@ func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map
 		defer resp.Body.Close()
 		raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
 		if err != nil {
-			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
+			// raw 要原样回传：取消/超时/身份不符时已到达的首帧里可能带着 c_xxx，
+			// 上层 phantomCleanup 要靠它删幽灵会话，置 nil 这条残片就漏网了。
+			return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
 		}
 		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 	}
@@ -1335,7 +1337,8 @@ func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map
 	defer resp.Body.Close()
 	raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
 	if err != nil {
-		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
+		// 同代理分支：raw 里已到的 c_xxx 要留给 phantomCleanup。
+		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
 	}
 	return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 }

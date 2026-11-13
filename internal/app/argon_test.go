@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -707,5 +708,54 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 	setRT(false, true, false)
 	if p2 := phantomCleanupFunc("ck", "sa", "", "", 0); p2.enabled {
 		t.Fatal("missing xsrf should disable")
+	}
+
+	// 真实 HTTP 回归（must-fix）：上游已写出带 c_xxx 的首帧，客户端随后取消。
+	// doGeminiRequestStop 在 err != nil 时必须仍带回已读到的 raw，否则首帧里的
+	// c_xxx 被丢、幽灵会话漏删。这里走代理分支（stdlib，httptest 服务器当上游）。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		io.WriteString(w, frame+"\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	status, raw, _, _, err := doGeminiRequestStop(ctx, "http://upstream.invalid/StreamGenerate",
+		"f.req=x", map[string]string{}, srv.URL, func(string) error { return nil }, nil)
+	if err == nil {
+		t.Fatal("客户端取消应报错")
+	}
+	if status != 200 {
+		t.Fatalf("首帧已响应，status=%d want 200", status)
+	}
+	// 回归断言：错误路径不能把已读到的 raw 丢成 nil。
+	if got := extractConversationID(string(raw)); got != "c_deadbeef1234abcd" {
+		t.Fatalf("错误路径丢了已读 raw：raw=%q cid=%q", truncate(string(raw), 120), got)
+	}
+
+	// feed + flush 走通到底：打桩 deleteConversationFn 确认 GzXR5e 会发出。
+	setRT(true, false, false)
+	deleted := make(chan string, 1)
+	prevDel := deleteConversationFn
+	deleteConversationFn = func(cid, cookie, sapisid, xsrf, proxy string, authuser int) {
+		deleted <- cid
+	}
+	defer func() { deleteConversationFn = prevDel }()
+	pc := phantomCleanupFunc("ck", "sa", "xs", "", 0)
+	pc.feed(string(raw))
+	pc.flush()
+	select {
+	case cid := <-deleted:
+		if cid != "c_deadbeef1234abcd" {
+			t.Fatalf("GzXR5e 删的 cid=%q want c_deadbeef1234abcd", cid)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("flush 没有发出 GzXR5e 删除请求")
 	}
 }

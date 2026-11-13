@@ -890,6 +890,9 @@ func (p *phantomCleanup) feed(raw string) {
 	}
 }
 
+// deleteConversationFn 是删会话的实现，测试打桩观察 GzXR5e 是否发出。
+var deleteConversationFn = deleteConversation
+
 // flush 在请求返回前调一次，把收集到的 cid 逐条 GzXR5e 删掉（异步）。
 // 幂等：多次调用无副作用（map 只在 feed 里写，这里只读）。
 func (p *phantomCleanup) flush() {
@@ -898,7 +901,7 @@ func (p *phantomCleanup) flush() {
 	}
 	for cid := range p.cids {
 		logf("[phantom] 删残留会话 %s", cid)
-		go deleteConversation(cid, p.cookie, p.sapisid, p.xsrf, p.proxy, p.authuser)
+		go deleteConversationFn(cid, p.cookie, p.sapisid, p.xsrf, p.proxy, p.authuser)
 	}
 }
 
