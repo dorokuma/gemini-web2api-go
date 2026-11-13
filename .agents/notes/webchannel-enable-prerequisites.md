@@ -36,6 +36,26 @@
   `TestWCHandshakeFailureRedactsBody`（参数化 200/非200）、
   `TestWCSendRedactsRequestBuildError`、`TestWCRedactErrChainIsRedacted`、
   `TestWCRedactErrPreservesTimeout`。
+- **本轮收尾（O-1/O-6）**：下行/上行非 200 分支的 `"xsrf"` 标记已删除——WC 路径从不
+  发送 XSRF token（`wcHTTPHeaders` 只放 API key/SAPISIDHASH/模型头），且两处返回 err、
+  `statusCode=0` 不进 `gemini.go` 的 400 自愈分支，标记无任何消费者；握手分支标记
+  保留并注明无消费者可后续删除。同时第 4 条修复说明里“SF1 下行/上行不回传 body、
+  `Timeout()/Temporary()` 沿错误链下钻”两点已随上轮落地，此处一并登记。
 - **第 6、7 条部分缓解**：链上脱敏保留参数名与非敏感参数（`SID=%3Credacted%3E`、
   `VER=8` 等）便于定位；但 `wcRedactParam` 的 `;`/fragment/大小写变体仍未覆盖。
 - **第 1/2/3/5 条未动**，`useWC` 接线前必须先处理（当前 `gemini.go` `useWC = false`）。
+
+## 审计观察项（oracle O-1..O-6，均带 [pattern:webchannel-enable-prerequisites]）
+
+- **O-1**：WC 不参与 XSRF 自愈（握手 `"xsrf"` 标记保留但无消费者，下行/上行已删除）。
+  **接线前确认**——接线时若握手 400 诊断需要被 `isXSRFError` 命中，须重新评估该标记。
+- **O-2**：`*url.Error` 分支未做深链下钻（`url.Error→fmt→net.Error` 时 `Timeout()`
+  仍会丢），理论项，`errors.As` 本就只选外层。→ 观察，接线前不必修。
+- **O-3**：`wcSanitizeErr` 不跟随 `errors.Join` 的 `Unwrap() []error`，仓库无此用法。
+  → 观察，接线前不必修。
+- **O-4**：诊断里「响应体 N 字节」是 `LimitReader` 截断后长度（下行/上行 ≤4096、
+  握手 ≤1MB），排障可能误判真实体长。→ 观察，必要时改文案为「已读 N 字节」。
+- **O-5**：`wcParseStatus` 兜底 `truncate(string(p), 200)` 仍会把无法识别的
+  **200 帧**前 200 字节带进 `requests.error`/502/`last_error`（pre-existing，属
+  200 帧路径，不在 SF1 不回传响应体的范围）。→ **接线前必修**。
+- **O-6**：本条目（文档同步，即本节与 CHANGELOG 的更新）。

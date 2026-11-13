@@ -573,6 +573,8 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		// 分支的考量）。只给状态码/字节数/是否疑似含会话帧的定位信息。
 		// 上层依赖核查：非 200 只读 statusCode 与 raw 文本；XSRF 自愈判 400+正文含
 		// "xsrf"（isXSRFError），这里把该信号原样透出成标记以保住判定，不带正文。
+		// WC 不参与 XSRF 自愈（本协议不发 xsrf token），该标记仅为与旧协议错误分类
+		// 保持文本一致；若后续确认无消费者可一并删除。
 		diag := fmt.Sprintf("processSession 握手 HTTP %d: 响应体 %d 字节, 含会话帧=%v",
 			hs.status, len(hsBody), bytes.Contains(hsBody, []byte(`["c","`)))
 		if bytes.Contains(hsBody, []byte(`"xsrf"`)) {
@@ -620,13 +622,8 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				b, _ := io.ReadAll(io.LimitReader(g.body, 4096))
 				g.body.Close()
 				// 不回传上游响应体：本错误经 lastErr 进 requests.error、502 响应
-				// 和三张 last_error 表，原样带出会外泄。"xsrf" 信号同握手分支
-				// 透出成标记，保住上层 isXSRFError 判定（当前 useWC=false 不可达，
-				// 属防御性一致）。
+				// 和三张 last_error 表，原样带出会外泄。
 				diag := fmt.Sprintf("processSession 下行 HTTP %d: 响应体 %d 字节", g.status, len(b))
-				if bytes.Contains(b, []byte(`"xsrf"`)) {
-					diag += `, "xsrf"`
-				}
 				getErr <- errors.New(diag)
 				return
 			}
@@ -681,9 +678,6 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		if resp.status != 200 {
 			// 同下行分支：不回传上游响应体（见下行处注释）。
 			diag := fmt.Sprintf("processSession 上行 ofs=%d HTTP %d: 响应体 %d 字节", ofs, resp.status, len(b))
-			if bytes.Contains(b, []byte(`"xsrf"`)) {
-				diag += `, "xsrf"`
-			}
 			return errors.New(diag)
 		}
 		return nil

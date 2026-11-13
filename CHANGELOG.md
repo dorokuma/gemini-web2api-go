@@ -12,6 +12,12 @@
 - **WebChannel 握手 URL 中的 `$httpHeaders`/`SID`/`gsessionid` 在错误信息中脱敏**。
   请求构造失败、握手失败和 `errors.Unwrap`/`errors.As` 拿到的错误链上都不再回传
   API key、SAPISIDHASH 或会话值。当前 `web_channel` 未启用（`useWC=false`），无运行时影响。
+- **WebChannel 下行/上行非 200 响应不再回传上游响应体**，只给状态码与字节数等
+  定位信息，避免上游错误内容经 `requests.error`/502/`last_error` 外泄。
+- **WebChannel 脱敏错误链的 `Timeout()`/`Temporary()` 沿链下钻**，重建后的
+  `*wcRedactedError`/`*url.Error` 转发到底层 `net.Error`，超时重试判定不丢。
+- **WebChannel 凭据脱敏覆盖握手、请求构造与错误链**（`wcRedactErr`/`wcSanitizeErr`），
+  `Unwrap`/`errors.As` 命中的每个节点都脱敏。
 
 ## 4.28.0
 
