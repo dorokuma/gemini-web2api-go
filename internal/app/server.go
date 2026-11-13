@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const Version = "4.28.0-magpie.2"
+// Version 由发布构建注入（-X gemini-web2api/internal/app.Version=<tag>），
+// 源码里保持 "dev"：本地 go build 出来的是开发版，release workflow 按 tag 覆盖。
+// 之前是个写死的常量，发新版忘了同步时 --version 会报旧版（见 .github/workflows/release.yml）。
+var Version = "dev"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -168,11 +171,25 @@ func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig
 		return text, nil, res, nil
 	}
 	if text == "" {
+		// 帧里确实有内容但正文抽空了：整条回复就是个无法解析的 tool_call 围栏、
+		// 协议字段又变了，或只有思考链没有正文。跟「没帧」分开报 empty_content
+		// —— 上游明明回了东西，按 no_content_frame 查会找错方向。
+		//
+		// 只有思考链（reasoning-only）也报错，不把思考链当正文糊弄出去：
+		// reasoning_content 字段是给「正文之外附带的推理过程」用的，拿它顶替
+		// content 等于回一个「成功但没有答案」的假 200，跟空正文一样会误导客户端。
+		if hasContentFrame(res.Raw) {
+			return "", nil, res, &diagErr{
+				err:    fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+				reason: reasonEmptyContent, res: res}
+		}
 		// 上游拒绝时只回一个结束帧、没有内容帧（实测被拒时 raw 仅 216
 		// 字节）。这种情况必须报错：以前会当成空回复返回 200 + content:null，
 		// 客户端看不出请求其实失败了。
 		// 注意不能用 BardErrorInfo 判错 —— 正常响应的结束帧里也带这个码。
-		return "", nil, res, fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+		return "", nil, res, &diagErr{
+			err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
+			reason: reasonNoContentFrame, res: res}
 	}
 	var toolCalls []ToolCall
 	if len(tools) > 0 {
@@ -183,7 +200,9 @@ func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig
 	// 不能回 200 + content:null 且不带 tool_calls —— 客户端看不出请求其实失败了。
 	// 画布/媒体两类「正文可空」的路径在上面已先 return，这里不会误伤。
 	if text == "" && len(toolCalls) == 0 {
-		return "", nil, res, fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+		return "", nil, res, &diagErr{
+			err:    fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+			reason: reasonEmptyContent, res: res}
 	}
 	return text, toolCalls, res, nil
 }
@@ -326,21 +345,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if clientGone(r, "chat.completions", modelName, prompt, res, stream) {
 			return
 		}
-		mde, downgraded := err.(*ModelDowngradedError)
+		var mde *ModelDowngradedError
+		downgraded := errors.As(err, &mde)
 		status := 502
 		if downgraded {
 			status = 429
 		}
-		recordRequest("chat.completions", modelName, prompt, "", res, status, err.Error(), stream)
+		recordUpstreamFailure("chat.completions", modelName, prompt, res, status, err, stream)
 		if sse != nil && sse.Started() {
-			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			sse.Fail(err, res) // 已经开流，HTTP 状态码改不了了
 			return
 		}
 		if downgraded {
 			writeModelDowngraded(w, mde)
 			return
 		}
-		if ptl, ok := err.(*PromptTooLongError); ok {
+		var ptl *PromptTooLongError
+		if errors.As(err, &ptl) {
 			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
 			// 一个答非所问的 200，根本看不出请求其实没送到。
 			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
@@ -348,7 +369,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"code": "context_length_exceeded"}})
 			return
 		}
-		if rle, ok := err.(*RateLimitError); ok {
+		var rle *RateLimitError
+		if errors.As(err, &rle) {
 			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
 				"message": rle.Error(),
 				"type":    "rate_limit_exceeded",
@@ -356,7 +378,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}})
 			return
 		}
-		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		writeUpstreamError(w, err, res)
 		return
 	}
 
@@ -718,14 +740,16 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		if clientGone(r, "responses", modelName, prompt, res, stream) {
 			return
 		}
-		mde, downgraded := err.(*ModelDowngradedError)
+		var mde *ModelDowngradedError
+		downgraded := errors.As(err, &mde)
 		status := 502
 		if downgraded {
 			status = 429
 		}
-		recordRequest("responses", modelName, prompt, "", res, status, err.Error(), stream)
+		recordUpstreamFailure("responses", modelName, prompt, res, status, err, stream)
 		if stream {
-			errObj := map[string]string{"message": err.Error()}
+			// Responses 流式状态码已锁 200，诊断走 response.failed 事件（同一份字段）。
+			errObj := upstreamErrorJSON(err, res)
 			if downgraded {
 				errObj["code"] = "model_downgraded"
 			}
@@ -745,7 +769,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			writeModelDowngraded(w, mde)
 			return
 		}
-		if ptl, ok := err.(*PromptTooLongError); ok {
+		var ptl *PromptTooLongError
+		if errors.As(err, &ptl) {
 			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
 			// 一个答非所问的 200，根本看不出请求其实没送到。
 			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
@@ -753,7 +778,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"code": "context_length_exceeded"}})
 			return
 		}
-		if rle, ok := err.(*RateLimitError); ok {
+		var rle *RateLimitError
+		if errors.As(err, &rle) {
 			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
 				"message": rle.Error(),
 				"type":    "rate_limit_exceeded",
@@ -761,7 +787,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			}})
 			return
 		}
-		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		writeUpstreamError(w, err, res)
 		return
 	}
 

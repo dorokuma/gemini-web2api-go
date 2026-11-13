@@ -112,6 +112,17 @@ The projects most often compared with this one are the Python [Sophomoresty/gemi
   config changes applied without a restart and a top-bar notice when a new release is out
 - **Prompt and response bodies are never stored** — metadata only (length, latency,
   model, status)
+- Upstream failures return 502 with a structured diagnosis: `reason` (machine code:
+  `no_content_frame` no content frames at all / `failure_reply` upstream canned error
+  reply / `upstream_timeout` / `empty_content` frames present but no extractable text —
+  including reasoning-only replies, since the thinking trace is `reasoning_content`,
+  not an answer, and faking a 200 is worse than failing / `upstream_http` /
+  `upstream_error` fallback), `upstream_model` (upstream self-reported display name;
+  `unknown` only means no parseable self-report on that final attempt, not a
+  permission verdict), `frames` (total `wrb.fr` entries in that response, end frame
+  included), `content_frame` (whether existing text/reasoning detection recognized a
+  content frame), `hint` (one-line human advice). The same `[reason]` prefix is
+  written to `requests.error` for panel filtering
 
 ## Quick start
 
@@ -165,6 +176,16 @@ git clone https://github.com/zexadev/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
+```
+
+A plain `go build` prints `dev` for `--version`: the version isn't a hardcoded
+constant — `internal/app` has `var Version = "dev"` and the release pipeline
+injects it at build time (`-ldflags "-X gemini-web2api/internal/app.Version=<tag>"`
+in `release.yml`; Docker images take `--build-arg VERSION=<tag>`, see `Dockerfile`).
+To stamp a local build:
+
+```bash
+go build -ldflags "-X gemini-web2api/internal/app.Version=my-build" -o gemini-web2api-go .
 ```
 
 Changed the code and want it in a container? Uncomment the two `build:` lines in
@@ -694,6 +715,7 @@ docker-compose.yml         single container, pulls the ghcr image by default, sq
 | We return **429** | Every IP slot is at its concurrency/RPM/RPH limit. **This is not Google refusing** and no upstream quota was consumed | Add proxies, or raise the limits on the Settings page |
 | Panel diagnostics show **302 → `google.com/sorry/index`** | This exit IP is blocked by Google (after 80-180 requests, depending on connection strategy and exit quality) | Change exit / add proxies. **The block is hard, not probabilistic** (60 probes after a block, zero successes), so retrying in place is pointless |
 | Occasional empty responses, logged as an upstream refusal | Upstream transient refusal (`1155`). There is no predictable threshold — it correlates with neither rate, concurrency, nor cumulative count | Resend once and it usually works. **Lowering RPM does not help**: measured, it is unrelated to request rate |
+| **502 with `reason: empty_content`** | Upstream returned frames but no usable text. Reasoning-only replies (only a thinking trace) also land here: the trace is `reasoning_content`, not an answer, so we return 502 instead of a fake 200 with empty content | Retry once; if it repeats, the clean-up rules stripped the body or the wire format changed — file an issue |
 | Every request times out | This host can't reach `gemini.google.com` | Configure a proxy (panel or `--proxy`). Note that **`HTTPS_PROXY` is not read** |
 | Exits at startup with `unable to open database file (14)` | The container runs as nonroot (uid 65532) but the bind-mounted host directory is owned by root, so it can't be written | Use a named volume (the default in compose), or `sudo chown -R 65532:65532 ./data` |
 | `gemini-3.1-pro` errors out immediately | It isn't exposed without a cookie, by design | Add an account on the Cookie pool page and it becomes available |

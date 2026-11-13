@@ -106,6 +106,7 @@
 - SQLite 持久化：30 天请求明细 + 永久聚合统计（可选 MySQL / PostgreSQL，设 `SQL_DSN` 即可）
 - 中文管理面板：概览 / 请求记录 / 代理池 / Cookie 池 / 设置 / 关于，配置改完即时生效，有新版本时顶栏提示
 - **prompt 和回复内容永不入库**，只存元数据（长度、耗时、模型、状态）
+- 上游失败回 502 时 body 带结构化诊断：`reason`（机读原因码：`no_content_frame` 一个内容帧都没有 / `failure_reply` 上游出错话术 / `upstream_timeout` 超时 / `empty_content` 有帧但正文为空，含 reasoning-only 只有思考链的情形——思考链不是正文，明返 502 不回假 200 / `upstream_http` 非 200 / `upstream_error` 其余兼底）+ `upstream_model`（上游自报显示名，解析不到为 `unknown`，只表示本次自报不可解，不是模型权限结论）+ `frames`（该次响应 `wrb.fr` 条目总数，含结束帧）+ `content_frame`（是否有既有文本或思考检测能认出的内容帧）+ `hint`（一句人话）。同一套 `[reason]` 前缀落 `requests.error`，面板按类过滤
 
 ## 快速开始
 
@@ -158,6 +159,15 @@ git clone https://github.com/zexadev/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
+```
+
+源码 `go build` 出来的二进制 `--version` 报 `dev`：版本号不是写在代码里的常量，
+`internal/app` 里是 `var Version = "dev"`，由发布流程在构建时注入 ——
+release workflow（`.github/workflows/release.yml`）用 `-ldflags "-X gemini-web2api/internal/app.Version=<tag>"`、
+Docker 镜像走 `--build-arg VERSION=<tag>`（见 `Dockerfile`）。本地想注入版本号也一样：
+
+```bash
+go build -ldflags "-X gemini-web2api/internal/app.Version=my-build" -o gemini-web2api-go .
 ```
 
 改了代码想用容器跑，把 `docker-compose.yml` 里 `build:` 那两行的注释去掉，再 `docker compose up -d --build`。
@@ -764,6 +774,7 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 | 我们返回 **429** | 所有 IP slot 的并发/RPM/RPH 都占满了，**不是 Google 拒绝**，没消耗上游配额 | 加代理，或在「设置」页调高限额 |
 | 面板诊断显示 **302 → `google.com/sorry/index`** | 这个出口 IP 被 Google 拦了（80-180 次请求后，取决于连接策略和出口质量） | 换出口/加代理。**是硬拦不是概率性**（被拦后 60 次探测零成功），原地重试没有意义 |
 | 偶发空响应、面板记为上游拒绝 | 上游瞬时拒绝（`1155`），没有可预测阈值，跟频率/并发/累积次数都无关 | 重发一次通常就好。**降 RPM 解决不了**，实测跟频率无关 |
+| **502 返回 `reason: empty_content`** | 上游回了内容帧但抽不出正文。只有思考链（reasoning-only）也归这一类：思考链是 `reasoning_content` 辅助字段，不能顶替正文，拿它当 `content` 等于回一个“成功但没答案”的假 200，所以明返回 502 | 重发一次；反复出现说明清洗规则把正文剥空了或协议字段变了，该看代码 |
 | 请求全部超时 | 本机到 `gemini.google.com` 不通 | 配代理（面板「代理池」或 `--proxy`）。注意**不读 `HTTPS_PROXY` 环境变量** |
 | 启动即退出，报 `unable to open database file (14)` | 容器以 nonroot(uid 65532) 运行，而 bind mount 的宿主目录属主是 root，写不进去 | 改用具名卷（compose 默认已是），或 `sudo chown -R 65532:65532 ./data` |
 | 选 `gemini-3.1-pro` 直接报错 | 没配 cookie 时它不暴露，这是故意的 | 在面板「Cookie 池」导入 cookie 后即可用 |

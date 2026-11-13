@@ -6,6 +6,20 @@
 
 ### 修复
 
+- **502 响应体结构化 + 失败原因落库**。上游调用失败（无内容帧 / 出错话术 / 超时 /
+  抽取后为空）时，502 body 现在带 `reason`/`upstream_model`/`frames`/`content_frame`/`hint` 字段，
+  `requests.error` 写 `[reason]` 前缀、`upstream_model` 记上游自报显示名——即使
+  `log_requests` 关闭也落库，用户现场不再只剩一句 “upstream error”。
+  字段语义：`frames` 是该次响应 `wrb.fr` 条目总数（含结束帧）；`content_frame` 是
+  既有文本或思考检测能否认出内容帧的判据；`upstream_model` 为 `unknown` 表示该最终
+  尝试无可解析的自报名，不代表模型权限结论。多轮续接的「续接无内容帧」中文报错
+  现在带显式 `no_content_frame` reason（错误串无英文特征，单靠串匹配会漏归兜底）；
+  面板错误分类直接认 `[no_content_frame]`/`[failure_reply]` 前缀，不再误归 network。
+  reasoning-only（只有思考链没有正文）明确返回 `empty_content`：思考链是
+  `reasoning_content` 辅助字段不能顶替正文，回假 200 比报错更误导。
+- **`Version` 改为构建注入**。源码里恒为 `var Version = "dev"`，release workflow 与
+  Docker 构建用 `-ldflags -X` 注入 tag，不再出现「发了新版、`GET /` 还报旧版」的固化问题。
+
 - **回复只剩一个无法解析的 ```tool_call``` 围栏时不再返回空回答**。之前返回
   200 且 `content: null`（客户端静默拿不到内容）；现在返回错误，客户端会出现 5xx，
   OpenAI SDK 按默认策略会重试。

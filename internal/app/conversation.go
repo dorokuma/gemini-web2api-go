@@ -377,11 +377,17 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 
 	t0 := time.Now()
 	var lastErr error
+	var lastDiag upstreamDiagMeta
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
 		if cerr := ctx.Err(); cerr != nil {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
+			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, cerr
 		}
+		// 同 streamGenerateOnce：每轮先清上一轮现场，防帧数污染最后一轮。
+		lastDiag = upstreamDiagMeta{}
 		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil)
+		if len(raw) > 0 {
+			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
+		}
 		if len(setCookie) > 0 && conv.cookie != "" {
 			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
 				conv.cookie = merged
@@ -400,10 +406,14 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		}
 		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
 			if cerr := ctx.Err(); cerr != nil {
-				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, cerr
+				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, cerr
 			}
 			if err == nil && statusCode == 200 {
-				lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
+				// 无帧在 conversation.go:412 用中文报错（续接作废提示），错误串里
+				// 没有 "no content frame"，upstreamReason 按串匹配会漏归成兜底
+				// upstream_error —— 显式带 diagErr reason，跟库/单轮同前缀。
+				lastErr = &diagErr{err: fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw)),
+					reason: reasonNoContentFrame}
 			} else if err != nil {
 				lastErr = err
 			} else {
@@ -425,7 +435,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
 				}
 				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
-					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, werr
+					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, werr
 				}
 			}
 			continue
@@ -439,7 +449,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
 				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
-					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, werr
+					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, werr
 				}
 			}
 			continue
@@ -473,7 +483,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			TotalMs:          time.Since(t0).Milliseconds(),
 		}, nil
 	}
-	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, lastErr
+	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
+		Diag: lastDiag, UpstreamModel: lastDiag.Model}, lastErr
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
@@ -553,7 +564,16 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 		if !fresh {
 			convDelete(parentKey)
 		}
-		return "", nil, res, fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+		// 跟 callGemini 同一套：有帧抽不出正文（坏围栏 / 只有思考链）是
+		// empty_content，真没帧才是 no_content_frame。
+		if hasContentFrame(res.Raw) {
+			return "", nil, res, &diagErr{
+				err:    fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+				reason: reasonEmptyContent, res: res}
+		}
+		return "", nil, res, &diagErr{
+			err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
+			reason: reasonNoContentFrame, res: res}
 	}
 	// 存续接状态：客户端下一轮把这段回复原样带回来时，parentKey 会命中这里。
 	// 存的是解析掉围栏后的正文 —— 客户端把 assistant 消息带回来时 content 也是这段。

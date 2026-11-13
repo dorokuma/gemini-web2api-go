@@ -19,17 +19,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # tag 和代码里的 Version 常量对不上就直接失败。
-      # 否则会发出一个 v4.0.1 的包、里面 --version 却打印 4.0.0，
-      # 而这种错要等用户报上来才会发现。
-      - name: Check tag matches Version
+      # Version 是 var、由发布构建用 -ldflags -X 注入 tag 值，源码里恒为 "dev"
+      # （详见 README「版本号」）。这里只校验源码里没被改回写死的版本号——
+      # 写成 const 或具体版本都会让注入和检查失效。
+      - name: Check Version stays injectable
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          # 用 sed 不用 grep -oP：-P 依赖 PCRE 且在非 UTF-8 locale 下直接罢工
-          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/app/server.go)
-          echo "tag=$tag  internal/app/server.go=$code"
-          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 internal/app/server.go 里的 $code 不一致"; exit 1; }
+          # -x 整行精确匹配：注释行或 OtherVersion 之类同名串都不能顶替真实声明行。
+          grep -nx 'var Version = "dev"' internal/app/server.go \
+            || { echo "::error::internal/app/server.go 里 Version 应保持 var Version = \"dev\"，由构建注入"; exit 1; }
 
       - run: go test ./...
 
@@ -46,7 +44,7 @@ jobs:
             out="dist/gemini-web2api-go_${ver}_${os}_${arch}"
             [ "$os" = "windows" ] && bin="$out.exe" || bin="$out"
             echo "building $bin"
-            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$bin" .
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w -X gemini-web2api/internal/app.Version=${GITHUB_REF_NAME#v}" -o "$bin" .
           done
           cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
 

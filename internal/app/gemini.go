@@ -300,6 +300,11 @@ type StreamResult struct {
 	// MediaErr 记媒体产物取回失败的原因：生成本身 200 了、但走 hNvQHb / 下载那步挂了。
 	// 调用方据此报错，而不是返回一个只有文字没有图的「半成功」。
 	MediaErr error
+	// Diag 是失败路径上游响应的结构化现场（帧数/有无内容帧/自报模型名），
+	// 由上游响应到达时即时解算——完整 raw 只在内存里过一遍解析器就丢，
+	// 不往 StreamResult 留原文（含内部 token，不能进 502 body 或 requests 表）。
+	// 成功路径不填：Raw 本身已完整带回给正常消费者。
+	Diag upstreamDiagMeta
 }
 
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
@@ -493,13 +498,17 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 
 	// 出错时也要把「用了哪个号 / 哪个出口」带回去，否则失败记录里全是空白。
 	// picked 是拿到 slot 之后才填的，闭包捕获它，后面每次 attrib 都带上当时的出口。
+	// lastDiag 记的是最后一次上游响应即时解算出的帧统计/内容帧/自报模型名（只留
+	// 结构化计数，不留 raw 原文——原文含内部 token，不能进 502 body 或 requests 表）。
 	var picked Proxy
 	var cookieID int64
 	var cookieLabel string
+	var lastDiag upstreamDiagMeta
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
 			ProxyID: picked.ID, ProxyName: picked.Name,
+			Diag: lastDiag, UpstreamModel: lastDiag.Model,
 		}, err
 	}
 
@@ -827,6 +836,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		if err := ctx.Err(); err != nil {
 			return attrib(err)
 		}
+		// 每轮重试先清掉上一轮的帧现场：本轮若在拿到响应前就挂了，诊断得如实说
+		// 「这一轮没帧」，不能把上一轮的（可能是别的原因失败的）帧数留进来。
+		lastDiag = upstreamDiagMeta{}
 		var statusCode int
 		var raw []byte
 		var ttfb int64
@@ -848,6 +860,10 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		// raw 可能为 nil（网络层失败），extractConversationID 对空串返回 ""，安全。
 		if len(raw) > 0 {
 			phantomCleanup.feed(string(raw))
+			// 完整 raw 就地解算成结构化帧统计：帧数按一行多帧逐条目数，内容帧复用
+			// textsInLine/reasoningInLine，自报名复用 extractUpstreamModel——同一帧
+			// 不会因截断而判错，也不会把原文带进失败结果。
+			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
 		}
 		var aie *argonIdentityError
 		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
