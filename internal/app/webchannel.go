@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -260,30 +261,56 @@ func wcRedactErr(err error) error {
 // 敏感参数：
 //   - *url.Error：浅拷贝、URL 换成脱敏版、底层 Err 递归脱敏（类型和 Is 判定不变）；
 //   - 带 Unwrap 的 fmt 包装：脱敏各节点文本后重建整链，sentinel 的 Is 仍成立；
+//   - 整链没有任何节点需要脱敏时原样返回原错误：identity、errors.Is 和底层
+//     net.Error 的 Timeout()/Temporary() 等接口能力全部保留；
 //   - 文本干净的叶子直接返回原值，保证 sentinel 的 errors.Is 命中原对象；
 //   - 文本带敏感参数且不能再向下走的叶子：返回脱敏副本，此时 identity 判定
 //     不再可用（相比外泄 SID/$httpHeaders 是更优取舍）。
+//
+// 重建节点只能是 *url.Error 或 *wcRedactedError，两者都把 Timeout()/Temporary()
+// 转发给底层 Err，超时语义在不得不重建时也 survives。
 func wcSanitizeErr(err error) error {
+	san, changed := wcSanitizeErrChg(err)
+	if !changed {
+		return err
+	}
+	return san
+}
+
+// wcSanitizeErrChg 是 wcSanitizeErr 的内部版，附带报告链上是否有节点被真正脱敏；
+// 什么都没动时返回 (err, false)，调用方据此决定是否原样返回。
+func wcSanitizeErrChg(err error) (error, bool) {
 	if err == nil {
-		return nil
+		return nil, false
 	}
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		out := *ue
 		out.URL = wcRedactURL(ue.URL)
-		out.Err = wcSanitizeErr(ue.Err)
-		return &out
+		sanInner, chg := wcSanitizeErrChg(ue.Err)
+		out.Err = sanInner
+		if out.URL == ue.URL && !chg {
+			return err, false
+		}
+		return &out, true
 	}
 	if inner := errors.Unwrap(err); inner != nil {
-		return &wcRedactedError{msg: wcRedactURL(err.Error()), err: wcSanitizeErr(inner)}
+		msg := wcRedactURL(err.Error())
+		sanInner, chg := wcSanitizeErrChg(inner)
+		if msg == err.Error() && !chg {
+			return err, false
+		}
+		return &wcRedactedError{msg: msg, err: sanInner}, true
 	}
 	if red := wcRedactURL(err.Error()); red != err.Error() {
-		return errors.New(red)
+		return errors.New(red), true
 	}
-	return err
+	return err, false
 }
 
 // wcRedactedError 错误消息是脱敏文本，Unwrap 指向脱敏后的错误，整条链都安全。
+// Timeout()/Temporary() 转发给底层 err（底层不支持则 false）：上层靠
+// net.Error.Timeout() 认上游超时（isUpstreamTimeout），重建包装后不能把它弄丢。
 type wcRedactedError struct {
 	msg string
 	err error
@@ -291,6 +318,18 @@ type wcRedactedError struct {
 
 func (e *wcRedactedError) Error() string { return e.msg }
 func (e *wcRedactedError) Unwrap() error { return e.err }
+func (e *wcRedactedError) Timeout() bool {
+	if t, ok := e.err.(interface{ Timeout() bool }); ok {
+		return t.Timeout()
+	}
+	return false
+}
+func (e *wcRedactedError) Temporary() bool {
+	if t, ok := e.err.(interface{ Temporary() bool }); ok {
+		return t.Temporary()
+	}
+	return false
+}
 
 // wcSend 发一条请求。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
 func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {
@@ -521,7 +560,17 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	hsBody, _ := io.ReadAll(io.LimitReader(hs.body, 1<<20))
 	hs.body.Close()
 	if hs.status != 200 {
-		return hs.status, hsBody, 0, setCookie, nil
+		// 不回传响应体：非 200 的体可能是上游错误 JSON 或含会话帧，原样作 raw 会经
+		// lastErr 拼进 requests.error、502 响应和三张 last_error 表（同下方缺 sid
+		// 分支的考量）。只给状态码/字节数/是否疑似含会话帧的定位信息。
+		// 上层依赖核查：非 200 只读 statusCode 与 raw 文本；XSRF 自愈判 400+正文含
+		// "xsrf"（isXSRFError），这里把该信号原样透出成标记以保住判定，不带正文。
+		diag := fmt.Sprintf("processSession 握手 HTTP %d: 响应体 %d 字节, 含会话帧=%v",
+			hs.status, len(hsBody), bytes.Contains(hsBody, []byte(`["c","`)))
+		if bytes.Contains(hsBody, []byte(`"xsrf"`)) {
+			diag += `, "xsrf"`
+		}
+		return hs.status, []byte(diag), 0, setCookie, nil
 	}
 	var sid string
 	_ = wcReadFrames(strings.NewReader(string(hsBody)), func(it wcItem) bool {

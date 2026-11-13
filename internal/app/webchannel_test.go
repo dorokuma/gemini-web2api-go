@@ -5,15 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 // 下行内容消息：X 是老响应的 inner 数组。正文要够长，textsInLine 对太短的行直接跳过。
 const wcTestText = "伦敦是英国的首都，一座将千年历史与现代文化融合在一起的国际大都市，泰晤士河穿城而过。"
+
+// wcTestAPIKey 是测试占位 API key（AIza + 35 位占位字符，匹配 wcKeyRe）。
+// AGENTS.md：测试里严禁真实密钥；39 位 Google API key 形状的常量一律用它。
+const wcTestAPIKey = "AIzaTESTKEYAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 func wcContentPayload(flag string) string {
 	x := `[null,["c_1","r_2"],null,null,[["rc_3",["` + wcTestText + `"],null,null,null,null,null,null,[1],"zh"]],` +
@@ -124,7 +131,7 @@ func TestWCInnerWithoutPrompt(t *testing.T) {
 // 握手 URL 的 $httpHeaders 塞着 API key 和 SAPISIDHASH：错误往外带 URL 时必须脱敏，
 // 但 host、VER= 等非敏感参数要留着便于定位；实际发送的 URL 不能动。
 func TestWCRedactURL(t *testing.T) {
-	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	const apiKey = wcTestAPIKey
 	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
 	raw := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
 		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
@@ -184,7 +191,7 @@ func TestWCRedactURL(t *testing.T) {
 // 传输层失败走代理分支（stdlib）时，*url.Error 里不能再见到凭据；
 // Op 和底层错误要保留，Timeout() 之类行为不变。
 func TestWCSendRedactsURLError(t *testing.T) {
-	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	const apiKey = wcTestAPIKey
 	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
 	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
 		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
@@ -263,7 +270,7 @@ func TestWCSendRedactsURLError(t *testing.T) {
 // 脱敏必须覆盖整条错误链：调用方走 Unwrap()/errors.As 拿到的任何节点都不能
 // 带出原文 URL（$httpHeaders、SID、gsessionid），同时 sentinel 的 errors.Is 判定不变。
 func TestWCRedactErrChainIsRedacted(t *testing.T) {
-	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	const apiKey = wcTestAPIKey
 	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
 	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
 		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
@@ -328,7 +335,7 @@ func TestWCRedactErrChainIsRedacted(t *testing.T) {
 // 请求构造失败（URL 含非法字符）时，*url.Error 的 Error() 带完整 URL ——
 // $httpHeaders 里有 API key 和 SAPISIDHASH，必须经 wcRedactErr 脱敏。
 func TestWCSendRedactsRequestBuildError(t *testing.T) {
-	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	const apiKey = wcTestAPIKey
 	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
 	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
 		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
@@ -361,58 +368,142 @@ func TestWCSendRedactsRequestBuildError(t *testing.T) {
 	}
 }
 
+// S3 回归：脱敏包装不能把传输层超时弄丢。isUpstreamTimeout 靠
+// errors.As(err, &net.Error) + Timeout() 认上游超时（决定 retry_on_timeout 开关）；
+// 重建的链节点要么原样返回、要么 Timeout()/Temporary() 转发给底层。
+func TestWCRedactErrPreservesTimeout(t *testing.T) {
+	timeoutErr := &net.OpError{Op: "dial", Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}
+
+	// 情形 1：本次没有任何东西可脱敏 —— 整链原样返回，超时判定不变。
+	clean := &url.Error{Op: "Post", URL: "https://h/?SID=SIDV", Err: timeoutErr}
+	w := wcRedactErr(clean)
+	var ne net.Error
+	if !errors.As(w, &ne) || !ne.Timeout() {
+		t.Fatalf("clean 链 Timeout() 丢失: %T %v", w, w)
+	}
+	if !isUpstreamTimeout(w) {
+		t.Fatalf("clean 链 isUpstreamTimeout 应判超时: %T %v", w, w)
+	}
+	var ue *url.Error
+	if !errors.As(w, &ue) {
+		t.Fatalf("clean 链应保留 *url.Error: %T", w)
+	}
+	// 顶层 URL 已被脱敏（SID 是 wcRedactParams），但底层超时节点什么都没脱敏
+	// 时必须原样返回 —— 旧代码一律包成 *wcRedactedError，net.Error 断言失效。
+	if ue.Err != timeoutErr {
+		t.Fatalf("底层超时错误未原样保留（被重建包装）: %T %v", ue.Err, ue.Err)
+	}
+	if !errors.Is(w, timeoutErr) {
+		t.Fatalf("errors.Is 沿链命中原超时对象失效: %T", w)
+	}
+
+	// 情形 2：确实需要脱敏（URL 带 $httpHeaders/SID）—— 文本已脱敏，
+	// 重建的节点 Timeout() 转发给底层，超时语义仍 survives。
+	dirty := &url.Error{Op: "Post",
+		URL: "https://h/?$httpHeaders=X-Goog-Api-Key%3A" + wcTestAPIKey + "&SID=SID_PLACEHOLDER",
+		Err: timeoutErr}
+	w2 := wcRedactErr(dirty)
+	for _, leak := range []string{"SID_PLACEHOLDER", wcTestAPIKey} {
+		if strings.Contains(w2.Error(), leak) {
+			t.Fatalf("脱敏后错误仍含 %q: %s", leak, w2)
+		}
+	}
+	var ne2 net.Error
+	if !errors.As(w2, &ne2) || !ne2.Timeout() {
+		t.Fatalf("脱敏链 Timeout() 丢失: %T %v", w2, w2)
+	}
+	if !isUpstreamTimeout(w2) {
+		t.Fatalf("脱敏链 isUpstreamTimeout 应判超时: %T %v", w2, w2)
+	}
+
+	// 情形 3：链中间节点文本带 URL（非 *url.Error 节点）—— 重建为
+	// *wcRedactedError 时 Timeout() 也必须沿链转发。
+	wrapped := wcRedactErr(fmt.Errorf("req %s failed: %w",
+		"https://h/?SID=SID_PLACEHOLDER", timeoutErr))
+	if strings.Contains(wrapped.Error(), "SID_PLACEHOLDER") {
+		t.Fatalf("中间节点未脱敏: %s", wrapped)
+	}
+	var ne3 net.Error
+	if !errors.As(wrapped, &ne3) || !ne3.Timeout() {
+		t.Fatalf("wcRedactedError 包装后 Timeout() 丢失: %T %v", wrapped, wrapped)
+	}
+	if !isUpstreamTimeout(wrapped) {
+		t.Fatalf("wcRedactedError 包装后 isUpstreamTimeout 应判超时: %T %v", wrapped, wrapped)
+	}
+}
+
 // 握手返 200 但 X-HTTP-Session-Id 缺失时，错误文本不能回传响应体 ——
 // 体里的 ["c","<SID>"] 帧是可复用会话值，会经 last_error 和 502 响应外泄。
 func TestWCHandshakeFailureRedactsBody(t *testing.T) {
-	const apiKey = "AIza" + "AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa1" // 35 字符，匹配 wcKeyRe
 	const probe = "SID_PROBE_VALUE"
+	cases := []struct {
+		name       string
+		hsStatus   int
+		hsBody     string
+		wantStatus int
+	}{
+		// 200 但无 X-HTTP-Session-Id：body 带 c 帧（含 SID 探针值）。
+		{"200-无会话帧", 200, "40\n[[0,[\"c\",\"" + probe + "\"]]]", 502},
+		// 非 200：上游错误体原样回传会经 lastErr 进 requests.error、502 响应
+		// 和三张 last_error 表，探针串绝不能出现。
+		{"非200-400", 400, "[[\"er\",\"" + probe + "\",400]]", 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				resp := func(status int, h http.Header, body string) *http.Response {
+					return &http.Response{
+						StatusCode: status, Status: fmt.Sprintf("%d", status),
+						Header:  h,
+						Body:    io.NopCloser(strings.NewReader(body)),
+						Request: req,
+					}
+				}
+				switch req.URL.Path {
+				case "/app", "/u/0/app":
+					return resp(200, http.Header{}, `"d2zJAe":"`+wcTestAPIKey+`"`), nil
+				case "/v1/processSession":
+					return resp(c.hsStatus, http.Header{}, c.hsBody), nil
+				}
+				return resp(404, http.Header{}, ""), nil
+			})
+			const fakeProxy = "http://wchsredact.invalid:3128"
+			stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+			stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+			defer func() {
+				stdlibClientCache.Delete(fakeProxy + "|0")
+				stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+			}()
 
-	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		resp := func(status int, h http.Header, body string) *http.Response {
-			return &http.Response{
-				StatusCode: status, Status: fmt.Sprintf("%d", status),
-				Header:  h,
-				Body:    io.NopCloser(strings.NewReader(body)),
-				Request: req,
+			wcKeyMu.Lock()
+			oldKey, oldAt := wcKey, wcKeyAt
+			wcKey, wcKeyAt = "", time.Time{}
+			wcKeyMu.Unlock()
+			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
+
+			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
+			status, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			if err != nil {
+				t.Fatalf("握手失败应走状态码而不是 err: %v", err)
 			}
-		}
-		switch req.URL.Path {
-		case "/app", "/u/0/app":
-			return resp(200, http.Header{}, `"d2zJAe":"`+apiKey+`"`), nil
-		case "/v1/processSession":
-			// 200 但无 X-HTTP-Session-Id；body 带 c 帧（含 SID 探针值）。
-			return resp(200, http.Header{}, "40\n[[0,[\"c\",\""+probe+"\"]]]"), nil
-		}
-		return resp(404, http.Header{}, ""), nil
-	})
-	const fakeProxy = "http://wchsredact.invalid:3128"
-	stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
-	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
-	defer func() {
-		stdlibClientCache.Delete(fakeProxy + "|0")
-		stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
-	}()
-
-	wcKeyMu.Lock()
-	oldKey, oldAt := wcKey, wcKeyAt
-	wcKey, wcKeyAt = "", time.Time{}
-	wcKeyMu.Unlock()
-	defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
-
-	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
-	status, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
-	if err != nil {
-		t.Fatalf("握手 200 失败应走状态码而不是 err: %v", err)
-	}
-	if status != 502 {
-		t.Fatalf("缺 gsessionid 应映射 502: status=%d body=%q", status, raw)
-	}
-	if strings.Contains(string(raw), probe) {
-		t.Fatalf("握手失败错误文本回传了响应体里的 SID: %s", raw)
-	}
-	// 仍要留可定位信息：HTTP 状态或响应体字节数。
-	msg := string(raw)
-	if !strings.Contains(msg, "200") || !strings.Contains(msg, "字节") {
-		t.Fatalf("错误文本应含状态码/字节数便于定位: %s", msg)
+			if status != c.wantStatus {
+				t.Fatalf("status=%d（期望 %d）body=%q", status, c.wantStatus, raw)
+			}
+			if strings.Contains(string(raw), probe) {
+				t.Fatalf("握手失败错误文本回传了响应体里的探针串: %s", raw)
+			}
+			// 锁死：诊断文本里不能出现任何凭据项。
+			msg := string(raw)
+			for _, leak := range []string{"SAPISIDHASH", "X-Goog-Api-Key", wcTestAPIKey} {
+				if strings.Contains(msg, leak) {
+					t.Fatalf("握手失败诊断泄露 %q: %s", leak, msg)
+				}
+			}
+			// 仍要留可定位信息：HTTP 状态或响应体字节数。
+			if !strings.Contains(msg, "HTTP") || !strings.Contains(msg, "字节") {
+				t.Fatalf("错误文本应含状态码/字节数便于定位: %s", msg)
+			}
+		})
 	}
 }

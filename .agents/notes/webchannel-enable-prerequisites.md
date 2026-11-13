@@ -22,14 +22,20 @@
 7. `wcRedactParam` 前导规则在 `;`/片段/大小写变体下失效：只认 `&`/`?` 前导，
    `;` 分隔的参数、URL fragment 内的参数、大小写不同的参数名会漏脱敏。
 
-## 处置状态（2026-11-13 更新）
+## 处置状态（2026-11-14 更新）
 
 - **第 4 条已修复**（S1/S2），并连带修复审计追加发现的 S3（`wcRedactedError.Unwrap()`
-  链上仍指向未脱敏原文）：握手失败改回固定诊断（状态码/字节数/sid 与 gsessionid
-  是否取到的布尔），不再回传响应体；两处构造错误走 `wcRedactErr`；新增
-  `wcSanitizeErr` 让 `Unwrap`/`errors.As` 命中的每个节点都脱敏。回归测试见
-  `internal/app/webchannel_test.go` 的 `TestWCHandshakeFailureRedactsBody`、
-  `TestWCSendRedactsRequestBuildError`、`TestWCRedactErrChainIsRedacted`。
+  链上仍指向未脱敏原文）与 M1（S3 重建错误链丢 `net.Error`/`Timeout()` 判定）：
+  握手失败改回固定诊断（状态码/字节数/是否取到 sid 的布尔），不再回传响应体；
+  **非 200 分支同样不回传响应体**，改给固定诊断（status/字节数/是否疑似含会话帧，
+  XSRF 自愈靠 `isXSRFError` 命中的 `"xsrf"` 标记保留）；两处构造错误走
+  `wcRedactErr`；`wcSanitizeErr` 让 `Unwrap`/`errors.As` 命中的每个节点都脱敏，
+  且链上没有任何节点被脱敏时原样返回原错误，不得不重建时
+  `*wcRedactedError`/`*url.Error` 的 `Timeout()`/`Temporary()` 转发给底层。
+  回归测试见 `internal/app/webchannel_test.go` 的
+  `TestWCHandshakeFailureRedactsBody`（参数化 200/非200）、
+  `TestWCSendRedactsRequestBuildError`、`TestWCRedactErrChainIsRedacted`、
+  `TestWCRedactErrPreservesTimeout`。
 - **第 6、7 条部分缓解**：链上脱敏保留参数名与非敏感参数（`SID=%3Credacted%3E`、
   `VER=8` 等）便于定位；但 `wcRedactParam` 的 `;`/fragment/大小写变体仍未覆盖。
-- **第 1/2/3/5 条未动**，`useWC` 接线前必须先处理。
+- **第 1/2/3/5 条未动**，`useWC` 接线前必须先处理（当前 `gemini.go` `useWC = false`）。
