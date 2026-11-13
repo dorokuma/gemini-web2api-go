@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -589,18 +590,6 @@ func TestArgonMode8Slots(t *testing.T) {
 			t.Errorf("%s inner[79]=%v inner[80]=%v want 8/%d", name, inner[79], inner[80], mc.thinkWire())
 		}
 	}
-
-	// 媒体工具槽位覆盖顺序保持 PR #71 原序：mc.Tool>0 在补齐块之后执行，
-	// Tool 值压过 mode-8 的 inner[49]=40（当前没有 Tool 与 Mode=8 同时存在的型号，防回归）。
-	toolMC := ModelConfig{Mode: 8, Tool: toolImage}
-	toolInner := make([]any, innerSlots)
-	argonMode8Slots(toolInner)
-	if toolMC.Tool > 0 {
-		toolInner[49] = toolMC.Tool
-	}
-	if toolInner[49] != toolImage {
-		t.Errorf("Tool 覆盖后 inner[49]=%v want %d", toolInner[49], toolImage)
-	}
 }
 
 // 4 Hydrogen：3.8 Flash 槽位（hexFlash38 / Mode=1）2026-11 原位升级。三档表项、登录门控、
@@ -686,12 +675,15 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 		rtVal.TemporaryChat, rtVal.AutoDeleteConversation, rtVal.MultiTurn = temp, autodel, multi
 		rtMu.Unlock()
 	}
+	credsOf := func(cookie, xsrf string) func() (string, string, string, int) {
+		return func() (string, string, string, int) { return cookie, "sa", xsrf, 0 }
+	}
 	setRT(true, false, true) // temporary+multi → multi 优先，关
-	if p := phantomCleanupFunc("ck", "sa", "xs", "", 0); p.enabled {
+	if p := phantomCleanupFunc(credsOf("ck", "xs"), ""); p.enabled {
 		t.Fatal("multi_turn on should disable phantom cleanup")
 	}
 	setRT(true, false, false) // temporary only → 开
-	p := phantomCleanupFunc("ck", "sa", "xs", "", 0)
+	p := phantomCleanupFunc(credsOf("ck", "xs"), "")
 	if !p.enabled {
 		t.Fatal("temporary_chat should enable phantom cleanup")
 	}
@@ -706,7 +698,7 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 	}
 	// xsrf 缺失 → no-op（删不了，不浪费 RPC）。
 	setRT(false, true, false)
-	if p2 := phantomCleanupFunc("ck", "sa", "", "", 0); p2.enabled {
+	if p2 := phantomCleanupFunc(credsOf("ck", ""), ""); p2.enabled {
 		t.Fatal("missing xsrf should disable")
 	}
 
@@ -747,7 +739,7 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 		deleted <- cid
 	}
 	defer func() { deleteConversationFn = prevDel }()
-	pc := phantomCleanupFunc("ck", "sa", "xs", "", 0)
+	pc := phantomCleanupFunc(credsOf("ck", "xs"), "")
 	pc.feed(string(raw))
 	pc.flush()
 	select {
@@ -759,3 +751,136 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 		t.Fatal("flush 没有发出 GzXR5e 删除请求")
 	}
 }
+
+// must-fix 回归：400+XSRF 自愈换 token 之后，phantomCleanup 收尾必须带新 token ——
+// 旧版拿的是创建时快照的旧 token，自愈后取消/超时会让 GzXR5e 带着已被拒的旧 token
+// 去删，幽灵照样残留。成功路径不再直调 deleteConversation：同一 cid 由
+// defer phantomCleanup.flush() 删一次，计数断言防"成功分支 + flush"双删。
+//
+// 出口侧不打真网络：streamGenerateOnce 走代理分支（stdlib 客户端），测试把该
+// proxyURL 的 stdlibClientCache 换成走假 RoundTripper 的客户端，handler 按 URL
+// 分派 —— /app 取 XSRF、StreamGenerate 先 400 再 200、/gg-dl 出 PNG。
+func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
+	cid := "c_f00dd00df00dd00d"
+	// 首帧只带 cid（幽灵帧）、次帧带图片 CDN 链让 collectImageURLs 命中，末帧出正文。
+	frame := fmt.Sprintf(`[["wrb.fr","A","[null,[\"%s\"],null,4]",null,"generic"]]`, cid)
+	imgLine := `[["wrb.fr","B","[null,null,null,[null,null,null,\"https://lh3.googleusercontent.com/gg-dl/abc\"]]",null,"generic"]]`
+
+	// 正文帧：textsInLine 取 inner[4][i][1][j] 的字符串，构造同形状的候选回复块。
+	// inner[1] 放 [cid, rid] 供 convIDInLine / parseConvIDs 提取（同 frame 行的 [1][0]）。
+	contentFields := make([]any, 43)
+	contentFields[1] = []any{cid, "r_1"}
+	// 答案给长一点：textsInLine 对 <200 字节的行直接返回 nil，padding 凑够长度。
+	contentFields[4] = []any{[]any{"rc_x", []any{"ok - a deliberately long answer body to pad the wrb.fr line beyond the 200-byte textsInLine minimum length gate"}}}
+	cpayload, _ := json.Marshal(contentFields)
+	crow, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(cpayload), nil}})
+	contentLine := string(crow)
+
+	var first atomic.Bool
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		var body []byte
+		if req.Body != nil {
+			body, _ = io.ReadAll(req.Body)
+			_ = req.Body.Close()
+		}
+		resp := func(status int, body string) *http.Response {
+			return &http.Response{
+				StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header:  http.Header{},
+				Body:    io.NopCloser(strings.NewReader(body)),
+				Request: req,
+			}
+		}
+		switch req.URL.Path {
+		case "/app":
+			// SNlM0e 形状是 <token>:<毫秒时间戳>，正则要求整段 ≥10 字符。
+			return resp(200, `"SNlM0e":"tok-new-xyz:1700000000000","cfb2h":"boq_x_20260101.01_p1","qKIAYe":"pid","Ylro7b":"pctx"`), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			if !first.Swap(true) {
+				return resp(400, `[["er",null,400,null,null,[["48448350",["xsrf","tok-new"]]]]]`), nil
+			}
+			return resp(200, ")]}'\n"+frame+"\n"+imgLine+"\n"+contentLine+"\n"), nil
+		case "/gg-dl/abc=s0":
+			r := resp(200, "PNGDATA")
+			r.Header.Set("Content-Type", "image/png")
+			return r, nil
+		}
+		t.Logf("未命中: %s %s body=%.200s", req.Method, req.URL.String(), body)
+		return resp(404, ""), nil
+	})
+	const fakeProxy = "http://fake-exit.invalid:3128"
+	stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+	defer func() {
+		stdlibClientCache.Delete(fakeProxy + "|0")
+		stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+	}()
+
+	// 把池子里塞一条测试号，绑定走我们的"代理"。
+	withPoolCookie(t)
+	acct, ok := pickCookieAccount()
+	if !ok {
+		t.Fatal("池里没有号")
+	}
+	proxyMu.Lock()
+	oldProxies := proxyCache
+	proxyCache = []Proxy{{ID: 999, Name: "test", URL: fakeProxy, Enabled: true}}
+	proxyMu.Unlock()
+	defer func() { proxyMu.Lock(); proxyCache = oldProxies; proxyMu.Unlock() }()
+
+	// token 桩：getXSRF 走缓存路径返回，不发真 HTTP。tok-old 是被上游拒的那个。
+	cookie := acct.Cookie
+	invalidateXSRF(cookie)
+	xsrfMu.Lock()
+	xsrfCache[xsrfKey(cookie, acct.AuthUser)] = xsrfEntry{token: "tok-old", fetched: time.Now()}
+	xsrfMu.Unlock()
+
+	// rtVal：测试进程里 initRuntimeConfig 没跑过，rtVal 是零值（RetryAttempts=0 会
+	// 让整个重试循环一次都不跑直接空返回）。按默认值补重试预算，再开本用例要的开关。
+	saveRt := rtVal
+	defer func() { rtMu.Lock(); rtVal = saveRt; rtMu.Unlock() }()
+	rtMu.Lock()
+	rtVal.RetryAttempts, rtVal.RetryDelaySec = 3, 1
+	rtVal.TemporaryChat, rtVal.AutoDeleteConversation, rtVal.MultiTurn = true, false, false
+	rtMu.Unlock()
+
+	// 打桩：数删除次数，记 token。
+	deleted := make(chan string, 4)
+	prevDel := deleteConversationFn
+	deleteConversationFn = func(cid, cookie, sapisid, xsrf, proxy string, authuser int) {
+		deleted <- xsrf + "|" + cid
+	}
+	defer func() { deleteConversationFn = prevDel }()
+
+	// 媒体工具（toolImage）走 fetchMediaArtifacts 的 /gg-dl 分支，把 PNG 捞回来。
+	mc := ModelConfig{HexID: hexFlash36, Mode: 1, Tool: toolImage}
+	res, err := streamGenerateOnce(context.Background(), "draw", promptCtx{Latest: "draw"}, mc, nil, nil, nil, nil, map[int64]bool{})
+	if err != nil {
+		t.Fatalf("streamGenerateOnce err=%v res=%+v", err, res)
+	}
+	if res == nil || len(res.Artifacts) == 0 {
+		t.Fatalf("没取回产物: artifacts=%d mediaErr=%v raw=%.400s", len(res.Artifacts), res.MediaErr, res.Raw)
+	}
+
+	select {
+	case got := <-deleted:
+		parts := strings.SplitN(got, "|", 2)
+		if parts[1] != cid {
+			t.Fatalf("删的 cid=%q want %s", parts[1], cid)
+		}
+		if parts[0] != "tok-new-xyz:1700000000000" {
+			t.Fatalf("用的 XSRF=%q want tok-new-xyz:1700000000000（旧 token 已被拒，flush 必须用新的）", parts[0])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("flush 没有发出 GzXR5e 删除请求")
+	}
+	select {
+	case extra := <-deleted:
+		t.Fatalf("同一 cid 被删了第二次: %q", extra)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

@@ -816,7 +816,10 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	// 收集到的任一 raw 帧里提取出 c_xxx，就异步 GzXR5e 删掉。成功帧、取消帧、错误帧都管。
 	// 无害性：正常会话不会被误删 —— 该条件本身就意味着「这条会话不该留在账号里」，删掉它
 	// 正是本意；multi_turn 开着时这个函数整体不生效（会话要留给续接）。
-	phantomCleanup := phantomCleanupFunc(cookieStr, sapisid, xsrfToken, proxyURL, authUser)
+	// XSRF 值在 retry 循环里可能被自愈换掉，用闭包读取保证收尾用的总是当前最新的。
+	phantomCleanup := phantomCleanupFunc(func() (cookie, sapisid, xsrf string, authuser int) {
+		return cookieStr, sapisid, xsrfToken, authUser
+	}, proxyURL)
 	defer phantomCleanup.flush()
 
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
@@ -891,6 +894,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
 				if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
+					xsrfToken = tok // 同步给收尾：phantomCleanup 按闭包取当前值
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 					setAuthUserHeaders(geminiHeaders, authUser)
@@ -1003,18 +1007,12 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				logf("[media] 取回 %d 份产物", len(arts))
 			}
 		}
-		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
-		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
-		//
-		// 兜底由 phantomCleanup 统一管（含 temporary_chat 下服务端仍建档的幽灵、以及
-		// 客户端取消/超时时已落库的那条）；这里保留原触发点只是让它在 200 成功时
-		// 立即删、不等 defer。条件放宽为 (AutoDeleteConversation||temporaryChatEligible)
-		// —— 后者开着时幽灵照样产生，旧版「temporary 就不用删」的前提被实测推翻。
-		if (rtCfg().AutoDeleteConversation || temporaryChatEligible()) && cookieStr != "" && xsrfToken != "" {
-			if cid := extractConversationID(string(raw)); cid != "" {
-				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, authUser)
-			}
-		}
+		// #19 自动删会话 / #phantom 幽灵清理：媒体路径的 cid 已在 raw 到达时由
+		// phantomCleanup.feed 收集；删会话统一由 defer phantomCleanup.flush() 收尾
+		// （含 temporary_chat 下服务端仍建档的幽灵、以及客户端取消/超时时已落库的那条）。
+		// 不再在这里直调 deleteConversation：同一 cid 会被 defer 删第二次，多发一次
+		// GzXR5e RPC。条件放宽为 (AutoDeleteConversation||temporaryChatEligible) ——
+		// 后者开着时幽灵照样产生，旧版「temporary 就不用删」的前提被实测推翻。
 		return result, nil
 	}
 	if lastErr != nil {

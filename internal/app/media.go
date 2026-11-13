@@ -856,20 +856,21 @@ func convIDFromPayload(inner []interface{}) (string, bool) {
 // 线程安全：feed 只在请求 goroutine 里调，flush 由 defer 在返回前调一次，删是 go 出去
 // 的 best-effort。同一 cid 只删一次（map 去重）。
 type phantomCleanup struct {
-	enabled  bool
-	cids     map[string]bool
-	cookie   string
-	sapisid  string
-	xsrf     string
-	proxy    string
-	authuser int
+	enabled bool
+	cids    map[string]bool
+	proxy   string
+	// creds 每次删除前按最新值取：400/XSRF 自愈拿到新 token 后会更新 xsrfToken，
+	// 用闭包取到的总是当前值，不会拿到上游已拒的旧 token。
+	creds func() (cookie, sapisid, xsrf string, authuser int)
 }
 
 // phantomCleanupFunc 构造收尾器。条件：(TemporaryChat||AutoDeleteConversation) &&
 // !MultiTurn && cookie!="" —— 这就是「这条会话本来就不该留在账号里」的充要条件。
 // multi_turn 开着时整个返回 no-op（会话要留给续接）。xsrf 拿不到时也退化成 no-op。
-func phantomCleanupFunc(cookie, sapisid, xsrf, proxyURL string, authuser int) *phantomCleanup {
-	p := &phantomCleanup{cookie: cookie, sapisid: sapisid, xsrf: xsrf, proxy: proxyURL, authuser: authuser}
+// creds 由调用方闭包提供，flush 时按需取最新 cookie/XSRF（XSRF 可能被自愈换掉）。
+func phantomCleanupFunc(creds func() (cookie, sapisid, xsrf string, authuser int), proxyURL string) *phantomCleanup {
+	cookie, _, xsrf, _ := creds()
+	p := &phantomCleanup{proxy: proxyURL, creds: creds}
 	p.enabled = (rtCfg().TemporaryChat || rtCfg().AutoDeleteConversation) && !rtCfg().MultiTurn && cookie != "" && xsrf != ""
 	return p
 }
@@ -899,9 +900,10 @@ func (p *phantomCleanup) flush() {
 	if !p.enabled || len(p.cids) == 0 {
 		return
 	}
+	cookie, sapisid, xsrf, authuser := p.creds()
 	for cid := range p.cids {
 		logf("[phantom] 删残留会话 %s", cid)
-		go deleteConversationFn(cid, p.cookie, p.sapisid, p.xsrf, p.proxy, p.authuser)
+		go deleteConversationFn(cid, cookie, sapisid, xsrf, p.proxy, authuser)
 	}
 }
 
