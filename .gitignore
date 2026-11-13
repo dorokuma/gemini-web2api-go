@@ -25,3 +25,6 @@ vendor/
 
 # ─── 本地工程笔记（给 Claude 跨会话续接，不入库不分发）──
 docs/local/
+
+# ─── 代理笔记（白名单模式，需公开者 git add -f 逐条入库）──
+.agents/notes/

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -76,7 +77,11 @@ func contextFilePrompt(latest string, budget int) string {
 //
 // 上传失败**不静默回退到超长内联**：那样上游会把最新提问截掉，客户端拿到一个
 // 答非所问的 200 却看不出问题。
-func prepareContextFile(prompt, latest string, budget int, cookie string, authuser int, proxyURL string) (
+//
+// 附件里只放对话历史，工具协议（pc.Head / pc.Tail）留在正文：agentic 客户端的
+// 请求动辄十几万字节，几乎每轮都走这条路，工具说明和末尾锚点一旦进了附件，模型
+// 就不再稳定地吐 ```tool_call```。工具说明本身就超预算时才退回整段进附件。
+func prepareContextFile(ctx context.Context, prompt string, pc promptCtx, budget int, cookie string, authuser int, proxyURL string) (
 	string, []fileRef, bool, error) {
 	if budget <= 0 || len(prompt) <= budget {
 		return prompt, nil, false, nil
@@ -84,11 +89,50 @@ func prepareContextFile(prompt, latest string, budget int, cookie string, authus
 	if cookie == "" {
 		return prompt, nil, false, nil // 匿名：引用会被回 1100，转了也没用
 	}
-	ref, err := uploadBytes(cookie, authuser, proxyURL, []byte(prompt), contextFileName)
+	history, inline := planContextFile(prompt, pc, budget)
+	ref, err := uploadBytesCtx(ctx, cookie, authuser, proxyURL, []byte(history), contextFileName)
 	if err != nil {
 		return prompt, nil, false, fmt.Errorf("超长对话转附件失败: %w", err)
 	}
-	logf("[context] prompt %d 字节超过 %d，已转成附件 %s", len(prompt), budget, contextFileName)
+	logf("[context] prompt %d 字节超过 %d，已转成附件 %s（附件 %d 字节，内联 %d 字节）",
+		len(prompt), budget, contextFileName, len(history), len(inline))
 	files := []fileRef{{Ref: ref, Name: contextFileName, Kind: 3, Mime: "text/plain"}}
-	return contextFilePrompt(latest, budget), files, true, nil
+	return inline, files, true, nil
+}
+
+// planContextFile 决定附件里放什么、正文里内联什么。
+func planContextFile(prompt string, pc promptCtx, budget int) (history, inline string) {
+	history, inline = prompt, contextFilePrompt(pc.Latest, budget)
+	if h, ok := stripToolProtocol(prompt, pc); ok {
+		if withTools := joinPromptParts(pc.Head, inline, pc.Tail); len(withTools) <= budget {
+			history, inline = h, withTools
+		}
+	}
+	return history, inline
+}
+
+// stripToolProtocol 从拼好的 prompt 里去掉首尾的工具协议，只留对话历史。
+// 没有工具协议、或 prompt 不是按 pc 拼出来的，返回 ok=false。
+func stripToolProtocol(prompt string, pc promptCtx) (string, bool) {
+	if pc.Head == "" && pc.Tail == "" {
+		return prompt, false
+	}
+	body := prompt
+	if pc.Head != "" {
+		if !strings.HasPrefix(body, pc.Head) {
+			return prompt, false
+		}
+		body = strings.TrimPrefix(body[len(pc.Head):], "\n\n")
+	}
+	if pc.Tail != "" {
+		if !strings.HasSuffix(body, pc.Tail) {
+			return prompt, false
+		}
+		body = strings.TrimSuffix(body[:len(body)-len(pc.Tail)], "\n\n")
+	}
+	return body, true
+}
+
+func joinPromptParts(parts ...string) string {
+	return promptParts{body: parts}.join()
 }

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -44,7 +45,22 @@ const (
 //
 // 加长本身是安全的：曾经把它从 80 加到 102 来试 inner[79] 会不会复活，结论是不会
 // —— 模型选择完全由 x-goog-ext-525001261-jspb header 决定，长度不影响。
-const innerSlots = 97
+const innerSlots = 99
+
+// 4 Argon（mode 8）：按浏览器 processSession 抓包补齐槽位（protobuf 字段 N == inner[N-1]，
+// 2026-11-09 实测）。不补的话付费号上请求会挂起没有回应。BotGuard 槽位 inner[3]/[4] 留空。
+// inner[96] 按抓包恒为 1：mode-8 请求服务端要求该槽为 1，与思考档位无关。
+// 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用，两条路径发的 inner 必须一致。
+func argonMode8Slots(inner []interface{}) {
+	inner[6] = []interface{}{1}
+	inner[30] = []interface{}{}
+	inner[49] = 40
+	inner[68] = 2
+	inner[83] = 1
+	inner[91] = 1
+	inner[96] = 1
+	inner[98] = 1
+}
 
 // inner[80] / 模型 header 下标 15 的取值：1=普通，2=扩展思考。
 //
@@ -127,24 +143,38 @@ var Models = map[string]ModelConfig{
 	// gemini-3.7-flash 保留为别名（同 hex）。
 	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
 	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	// 4 Hydrogen：Google 2026-11 把同一槽位（hexFlash38 / Mode=1）从 3.8 Flash 原位升级成
+	// "4 Hydrogen"。与 3.8 三条完全同 hex 同 Mode，仅对外名和登记的 Upstream 名不同。
+	// 仍 gate 成要 cookie（modelNeedsLogin 按 hexFlash38 覆盖）。
+	"gemini-4-hydrogen": {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", Desc: "4 Hydrogen (Everyday help, replaced 3.8 Flash on same slot); needs a signed-in Google account"},
 	// 4 Argon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
 	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
 	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Argon", Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
+	// 4 Carbon：Google 2026-11 起把同一槽位（hexArgon4 / Mode=8）的显示名原位改名
+	// "4 Argon" → "4 Carbon"。与 argon 三条完全同配，仅对外名和登记的 Upstream 名不同。
+	"gemini-4-carbon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Carbon", Desc: "4 Carbon (renamed 4 Argon, same slot); needs a signed-in PAID/Ultra Google account"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
-	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
-	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
-	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
+	"gemini-3.6-flash-thinking":        {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.5-flash-lite-thinking":   {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
+	"gemini-3.1-pro-thinking":          {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
+	"gemini-3.8-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.7-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
+	"gemini-3.8-flash-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "3.8 Flash", Desc: "3.8 Flash at the Medium thinking tier; needs a signed-in Google account"},
 	// 4 Argon + 扩展思考：Mode=8（选 Argon）+ inner[80]=2（上游现在把这档叫 "High"）。
 	// 实测回报 "4 Argon High" 且带思考链（硬题 985 字符，走既有 [4][0][37][0][0] 路径，
 	// 无需改抽取代码）→ 映射成 reasoning_content。付费/Ultra 专属。
 	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Argon", Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
 	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
 	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
-	"gemini-4-argon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-argon-thinking-medium":  {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-carbon-thinking":        {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Carbon", Desc: "4 Carbon with extended thinking (High tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
+	"gemini-4-carbon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Carbon", Desc: "4 Carbon at the Medium thinking tier; needs a signed-in PAID/Ultra account"},
+	// 4 Hydrogen 思考档：与 3.8 Flash 同槽位（hexFlash38 / Mode=1），高档自报 "4 Hydrogen High"
+	// 并吐思考链，中档 think 线值 thinkingMedium、服务端内部思考不吐链。
+	"gemini-4-hydrogen-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", Desc: "4 Hydrogen with extended thinking (High tier); emits reasoning_content; needs a signed-in Google account"},
+	"gemini-4-hydrogen-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "4 Hydrogen", Desc: "4 Hydrogen at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in Google account"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
@@ -378,7 +408,7 @@ func (e *pinnedAccountError) Unwrap() error { return e.Err }
 // 自己做。一旦已经吐过内容就不再重试——重试会让客户端收到重复文本。
 func streamGenerate(prompt, latest string, mc ModelConfig,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
-	return streamGenerateWithFiles(prompt, latest, mc, nil, onDelta, onReasoning)
+	return streamGenerateWithFiles(context.Background(), prompt, promptCtx{Latest: latest}, mc, nil, onDelta, onReasoning, nil)
 }
 
 // fileRef 是一个已上传附件的引用。
@@ -393,15 +423,23 @@ type fileRef struct {
 //
 // 附件填 inner[0][3]，形状 [[[ref, 1], "文件名"], …]。附件只在登录态可用：
 // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
-func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
-	onDelta, onReasoning func(string)) (*StreamResult, error) {
+//
+// stopWhen 非 nil 时，每帧拿当前累积正文问一次；返回 true 就不再读上游、按已收到
+// 的内容收尾。用于工具调用：围栏闭合时调用就已确定，上游最后一次改正文之后还要
+// 再推几秒收尾帧（Argon 实测约 2.3 秒），没必要让客户端干等。
+//
+// ctx 是客户端请求的 context：客户端断开后中止上游读取、上传和重试等待，不再替
+// 已经走掉的请求生成（否则账号照样被占用、重试还会再发一次，限流名额也一直占着）。
+// 取消导致的失败不记进代理 / cookie 健康度，那不是它们的错。
+func streamGenerateWithFiles(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), stopWhen func(string) bool) (*StreamResult, error) {
 	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
 	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
 	for try := 0; try < maxCookieTries; try++ {
-		next, nextErr := streamGenerateOnce(prompt, latest, mc, pending, onDelta, onReasoning, exclude)
+		next, nextErr := streamGenerateOnce(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, exclude)
 		var exhausted *ModelDowngradedError
 		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
 			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
@@ -419,8 +457,8 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	return res, err
 }
 
-func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
-	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
+func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), stopWhen func(string) bool, exclude map[int64]bool) (*StreamResult, error) {
 	var files []fileRef
 
 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
@@ -430,6 +468,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// 不发请求，真正发请求的是下面的 getXSRF，它在拿到 slot 之后。
 	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
 	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var acct *CookieAccount
 	skip := exclude
 	if mc.PinAccountID > 0 {
@@ -487,6 +528,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
 	rotatedOnce := map[int64]bool{}
 	for acct != nil && len(tried) < maxCookieTries {
+		if err := ctx.Err(); err != nil {
+			return attrib(err)
+		}
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
@@ -583,7 +627,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		}
 		nImg, nVid := 0, 0
 		for _, u := range pending {
-			ref, uerr := uploadBytes(cookieStr, authUser, proxyURL, u.Data, u.Name)
+			ref, uerr := uploadBytesCtx(ctx, cookieStr, authUser, proxyURL, u.Data, u.Name)
+			if err := ctx.Err(); err != nil {
+				return attrib(err)
+			}
 			if uerr != nil {
 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
 			}
@@ -600,7 +647,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
 	// 而且必须走跟正式请求同一个出口。
 	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, authUser, proxyURL); ferr != nil {
+	if p, f, used, ferr := prepareContextFile(ctx, prompt, pc, budget, cookieStr, authUser, proxyURL); ferr != nil {
+		if err := ctx.Err(); err != nil {
+			return attrib(err)
+		}
 		return attrib(ferr)
 	} else if used {
 		prompt = p
@@ -677,6 +727,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	if tw != thinkingNormal {
 		inner[96] = 1
 	}
+	if mc.Mode == 8 {
+		argonMode8Slots(inner)
+	}
 	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
 	if mc.Tool > 0 {
 		inner[49] = mc.Tool
@@ -728,49 +781,48 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
 	t0 := time.Now()
 
-	tracker := &deltaTracker{}
-	rtracker := &deltaTracker{}
 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
-	var lineCB func(string) error
-	if onDelta != nil || onReasoning != nil || strictCheck != nil {
-		lineCB = func(line string) error {
-			if strictCheck != nil {
-				if err := strictCheck(line); err != nil {
-					return err
-				}
-			}
-			// 出错话术在吐给客户端之前拦下，中断读取走下面的重试。
-			if failureReplyInLine(line) {
-				return errUpstreamFailureReply
-			}
-			// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
-			if onReasoning != nil {
-				if r := reasoningInLine(line); r != "" {
-					if d := rtracker.Push(r); d != "" {
-						onReasoning(d)
-					}
-				}
-			}
-			if onDelta == nil {
-				return nil
-			}
-			for _, t := range renderedTextsInLine(line, false) {
-				if d := tracker.Push(t); d != "" {
-					onDelta(d)
-				}
-			}
-			return nil
-		}
+	lh := newLineHandler(onDelta, onReasoning, stopWhen, strictCheck)
+	tracker, rtracker := lh.tracker, lh.rtracker
+
+	retryWait := func() error {
+		return sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second)
 	}
 
-	// 新协议（#43）：同一个 inner，只换传输层；返回的 raw 已包成老格式，下面的判断原样适用。
-	useWC := rtCfg().WebChannel
+	// 新协议（#43）尚未接入按沉默计时（#33）、请求取消传播、工具提前收尾与扩展思考，
+	// 当前版本锁死走 StreamGenerate。
+	noteWebChannelIgnored(rtCfg().WebChannel)
+	useWC := false
 	wcReq := wcRequest{
 		Inner: wcInnerWithoutPrompt(inner), Prompt: prompt,
 		HexID: mc.HexID, Mode: mc.Mode, Think: mc.thinkWire(),
 		Cookie: cookieStr, SAPISID: sapisid, AuthUser: authUser,
 	}
+
+	// 幽灵会话根治（#phantom）：temporary_chat（inner[45]=1）在带附件（超长 prompt 转
+	// message.txt，inner[0][3] 有文件引用）或 Mode=8 等场景下**不能**阻止服务端建会话
+	// —— 实测服务端仍返回非空 c_xxx 并在侧栏留下「带未读蓝点、hNvQHb 报 1167 打不开」的
+	// 索引残片。它们不在 MaZiqc 常规列表里（RPC 看不到、delete 却能删），是服务端索引
+	// 与正文不一致的残留。
+	//
+	// 旧逻辑两处漏洞让它漏网：
+	//   1) 只在 rtCfg().AutoDeleteConversation 为真时才删，而它默认 false、且
+	//      temporaryChatEligible() 为真时整条被跳过 —— 幽灵恰恰在 temporary_chat 开着时产生；
+	//   2) 只在 200 成功分支里删。客户端中途取消（499）、上游超时、出错话术等任何提前
+	//      return 的路径，即便 raw 首帧已带回 c_xxx，也直接走了，残片留在账号里。
+	//
+	// 修法：cleanupPhantom 挂在 retry 循环**外**，每次 streamGenerateOnce 返回前统一执行。
+	// 条件：(TemporaryChat||AutoDeleteConversation) && !MultiTurn && 有 cookie —— 只要本次
+	// 收集到的任一 raw 帧里提取出 c_xxx，就异步 GzXR5e 删掉。成功帧、取消帧、错误帧都管。
+	// 无害性：正常会话不会被误删 —— 该条件本身就意味着「这条会话不该留在账号里」，删掉它
+	// 正是本意；multi_turn 开着时这个函数整体不生效（会话要留给续接）。
+	phantomCleanup := phantomCleanupFunc(cookieStr, sapisid, xsrfToken, proxyURL, authUser)
+	defer phantomCleanup.flush()
+
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return attrib(err)
+		}
 		var statusCode int
 		var raw []byte
 		var ttfb int64
@@ -778,15 +830,24 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		var err error
 		if useWC {
 			wcReq.Cookie = cookieStr
-			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lineCB)
+			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lh.cb)
 		} else {
-			statusCode, raw, ttfb, setCookie, err = doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop)
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
 				cookieStr = merged
 				updateAccountCookie(cookieID, merged)
 			}
+		}
+		// 每次拿到一段 raw 就喂给 phantomCleanup：流式/非流式/提前 EOF 都覆盖。
+		// raw 可能为 nil（网络层失败），extractConversationID 对空串返回 ""，安全。
+		if len(raw) > 0 {
+			phantomCleanup.feed(string(raw))
+		}
+		var aie *argonIdentityError
+		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
+			err = &ModelDowngradedError{Requested: mc.Upstream, Reported: aie.name, AccountID: cookieID}
 		}
 		// 降级不是出口或 cookie 的错，也不该重试：同一个号再发一次还是降级。
 		var mde *ModelDowngradedError
@@ -799,6 +860,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			return res, err
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return attrib(cerr) // 客户端断开，不是出口的错
+			}
 			lastErr = err
 			// 出错话术不记进代理健康度：匿名直连也一样出，跟出口无关，算进去会误熔断。
 			if pickedOK && !errors.Is(err, errUpstreamFailureReply) {
@@ -814,7 +878,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := retryWait(); werr != nil {
+					return attrib(werr)
+				}
 			}
 			continue
 		}
@@ -843,7 +909,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := retryWait(); werr != nil {
+					return attrib(werr)
+				}
 			}
 			continue
 		}
@@ -871,7 +939,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := retryWait(); werr != nil {
+					return attrib(werr)
+				}
 			}
 			continue
 		}
@@ -883,7 +953,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				if werr := retryWait(); werr != nil {
+					return attrib(werr)
+				}
 			}
 			continue
 		}
@@ -934,9 +1006,11 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
 		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
 		//
-		// 临时对话（#34）生效时跳过：那条压根没进会话列表，删它是多发一次 RPC 删空气。
-		// 这正是临时对话比 create-then-delete 省的那一次出站请求。
-		if rtCfg().AutoDeleteConversation && !temporaryChatEligible() && cookieStr != "" && xsrfToken != "" {
+		// 兜底由 phantomCleanup 统一管（含 temporary_chat 下服务端仍建档的幽灵、以及
+		// 客户端取消/超时时已落库的那条）；这里保留原触发点只是让它在 200 成功时
+		// 立即删、不等 defer。条件放宽为 (AutoDeleteConversation||temporaryChatEligible)
+		// —— 后者开着时幽灵照样产生，旧版「temporary 就不用删」的前提被实测推翻。
+		if (rtCfg().AutoDeleteConversation || temporaryChatEligible()) && cookieStr != "" && xsrfToken != "" {
 			if cid := extractConversationID(string(raw)); cid != "" {
 				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, authUser)
 			}
@@ -947,6 +1021,82 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		markCookieByStatus(cookieID, lastStatus, lastErr.Error())
 	}
 	return attrib(lastErr)
+}
+
+// lineHandler 是每读到一行上游数据时的处理：推思考链、推正文增量、判断能否提前收尾。
+//
+// tracker / rtracker 记的是**已经发给客户端的**正文 / 思考链，调用方据此决定还能
+// 不能重试（吐过内容就不能重试，否则重复）。非流式也要逐帧看正文才能判断能否提前
+// 收尾，所以没有 onDelta 时另用一份 watch 记，不污染 tracker。
+type lineHandler struct {
+	tracker, rtracker *deltaTracker
+	stop              atomic.Bool
+	cb                func(string) error // nil 表示不需要逐行处理
+}
+
+func newLineHandler(onDelta, onReasoning func(string), stopWhen func(string) bool, check func(string) error) *lineHandler {
+	lh := &lineHandler{tracker: &deltaTracker{}, rtracker: &deltaTracker{}}
+	if onDelta == nil && onReasoning == nil && stopWhen == nil && check == nil {
+		return lh
+	}
+	watch := lh.tracker
+	if onDelta == nil {
+		watch = &deltaTracker{}
+	}
+	lh.cb = func(line string) error {
+		if check != nil {
+			if err := check(line); err != nil {
+				return err
+			}
+		}
+		// 出错话术在吐给客户端之前拦下，中断读取走重试。
+		if failureReplyInLine(line) {
+			return errUpstreamFailureReply
+		}
+		// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
+		if onReasoning != nil {
+			if r := reasoningInLine(line); r != "" {
+				if d := lh.rtracker.Push(r); d != "" {
+					onReasoning(d)
+				}
+			}
+		}
+		if onDelta == nil && stopWhen == nil {
+			return nil
+		}
+		grew := false
+		for _, t := range renderedTextsInLine(line, false) {
+			if d := watch.Push(t); d != "" {
+				grew = true
+				if onDelta != nil {
+					onDelta(d)
+				}
+			}
+		}
+		if grew && stopWhen != nil && stopWhen(watch.emitted) {
+			lh.stop.Store(true)
+		}
+		return nil
+	}
+	return lh
+}
+
+// webChannelIgnoredLogged 记下「web_channel 开着但被忽略」是否已经提示过；开关关掉时清零，
+// 再打开会再提示一次。
+var webChannelIgnoredLogged atomic.Bool
+
+// noteWebChannelIgnored 在 web_channel 开着时提示它被忽略：开关每打开一次只提示一次，
+// 免得每个请求都刷一行日志。返回这次是否提示了。
+func noteWebChannelIgnored(on bool) bool {
+	if !on {
+		webChannelIgnoredLogged.Store(false)
+		return false
+	}
+	if !webChannelIgnoredLogged.CompareAndSwap(false, true) {
+		return false
+	}
+	logf("[gemini] web_channel 已在配置中开启，但当前版本固定走 StreamGenerate（保留按沉默计时、请求取消、工具提前收尾与扩展思考）")
+	return true
 }
 
 // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。
@@ -1029,10 +1179,125 @@ func setAuthUserHeaders(h map[string]string, authuser int) {
 // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error) (int, []byte, int64, []string, error) {
+	return doGeminiRequestStop(context.Background(), endpoint, body, headers, proxyURL, onLine, nil)
+}
+
+// sleepCtx 等 d；ctx 先结束就提前返回它的错误。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stopReader 在 stop 置位后让下一次 Read 直接返回 EOF：调用方已经拿到想要的内容，
+// 剩下的上游帧不再等。已经读进 Scanner 缓冲的行照常处理完。
+type stopReader struct {
+	r    io.Reader
+	stop *atomic.Bool
+}
+
+func (s stopReader) Read(p []byte) (int, error) {
+	if s.stop != nil && s.stop.Load() {
+		return 0, io.EOF
+	}
+	return s.r.Read(p)
+}
+
+// stallLimit 是 StreamGenerate 上游最多能沉默多久：request_timeout_sec，0 = 不限
+// （同客户端 Timeout 的 0）。测试里换短。
+var stallLimit = func() time.Duration { return time.Duration(rtCfg().RequestTimeout) * time.Second }
+
+// StallError 说上游沉默了 Limit 这么久，这次请求被 stallWatch 掐掉了。
+type StallError struct{ Limit time.Duration }
+
+func (e *StallError) Error() string {
+	return fmt.Sprintf("上游 %s 没有任何数据（request_timeout_sec）", e.Limit)
+}
+
+func (e *StallError) Timeout() bool   { return true }
+func (e *StallError) Temporary() bool { return true }
+
+// stallWatch 盯着一次 StreamGenerate：上游 limit 这么久一个字节都没来（连上了却迟迟
+// 不回、或者回复写到一半停住）就取消这次请求，没出字的照常重试。计的是沉默，不是整次
+// 请求。
+//
+// 原来客户端的 Timeout 管整次请求，而上游会让请求排很久的队：同一个号问一句「你是谁」，
+// 3.6 Flash 首字在 48–393 秒之间（3.5 Flash-Lite 4 秒）。排队时上游每 60 秒发一个
+// 38 字节的心跳帧，出字后 1 秒内写完。整次限时 180 秒，排队超过 180 秒的请求一律被
+// 掐掉重发，重发又从头排队，三次都掐完才报错；还在出字的长回复也被拦腰截断。按沉默
+// 计时，心跳就让排队的请求一直等下去，只有连心跳都断了（limit 默认 180 秒，等于连着
+// 丢三个）才算卡住。
+type stallWatch struct {
+	ctx    context.Context
+	limit  time.Duration
+	timer  *time.Timer
+	cancel context.CancelCauseFunc
+}
+
+func newStallWatch(ctx context.Context, limit time.Duration) *stallWatch {
+	ctx, cancel := context.WithCancelCause(ctx)
+	w := &stallWatch{ctx: ctx, limit: limit, cancel: cancel}
+	if limit > 0 {
+		w.timer = time.AfterFunc(limit, func() { cancel(&StallError{Limit: limit}) })
+	}
+	return w
+}
+
+// heard 说上游又来了数据，沉默从现在重新算。
+func (w *stallWatch) heard() {
+	if w.timer != nil {
+		w.timer.Reset(w.limit)
+	}
+}
+
+// done 结束盯梢。
+func (w *stallWatch) done() {
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.cancel(nil)
+}
+
+// explain 把被 stallWatch 掐掉的请求报的 context canceled 换成 StallError；
+// 别的错误（包括客户端断开）原样返回。
+func (w *stallWatch) explain(err error) error {
+	var stall *StallError
+	if err != nil && errors.As(context.Cause(w.ctx), &stall) {
+		return stall
+	}
+	return err
+}
+
+// heardReader 每读到数据就告诉 stallWatch 一声。
+type heardReader struct {
+	r io.Reader
+	w *stallWatch
+}
+
+func (h heardReader) Read(p []byte) (int, error) {
+	n, err := h.r.Read(p)
+	if n > 0 {
+		h.w.heard()
+	}
+	return n, err
+}
+
+// doGeminiRequestStop 同 doGeminiRequest，stop 置位后提前结束读取（见 stopReader），
+// ctx 结束时中止连接和读取。整次请求不限时，上游沉默超过 stallLimit 才放弃（见 stallWatch）。
+func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
+	onLine func(string) error, stop *atomic.Bool) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
+	watch := newStallWatch(ctx, stallLimit())
+	defer watch.done()
+	ctx = watch.ctx
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
@@ -1040,36 +1305,37 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
+		client := getStdlibStreamClient(proxyURL)
 		resp, err := client.Do(req)
 		if err != nil {
-			return 0, nil, 0, nil, err
+			return 0, nil, 0, nil, watch.explain(err)
 		}
 		defer resp.Body.Close()
-		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+		raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
 		if err != nil {
-			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
 		}
 		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 	}
 
 	// 直连 → tls-client，保留 chrome146 TLS/HTTP2 真指纹
-	req, err := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
 	if err != nil {
 		return 0, nil, 0, nil, err
 	}
+	setChromeHeaders(req.Header)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := getTLSClient()
+	client := getTLSStreamClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, 0, nil, err
+		return 0, nil, 0, nil, watch.explain(err)
 	}
 	defer resp.Body.Close()
-	raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+	raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
 	if err != nil {
-		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
+		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)
 	}
 	return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 }
@@ -1451,6 +1717,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 			res.Diagnostic = "构建请求失败: " + e.Error()
 			return res
 		}
+		setChromeHeaders(req.Header)
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}

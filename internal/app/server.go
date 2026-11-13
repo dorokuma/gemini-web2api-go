@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +11,7 @@ import (
 	"time"
 )
 
-const Version = "4.28.0"
+const Version = "4.28.0-magpie.2"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -40,9 +41,10 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		modelNames = append(modelNames, n)
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"status":  "ok",
-		"version": Version,
-		"models":  modelNames,
+		"status":       "ok",
+		"version":      Version,
+		"models":       modelNames,
+		"capabilities": map[string]bool{"account_proxy_binding": true},
 	})
 }
 
@@ -130,9 +132,9 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 	return nil
 }
 
-func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interface{},
+func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, tools []map[string]interface{},
 	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	res, err := streamGenerateWithFiles(prompt, latest, mc, images, onDelta, onReasoning)
+	res, err := streamGenerateWithFiles(ctx, prompt, pc, mc, images, onDelta, onReasoning, toolCallComplete(tools))
 	if err != nil {
 		// res 非 nil：失败时它只带归属（哪个号 / 哪个出口），给 recordRequest 用
 		return "", nil, res, err
@@ -268,7 +270,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty prompt"}})
 		return
@@ -308,12 +310,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var res *StreamResult
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
+		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
 	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
+		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, onReasoning)
 	}
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
 	if err != nil {
+		if clientGone(r, "chat.completions", modelName, prompt, res, stream) {
+			return
+		}
 		mde, downgraded := err.(*ModelDowngradedError)
 		status := 502
 		if downgraded {
@@ -402,6 +407,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}},
 		"usage": usageOf(prompt, text, res),
 	})
+}
+
+// statusClientClosed 是客户端先断开时记进 requests 表的状态码（沿用 nginx 的 499）。
+const statusClientClosed = 499
+
+// clientGone 判断失败是不是因为客户端已经断开；是的话记一条 499 并返回 true。
+//
+// 这时连接已经没了，再写 502 / 流错误没人收。记成 502 会让「用户自己取消」看起来
+// 像上游故障；499 + "client disconnected" 在面板的失败列表里一眼能分清。
+func clientGone(r *http.Request, endpoint, model, prompt string, res *StreamResult, stream bool) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	recordRequest(endpoint, model, prompt, "", res, statusClientClosed, "client disconnected", stream)
+	return true
 }
 
 // usageOf 是 buildUsageWithReasoning 的便捷包装，res 可能为 nil。
@@ -579,7 +599,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty input"}})
 		return
@@ -682,12 +702,15 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var toolCalls []ToolCall
 	var res *StreamResult
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
-		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
+		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
 	} else {
-		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
+		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, nil)
 	}
 	ka.Stop()
 	if err != nil {
+		if clientGone(r, "responses", modelName, prompt, res, stream) {
+			return
+		}
 		mde, downgraded := err.(*ModelDowngradedError)
 		status := 502
 		if downgraded {

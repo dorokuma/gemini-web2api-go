@@ -1,0 +1,711 @@
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func makeSyntheticArgonFrame(hexID string, modelName string, answer string) []byte {
+	fields := make([]any, 43)
+	if answer != "" {
+		fields[4] = answer
+	}
+	if hexID != "" {
+		fields[39] = hexID
+		fields[40] = nil
+		fields[41] = nil
+		fields[42] = modelName
+	}
+	payloadBytes, _ := json.Marshal(fields)
+	row := []any{"wrb.fr", "rpc1", string(payloadBytes), nil}
+	rows := [][]any{row}
+	lineBytes, _ := json.Marshal(rows)
+	return append(lineBytes, '\n')
+}
+
+func TestArgonValidateIdentity(t *testing.T) {
+	// 1. Correct hex and name passes (including upstream's hexFlashLite placeholder slot with Argon name)
+	validFrame1 := makeSyntheticArgonFrame(hexArgon4, "4 Argon", "ARGON_OK")
+	if err := validateArgonIdentity(validFrame1, argonDisplayNames(thinkingNormal)); err != nil {
+		t.Fatalf("expected valid Argon frame to pass, got: %v", err)
+	}
+
+	validFrame2 := makeSyntheticArgonFrame(hexArgon4, "Gemini 4 Argon", "ARGON_OK")
+	if err := validateArgonIdentity(validFrame2, argonDisplayNames(thinkingNormal)); err != nil {
+		t.Fatalf("expected valid Gemini 4 Argon frame to pass, got: %v", err)
+	}
+
+	validPlaceholderHex := makeSyntheticArgonFrame(hexFlashLite, "4 Argon", "ARGON_OK")
+	if err := validateArgonIdentity(validPlaceholderHex, argonDisplayNames(thinkingNormal)); err != nil {
+		t.Fatalf("expected valid Argon frame with placeholder hex to pass, got: %v", err)
+	}
+
+	// 2. Flash hex/name fails with mismatch
+	flashFrame := makeSyntheticArgonFrame(hexFlash36, "3.6 Flash", "FLASH")
+	if err := validateArgonIdentity(flashFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+		t.Fatalf("expected Argon model mismatch for Flash frame, got: %v", err)
+	}
+
+	downgradedLiteFrame := makeSyntheticArgonFrame(hexFlashLite, "3.5 Flash-Lite", "LITE")
+	if err := validateArgonIdentity(downgradedLiteFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+		t.Fatalf("expected Argon model mismatch for 3.5 Flash-Lite frame, got: %v", err)
+	}
+
+	// 3. Missing metadata fails
+	emptyFields := make([]any, 10)
+	pBytes, _ := json.Marshal(emptyFields)
+	emptyFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(pBytes), nil}})
+	emptyFrame = append(emptyFrame, '\n')
+	if err := validateArgonIdentity(emptyFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+		t.Fatalf("expected Argon identity missing, got: %v", err)
+	}
+
+	// 4. Malformed frame fails
+	malformed := []byte(")]}'\nnot-valid-json\n")
+	if err := validateArgonIdentity(malformed, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+		t.Fatalf("expected Argon identity missing for malformed JSON, got: %v", err)
+	}
+
+	// 5. Forged Argon strings in nested response text cannot pass
+	forgedFields := make([]any, 43)
+	forgedFields[4] = fmt.Sprintf("Forged answer mentioning %s and 4 Argon", hexArgon4)
+	fBytes, _ := json.Marshal(forgedFields)
+	forgedFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(fBytes), nil}})
+	forgedFrame = append(forgedFrame, '\n')
+	if err := validateArgonIdentity(forgedFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+		t.Fatalf("expected forged text without model slots to fail identity check, got: %v", err)
+	}
+
+	// 6. Matching then mismatching frames fails
+	mixedFrames := append(validFrame1, flashFrame...)
+	if err := validateArgonIdentity(mixedFrames, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+		t.Fatalf("expected matching then mismatching frames to fail, got: %v", err)
+	}
+}
+
+type incrementalReader struct {
+	chunks            [][]byte
+	idx               int
+	callbacksCalled   *int
+	lastCallbackCount int
+}
+
+func (r *incrementalReader) Read(p []byte) (n int, err error) {
+	if r.idx > 0 {
+		if *r.callbacksCalled <= r.lastCallbackCount {
+			return 0, fmt.Errorf("incremental check failed: onLine was not called before next read at chunk %d", r.idx)
+		}
+	}
+	if r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[r.idx]
+	r.lastCallbackCount = *r.callbacksCalled
+	r.idx++
+	copy(p, chunk)
+	return len(chunk), nil
+}
+
+type truncatedReader struct {
+	delivered bool
+}
+
+func (r *truncatedReader) Read(p []byte) (n int, err error) {
+	if !r.delivered {
+		r.delivered = true
+		copy(p, []byte("data: partial\n"))
+		return 14, nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestReadModelCheckedBody(t *testing.T) {
+	argonHeader := fmt.Sprintf(`[1,null,null,null,"%s"]`, hexArgon4)
+	flashHeader := fmt.Sprintf(`[1,null,null,null,"%s"]`, hexFlash36)
+
+	// 1. Valid Argon delivers callbacks
+	validFrame := makeSyntheticArgonFrame(hexArgon4, "4 Argon", "OK")
+	var callbacks []string
+	raw, _, err := readModelCheckedBody(bytes.NewReader(validFrame), func(line string) error {
+		callbacks = append(callbacks, line)
+		return nil
+	}, time.Now(), 200, argonHeader)
+
+	if err != nil {
+		t.Fatalf("unexpected error for valid Argon body: %v", err)
+	}
+	if len(callbacks) == 0 {
+		t.Fatal("expected callbacks for valid Argon body")
+	}
+	if !bytes.Equal(raw, validFrame) {
+		t.Fatal("raw body does not match")
+	}
+
+	// 2. Mismatch/missing -> err and zero callbacks
+	flashFrame := makeSyntheticArgonFrame(hexFlash36, "3.6 Flash", "OK")
+	callbacks = nil
+	_, _, err = readModelCheckedBody(bytes.NewReader(flashFrame), func(line string) error {
+		callbacks = append(callbacks, line)
+		return nil
+	}, time.Now(), 200, argonHeader)
+
+	if err == nil {
+		t.Fatal("expected error on mismatched model for Argon header")
+	}
+	if len(callbacks) != 0 {
+		t.Fatalf("expected 0 callbacks on mismatch, got %d", len(callbacks))
+	}
+
+	// 3. Non-200 Argon preserves status-body read with zero callbacks, no identity error
+	errorBody := []byte(`{"error":"bad request"}` + "\n")
+	callbacks = nil
+	rawErr, _, err := readModelCheckedBody(bytes.NewReader(errorBody), func(line string) error {
+		callbacks = append(callbacks, line)
+		return nil
+	}, time.Now(), 400, argonHeader)
+
+	if err != nil {
+		t.Fatalf("expected no error from readModelCheckedBody on non-200 status, got: %v", err)
+	}
+	if len(callbacks) != 0 {
+		t.Fatalf("expected zero callbacks on non-200 status, got %d", len(callbacks))
+	}
+	if !bytes.Equal(rawErr, errorBody) {
+		t.Fatal("expected status body to be preserved")
+	}
+
+	// 4. Ordinary model remains incremental
+	callbackCount := 0
+	incReader := &incrementalReader{
+		chunks: [][]byte{
+			[]byte("line 1\n"),
+			[]byte("line 2\n"),
+			[]byte("line 3\n"),
+		},
+		callbacksCalled: &callbackCount,
+	}
+
+	rawOrd, _, err := readModelCheckedBody(incReader, func(line string) error {
+		callbackCount++
+		return nil
+	}, time.Now(), 200, flashHeader)
+
+	if err != nil {
+		t.Fatalf("incremental ordinary model read failed: %v", err)
+	}
+	if callbackCount != 3 {
+		t.Fatalf("expected 3 incremental callbacks, got %d", callbackCount)
+	}
+	if !bytes.Equal(rawOrd, []byte("line 1\nline 2\nline 3\n")) {
+		t.Fatal("raw body mismatch for ordinary model")
+	}
+
+	// 5. Truncated reader errors, no Argon callbacks
+	callbacks = nil
+	trunc := &truncatedReader{}
+	_, _, err = readModelCheckedBody(trunc, func(line string) error {
+		callbacks = append(callbacks, line)
+		return nil
+	}, time.Now(), 200, argonHeader)
+
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected io.ErrUnexpectedEOF, got: %v", err)
+	}
+	if len(callbacks) != 0 {
+		t.Fatalf("expected zero callbacks on truncated read, got %d", len(callbacks))
+	}
+}
+
+func TestArgonModelNeedsLoginAndAvailable(t *testing.T) {
+	mc, ok := Models["gemini-4-argon"]
+	if !ok {
+		t.Fatal("gemini-4-argon missing in Models map")
+	}
+	if !modelNeedsLogin(mc) {
+		t.Fatal("gemini-4-argon should require login")
+	}
+
+	// Without cookie: Argon hidden
+	if _, ok := availableModels()["gemini-4-argon"]; ok {
+		t.Fatal("gemini-4-argon should not be available without cookie")
+	}
+
+	// With cookie: Argon available
+	withPoolCookie(t)
+	if _, ok := availableModels()["gemini-4-argon"]; !ok {
+		t.Fatal("gemini-4-argon should be available when pool cookie exists")
+	}
+}
+
+// -thinking 版上游自报 "4 Argon High"：按请求 header 的思考位只认对应档位的名字，
+// 档位被静默换掉（要 High 回了普通档，或反过来）同样报身份不符。
+func TestArgonIdentityByThinkTier(t *testing.T) {
+	low := Models["gemini-4-argon"]
+	med := Models["gemini-4-argon-thinking-medium"]
+	high := Models["gemini-4-argon-thinking"]
+	if low.Thinking || !high.Thinking || high.HexID != hexArgon4 || high.Mode != 8 || med.ThinkWire != thinkingMedium {
+		t.Fatalf("unexpected Argon model table: low=%+v med=%+v high=%+v", low, med, high)
+	}
+	lowHeader := buildModelHeader(low.HexID, low.Mode, thinkingNormal, "uuid-x")
+	medHeader := buildModelHeader(med.HexID, med.Mode, thinkingMedium, "uuid-x")
+	highHeader := buildModelHeader(high.HexID, high.Mode, thinkingExtended, "uuid-x")
+
+	cases := []struct {
+		header, name string
+		ok           bool
+	}{
+		{lowHeader, "4 Argon", true},
+		{medHeader, "4 Argon", true},
+		{medHeader, "4 Argon Medium", true},
+		{highHeader, "4 Argon High", true},
+		{highHeader, "Gemini 4 Argon High", true},
+		{lowHeader, "4 Argon High", false},
+		{medHeader, "4 Argon High", false},
+		{highHeader, "4 Argon", false},
+	}
+	for _, c := range cases {
+		frame := makeSyntheticArgonFrame(hexArgon4, c.name, "ok")
+		var got []string
+		_, _, err := readModelCheckedBody(bytes.NewReader(frame), func(l string) error {
+			got = append(got, l)
+			return nil
+		}, time.Now(), 200, c.header)
+		if c.ok && (err != nil || len(got) == 0) {
+			t.Errorf("%q with header %s: want pass, err=%v lines=%d", c.name, c.header, err, len(got))
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+			t.Errorf("%q with header %s: want mismatch and no output, err=%v lines=%d", c.name, c.header, err, len(got))
+		}
+		if _, _, err := readModelCheckedBody(bytes.NewReader(frame), nil, time.Now(), 200, c.header); (err == nil) != c.ok {
+			t.Errorf("%q non-stream with header %s: ok=%v err=%v", c.name, c.header, c.ok, err)
+		}
+	}
+}
+
+func TestArgonIdentityWithStrictModel(t *testing.T) {
+	setStrictModel(t, true)
+	low := Models["gemini-4-argon"]
+	med := Models["gemini-4-argon-thinking-medium"]
+	high := Models["gemini-4-argon-thinking"]
+
+	type tc struct {
+		mc             ModelConfig
+		name           string
+		wantPass       bool
+		wantDowngraded bool
+	}
+	cases := []tc{
+		{low, "4 Argon", true, false},
+		{low, "Gemini 4 Argon", true, false},
+		{med, "4 Argon", true, false},
+		{med, "Gemini 4 Argon", true, false},
+		{med, "4 Argon Medium", true, false},
+		{med, "Gemini 4 Argon Medium", true, false},
+		{high, "4 Argon High", true, false},
+		{high, "Gemini 4 Argon High", true, false},
+		// Tier mismatch within Argon: rejected by Argon identity check, NOT classified as model downgrade cooldown.
+		{low, "4 Argon High", false, false},
+		{low, "Gemini 4 Argon High", false, false},
+		{med, "4 Argon High", false, false},
+		{med, "Gemini 4 Argon High", false, false},
+		{high, "4 Argon", false, false},
+		{high, "Gemini 4 Argon", false, false},
+		// Silent downgrade to another model family: rejected and converted to ModelDowngradedError under strict_model.
+		{low, "3.5 Flash-Lite", false, true},
+		{low, "Gemini 3.5 Flash-Lite", false, true},
+		{med, "3.5 Flash-Lite", false, true},
+		{high, "3.6 Flash", false, true},
+	}
+
+	for _, c := range cases {
+		header := buildModelHeader(c.mc.HexID, c.mc.Mode, c.mc.thinkWire(), "uuid-x")
+		frame := makeSyntheticArgonFrame(hexFlashLite, c.name, "ok")
+
+		// Check both the streamGenerateOnce (newLineHandler) and streamGenerateConv (lineCB) pipelines.
+		for _, mode := range []string{"once", "conv"} {
+			strictCheck := strictLineCheck(c.mc, func() int64 { return 42 })
+			var cb func(string) error
+			if mode == "once" {
+				lh := newLineHandler(nil, nil, nil, strictCheck)
+				cb = lh.cb
+			} else {
+				cb = func(line string) error {
+					if strictCheck != nil {
+						if err := strictCheck(line); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+			}
+
+			_, _, err := readModelCheckedBody(bytes.NewReader(frame), cb, time.Now(), 200, header)
+			var aie *argonIdentityError
+			if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(c.mc, aie.name) {
+				err = &ModelDowngradedError{Requested: c.mc.Upstream, Reported: aie.name, AccountID: 42}
+			}
+
+			if c.wantPass {
+				if err != nil {
+					t.Errorf("[%s] %q (think=%d): expected pass under strict_model, got %v", mode, c.name, c.mc.thinkWire(), err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Errorf("[%s] %q (think=%d): expected error under strict_model, got nil", mode, c.name, c.mc.thinkWire())
+				continue
+			}
+			var mde *ModelDowngradedError
+			isDowngraded := errors.As(err, &mde)
+			if isDowngraded != c.wantDowngraded {
+				t.Errorf("[%s] %q (think=%d): wantDowngraded=%v, got err=%T (%v)", mode, c.name, c.mc.thinkWire(), c.wantDowngraded, err, err)
+			}
+		}
+	}
+}
+
+// 上游 2026-11 原位改名 "4 Argon" → "4 Carbon"（同 hex、同 Mode=8）：同档名字放行，
+// 跨档仍拒，降级到 Flash 族仍拒；argon 请求收到 carbon 自报不算降级（改名滚动期）。
+func TestArgonCarbonIdentity(t *testing.T) {
+	low := Models["gemini-4-carbon"]
+	med := Models["gemini-4-carbon-thinking-medium"]
+	high := Models["gemini-4-carbon-thinking"]
+	if low.HexID != hexArgon4 || low.Mode != 8 || low.Thinking || low.ThinkWire != 0 ||
+		med.HexID != hexArgon4 || med.Mode != 8 || med.ThinkWire != thinkingMedium || med.Thinking ||
+		high.HexID != hexArgon4 || high.Mode != 8 || !high.Thinking {
+		t.Fatalf("unexpected Carbon model table: low=%+v med=%+v high=%+v", low, med, high)
+	}
+	if !modelNeedsLogin(low) || !modelNeedsLogin(med) || !modelNeedsLogin(high) {
+		t.Fatal("carbon models should require login (same hexArgon4 slot)")
+	}
+
+	lowHeader := buildModelHeader(low.HexID, low.Mode, thinkingNormal, "uuid-x")
+	medHeader := buildModelHeader(med.HexID, med.Mode, thinkingMedium, "uuid-x")
+	highHeader := buildModelHeader(high.HexID, high.Mode, thinkingExtended, "uuid-x")
+	cases := []struct {
+		header, name string
+		ok           bool
+	}{
+		{lowHeader, "4 Carbon", true},
+		{lowHeader, "Gemini 4 Carbon", true},
+		{medHeader, "4 Carbon", true},
+		{medHeader, "4 Carbon Medium", true},
+		{medHeader, "Gemini 4 Carbon Medium", true},
+		{highHeader, "4 Carbon High", true},
+		{highHeader, "Gemini 4 Carbon High", true},
+		// 2026-11-13 起上游对 High 档自报脱了 "High" 后缀、回裸 "4 Carbon"；放行。
+		{highHeader, "4 Carbon", true},
+		{highHeader, "Gemini 4 Carbon", true},
+		{medHeader, "4 Carbon High", false},
+		{lowHeader, "4 Carbon High", false},
+		{lowHeader, "4 Carbon Medium", false},
+		{lowHeader, "3.5 Flash-Lite", false},
+		{lowHeader, "3.6 Flash", false},
+	}
+	for _, c := range cases {
+		frame := makeSyntheticArgonFrame(hexArgon4, c.name, "ok")
+		var got []string
+		_, _, err := readModelCheckedBody(bytes.NewReader(frame), func(l string) error {
+			got = append(got, l)
+			return nil
+		}, time.Now(), 200, c.header)
+		if c.ok && (err != nil || len(got) == 0) {
+			t.Errorf("%q: want pass, err=%v lines=%d", c.name, err, len(got))
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+			t.Errorf("%q: want mismatch and no output, err=%v lines=%d", c.name, err, len(got))
+		}
+	}
+
+	// strict_model 判降级：argon/carbon 是同一个槽位的两个名字，互报不算降级；
+	// 掉到 Flash 族仍算降级。
+	for _, c := range []struct {
+		model, reported string
+		want            bool
+	}{
+		{"gemini-4-argon", "4 Carbon", false},
+		{"gemini-4-argon", "4 Carbon High", false},
+		{"gemini-4-argon-thinking", "4 Carbon", false},
+		{"gemini-4-argon-thinking", "4 Carbon High", false},
+		{"gemini-4-carbon", "4 Argon", false},
+		{"gemini-4-carbon-thinking", "4 Argon High", false},
+		{"gemini-4-carbon", "4 Carbon", false},
+		{"gemini-4-carbon", "3.5 Flash-Lite", true},
+		{"gemini-4-carbon-thinking", "3.6 Flash", true},
+	} {
+		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
+			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
+func TestTokenizerLoaderTimeout(t *testing.T) {
+	t.Setenv("TIKTOKEN_CACHE_DIR", t.TempDir())
+	prevTimeout := tokenizerHTTPTimeout
+	tokenizerHTTPTimeout = 80 * time.Millisecond
+	defer func() { tokenizerHTTPTimeout = prevTimeout }()
+
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+	}))
+	defer func() {
+		close(unblock)
+		srv.Close()
+	}()
+
+	loader := &boundedBpeLoader{}
+	start := time.Now()
+	_, err := loader.LoadTiktokenBpe(srv.URL + "/cl100k_base.tiktoken")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error from hanging tokenizer download")
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("tokenizer download took %v, expected bounded timeout", elapsed)
+	}
+}
+
+func TestAdminCookiesBindProxyBeforeCheck(t *testing.T) {
+	getDB()
+	_, _ = getDB().Exec(`DELETE FROM proxies`)
+	_, _ = getDB().Exec(`DELETE FROM accounts`)
+	t.Cleanup(func() {
+		_, _ = getDB().Exec(`DELETE FROM proxies`)
+		_, _ = getDB().Exec(`DELETE FROM accounts`)
+		loadProxies()
+	})
+
+	idA, err := proxyCreate("proxy-a", "http://127.0.0.1:18080", 1)
+	if err != nil {
+		t.Fatalf("proxyCreate A: %v", err)
+	}
+	idB, err := proxyCreate("proxy-b", "http://127.0.0.1:18081", 1)
+	if err != nil {
+		t.Fatalf("proxyCreate B: %v", err)
+	}
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"label":    "Magpie",
+		"cookie":   "SID=s; HSID=h; SSID=ss; APISID=a; SAPISID=sap; __Secure-1PSID=p",
+		"note":     "Added by Magpie",
+		"proxy_id": idB,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/cookies", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handleAdminCookies(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("POST /admin/api/cookies status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var added struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &added); err != nil || added.ID <= 0 {
+		t.Fatalf("unexpected response: %s", rec.Body.String())
+	}
+
+	accts := accountList()
+	if len(accts) != 1 || accts[0].ProxyID != idB {
+		t.Fatalf("expected account bound to proxy B (%d), got %+v (proxy A=%d)", idB, accts, idA)
+	}
+
+	picked, ok, err := acquireSlot(accts[0].ProxyID)
+	if !ok || err != nil {
+		t.Fatalf("acquireSlot failed: ok=%v err=%v", ok, err)
+	}
+	slotRelease(picked.ID)
+	if picked.ID != idB {
+		t.Fatalf("first check slot picked proxy %d (%s), want proxy B %d", picked.ID, picked.Name, idB)
+	}
+}
+
+// PR #71：mode-8（4 Argon/4 Carbon）inner 槽位补齐的防回归。
+// 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用 argonMode8Slots，
+// 这里直接断言该块的槽位值，以及它对非 mode-8、mode-8 各档的作用范围。
+func TestArgonMode8Slots(t *testing.T) {
+	// 非 mode-8 的 inner 不含补齐槽位：按 streamGenerateOnce/streamGenerateConv 的
+	// 默认值拼一个 3.6-flash 的 inner，逐个核对 PR #71 动的槽位都停在原值。
+	if innerSlots != 99 {
+		t.Fatalf("innerSlots = %d, want 99（PR #71 为 inner[98] 扩容）", innerSlots)
+	}
+	flash := Models["gemini-3.6-flash"]
+	inner := make([]any, innerSlots)
+	inner[6] = []any{0}
+	inner[30] = []any{4}
+	inner[68] = 1
+	inner[79] = flash.Mode
+	inner[80] = flash.thinkWire()
+	inner[91] = 0
+	inner[96] = 0
+	if flash.Mode == 8 {
+		argonMode8Slots(inner)
+	}
+	if inner[49] != nil || inner[83] != nil || inner[98] != nil {
+		t.Errorf("non-mode-8 inner 不应含补齐槽位: [49]=%v [83]=%v [98]=%v", inner[49], inner[83], inner[98])
+	}
+	if got := fmt.Sprint(inner[6]); got != "[0]" {
+		t.Errorf("non-mode-8 inner[6]=%s want [0]", got)
+	}
+	if inner[68] != 1 || inner[91] != 0 {
+		t.Errorf("non-mode-8 inner[68]=%v inner[91]=%v want 1/0", inner[68], inner[91])
+	}
+
+	// mode-8 补齐块按 PR #71 抓包逐槽核对；三档（普通/中/高）都走同一块。
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-carbon-thinking-medium", "gemini-4-carbon-thinking"} {
+		mc := Models[name]
+		inner := make([]any, innerSlots)
+		inner[6] = []any{0}
+		inner[30] = []any{4}
+		inner[68] = 1
+		inner[79] = mc.Mode
+		inner[80] = mc.thinkWire()
+		inner[91] = 0
+		inner[96] = 0
+		if mc.Mode == 8 {
+			argonMode8Slots(inner)
+		}
+		if got := fmt.Sprint(inner[6]); got != "[1]" {
+			t.Errorf("%s inner[6]=%s want [1]", name, got)
+		}
+		if got := fmt.Sprint(inner[30]); got != "[]" {
+			t.Errorf("%s inner[30]=%s want []", name, got)
+		}
+		for i, want := range map[int]int{49: 40, 68: 2, 83: 1, 91: 1, 96: 1, 98: 1} {
+			if inner[i] != want {
+				t.Errorf("%s inner[%d]=%v want %d", name, i, inner[i], want)
+			}
+		}
+		// 补齐块不改思考槽：inner[80] 仍是 thinkWire，header 档位不受影响。
+		if inner[80] != mc.thinkWire() || inner[79] != 8 {
+			t.Errorf("%s inner[79]=%v inner[80]=%v want 8/%d", name, inner[79], inner[80], mc.thinkWire())
+		}
+	}
+
+	// 媒体工具槽位覆盖顺序保持 PR #71 原序：mc.Tool>0 在补齐块之后执行，
+	// Tool 值压过 mode-8 的 inner[49]=40（当前没有 Tool 与 Mode=8 同时存在的型号，防回归）。
+	toolMC := ModelConfig{Mode: 8, Tool: toolImage}
+	toolInner := make([]any, innerSlots)
+	argonMode8Slots(toolInner)
+	if toolMC.Tool > 0 {
+		toolInner[49] = toolMC.Tool
+	}
+	if toolInner[49] != toolImage {
+		t.Errorf("Tool 覆盖后 inner[49]=%v want %d", toolInner[49], toolImage)
+	}
+}
+
+// 4 Hydrogen：3.8 Flash 槽位（hexFlash38 / Mode=1）2026-11 原位升级。三档表项、登录门控、
+// 以及 strict_model 降级判定（明确请求 Hydrogen 收到 Flash 族自报一律算降级；
+// 旧配置请求 3.8 Flash 收到 4 Hydrogen 算同槽升级）。
+func TestHydrogenModelsAndDowngrade(t *testing.T) {
+	low := Models["gemini-4-hydrogen"]
+	med := Models["gemini-4-hydrogen-thinking-medium"]
+	high := Models["gemini-4-hydrogen-thinking"]
+	if low.HexID != hexFlash38 || low.Mode != 1 || low.Upstream != "4 Hydrogen" || low.Thinking || low.ThinkWire != 0 ||
+		med.HexID != hexFlash38 || med.Mode != 1 || med.ThinkWire != thinkingMedium || med.Thinking ||
+		high.HexID != hexFlash38 || high.Mode != 1 || !high.Thinking ||
+		Models["gemini-3.8-flash-thinking-medium"].ThinkWire != thinkingMedium {
+		t.Fatalf("unexpected Hydrogen model table: low=%+v med=%+v high=%+v", low, med, high)
+	}
+	if !modelNeedsLogin(low) || !modelNeedsLogin(med) || !modelNeedsLogin(high) {
+		t.Fatal("hydrogen models should require login (hexFlash38 slot)")
+	}
+	for _, name := range []string{"gemini-4-hydrogen", "gemini-4-hydrogen-thinking-medium", "gemini-4-hydrogen-thinking"} {
+		if _, ok := availableModels()[name]; ok {
+			t.Fatalf("%s should not be available without cookie", name)
+		}
+	}
+	withPoolCookie(t)
+	for _, name := range []string{"gemini-4-hydrogen", "gemini-4-hydrogen-thinking-medium", "gemini-4-hydrogen-thinking"} {
+		if _, ok := availableModels()[name]; !ok {
+			t.Fatalf("%s should be available when pool cookie exists", name)
+		}
+	}
+
+	for _, c := range []struct {
+		model, reported string
+		want            bool
+	}{
+		{"gemini-4-hydrogen", "4 Hydrogen", false},
+		{"gemini-4-hydrogen", "4 Hydrogen Medium", false},
+		{"gemini-4-hydrogen", "4 Hydrogen High", false},
+		{"gemini-4-hydrogen-thinking-medium", "4 Hydrogen Medium", false},
+		{"gemini-4-hydrogen-thinking", "4 Hydrogen High", false},
+		{"gemini-4-hydrogen-thinking", "Gemini 4 Hydrogen High", false},
+		{"gemini-4-hydrogen", "3.8 Flash", true},
+		{"gemini-4-hydrogen", "3.7 Flash", true},
+		{"gemini-4-hydrogen", "3.6 Flash", true},
+		{"gemini-4-hydrogen", "3.5 Flash-Lite", true},
+		{"gemini-4-hydrogen-thinking", "3.8 Flash", true},
+		// 旧配置仍请求 3.8 Flash，上游自报新名 = 同槽升级，不算降级；掉到其它 Flash 仍算。
+		{"gemini-3.8-flash", "4 Hydrogen", false},
+		{"gemini-3.8-flash", "4 Hydrogen High", false},
+		{"gemini-3.8-flash", "Gemini 4 Hydrogen", false},
+		{"gemini-3.8-flash-thinking", "4 Hydrogen High", false},
+		{"gemini-3.8-flash", "3.6 Flash", true},
+		{"gemini-3.8-flash", "3.5 Flash-Lite", true},
+		// 反向：请求 Hydrogen 收到 3.8 Flash 不是升级。
+		{"gemini-4-hydrogen", "Gemini 3.8 Flash", true},
+	} {
+		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
+			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
+// phantomCleanup（#phantom 幽灵会话根治）：带附件/Mode-8 时服务端无视 inner[45]=1
+// 照样在侧栏落「打不开」的索引残片，旧版只在 AutoDeleteConversation && 200 成功时删，
+// 取消/超时/出错的路径全漏。这里断言三点：
+//  1. feed 能从 raw 帧里提取 cid（含「只有 cid 没有正文」的幽灵帧）；
+//  2. 条件不满足（无 cookie / multi_turn）时 enabled=false，整体 no-op；
+//  3. enabled 时 flush 会把收集到的 cid 各发一次 GzXR5e（用打桩的 deleteConversation 计）。
+func TestPhantomCleanupGateAndCollect(t *testing.T) {
+	frame := `[["wrb.fr","A","[null,[\"c_deadbeef1234abcd\"],null,4]",null,"generic"]]`
+	// 纯文本（无附件）temporary_chat 下，服务端也可能回 cid —— 一并删无害。
+	if got := convIDInLine(frame); got != "c_deadbeef1234abcd" {
+		t.Fatalf("convIDInLine=%q want c_deadbeef1234abcd", got)
+	}
+	if got := extractConversationID(frame); got != "c_deadbeef1234abcd" {
+		t.Fatalf("extractConversationID=%q", got)
+	}
+
+	// 条件关闭：multi_turn 开着时必须不动（会话留给续接）。
+	saveRt := rtVal
+	defer func() { rtMu.Lock(); rtVal = saveRt; rtMu.Unlock() }()
+	setRT := func(temp, autodel, multi bool) {
+		rtMu.Lock()
+		rtVal.TemporaryChat, rtVal.AutoDeleteConversation, rtVal.MultiTurn = temp, autodel, multi
+		rtMu.Unlock()
+	}
+	setRT(true, false, true) // temporary+multi → multi 优先，关
+	if p := phantomCleanupFunc("ck", "sa", "xs", "", 0); p.enabled {
+		t.Fatal("multi_turn on should disable phantom cleanup")
+	}
+	setRT(true, false, false) // temporary only → 开
+	p := phantomCleanupFunc("ck", "sa", "xs", "", 0)
+	if !p.enabled {
+		t.Fatal("temporary_chat should enable phantom cleanup")
+	}
+	p.feed(frame)
+	p.feed(`[["wrb.fr","A","[null,[\"c_deadbeef1234abcd\"],null]",null,"generic"]]` + "\n" + frame) // dup
+	if len(p.cids) != 1 {
+		t.Fatalf("dedup failed, cids=%v", p.cids)
+	}
+	p.feed("not a frame\nplain text")
+	if len(p.cids) != 1 {
+		t.Fatal("non-frame lines must not add cids")
+	}
+	// xsrf 缺失 → no-op（删不了，不浪费 RPC）。
+	setRT(false, true, false)
+	if p2 := phantomCleanupFunc("ck", "sa", "", "", 0); p2.enabled {
+		t.Fatal("missing xsrf should disable")
+	}
+}

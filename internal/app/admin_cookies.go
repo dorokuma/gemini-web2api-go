@@ -87,9 +87,10 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 		})
 	case http.MethodPost:
 		var p struct {
-			Label  string `json:"label"`
-			Cookie string `json:"cookie"`
-			Note   string `json:"note"`
+			Label   string `json:"label"`
+			Cookie  string `json:"cookie"`
+			Note    string `json:"note"`
+			ProxyID *int64 `json:"proxy_id"`
 			// 浏览器多号登录时的账号序号（/u/N），不传 = 0
 			AuthUser int `json:"authuser"`
 		}
@@ -113,6 +114,9 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, 500, map[string]string{"error": err.Error()})
 				return
 			}
+		}
+		if p.ProxyID != nil && *p.ProxyID >= 0 {
+			bindAccountProxy(id, *p.ProxyID)
 		}
 		logf("[cookies] 新增账号 #%d label=%q authuser=%d", id, strings.TrimSpace(p.Label), p.AuthUser)
 		writeJSON(w, 200, map[string]interface{}{"id": id})
@@ -207,6 +211,7 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 			Label    *string `json:"label"`
 			Note     *string `json:"note"`
 			Status   *string `json:"status"`
+			ProxyID  *int64  `json:"proxy_id"`
 			AuthUser *int    `json:"authuser"`
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -225,6 +230,9 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, 400, map[string]string{"error": err.Error()})
 				return
 			}
+		}
+		if p.ProxyID != nil && *p.ProxyID >= 0 {
+			bindAccountProxy(id, *p.ProxyID)
 		}
 		if p.Label != nil || p.Note != nil {
 			// 只改传了的字段：没传的沿用当前值。

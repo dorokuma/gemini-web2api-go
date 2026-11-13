@@ -50,7 +50,9 @@ type RuntimeConfig struct {
 	// 默认 false（保持现有"每轮拼全量 prompt"行为）。实测多轮不放大上下文窗口，只让长
 	// 对话不撞单请求墙——对 Codex 这类长会话有用，对"喂长文档"没用。
 	MultiTurn bool `json:"multi_turn"`
-	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。默认 false。
+	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。
+	// 默认 true：temporary_chat 不足以防幽灵（带附件/Mode-8 时服务端照样落残片），
+	// create-then-delete 双保险。见 streamGenerateOnce 的 phantomCleanup。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
 	// 匿名优先（#20）：不需要登录态能力的请求（纯文本、非思考、无工具、无图）走匿名、
 	// 不占 cookie 账号，省账号额度；需要登录才挑号。默认 false，见 modelNeedsLogin。
