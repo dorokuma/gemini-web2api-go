@@ -1,12 +1,32 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // 下行内容消息：X 是老响应的 inner 数组。正文要够长，textsInLine 对太短的行直接跳过。
 const wcTestText = "伦敦是英国的首都，一座将千年历史与现代文化融合在一起的国际大都市，泰晤士河穿城而过。"
+
+// wcTestAPIKey 是测试占位 API key（AIza + 35 位占位字符，匹配 wcKeyRe）。
+// AGENTS.md：测试里严禁真实密钥；39 位 Google API key 形状的常量一律用它。
+const wcTestAPIKey = "AIzaTESTKEYAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// hangBody 的 Read 挂住直到 ctx 取消，模拟下行长轮询建立后暂时没有帧。
+type hangBody struct{ ctx context.Context }
+
+func (b hangBody) Read([]byte) (int, error) { <-b.ctx.Done(); return 0, b.ctx.Err() }
+func (b hangBody) Close() error             { return nil }
 
 func wcContentPayload(flag string) string {
 	x := `[null,["c_1","r_2"],null,null,[["rc_3",["` + wcTestText + `"],null,null,null,null,null,null,[1],"zh"]],` +
@@ -111,5 +131,491 @@ func TestWCInnerWithoutPrompt(t *testing.T) {
 	}
 	if inner[0].([]interface{})[0] != "hello" {
 		t.Errorf("改到了原数组")
+	}
+}
+
+// 握手 URL 的 $httpHeaders 塞着 API key 和 SAPISIDHASH：错误往外带 URL 时必须脱敏，
+// 但 host、VER= 等非敏感参数要留着便于定位；实际发送的 URL 不能动。
+func TestWCRedactURL(t *testing.T) {
+	const apiKey = wcTestAPIKey
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	raw := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+
+	red := wcRedactURL(raw)
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)} {
+		if strings.Contains(red, leak) {
+			t.Errorf("脱敏后的 URL 还含 %q: %s", leak, red)
+		}
+	}
+	for _, keep := range []string{"VER=8", "RID=10001", "zx=abc123", "geminiweb-pa.clients6.google.com", "$httpHeaders=%3Credacted%3E"} {
+		if !strings.Contains(red, keep) {
+			t.Errorf("脱敏后的 URL 丢了 %q: %s", keep, red)
+		}
+	}
+	// $httpHeaders 不在或落在末尾也要安全。
+	if got := wcRedactURL(raw + "&extra=1"); !strings.HasSuffix(got, "&extra=1") || strings.Contains(got, "SAPISIDHASH") {
+		t.Errorf("末尾还有参数时脱敏不对: %s", got)
+	}
+	if got := wcRedactURL("https://x/?VER=8"); got != "https://x/?VER=8" {
+		t.Errorf("没 $httpHeaders 的 URL 不该动: %s", got)
+	}
+	// 实际发送的 URL 原样不动：raw 本身必须还含完整 headers（脱敏只作用于错误呈现）。
+	if !strings.Contains(raw, url.QueryEscape("X-Goog-Api-Key:"+apiKey)) {
+		t.Fatal("前提不成立：构造的握手 URL 没带 API key")
+	}
+
+	// 会话值 SID / gsessionid 同样要脱敏：下行/上行 URL 把它们放在裸 query 里。
+	sessURL := wcEndpoint + "?gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER&VER=8&RID=rpc&AID=3&CI=0"
+	redSess := wcRedactURL(sessURL)
+	for _, leak := range []string{"GSESSION_PLACEHOLDER", "SID_PLACEHOLDER"} {
+		if strings.Contains(redSess, leak) {
+			t.Errorf("脱敏后的 URL 还含会话值 %q: %s", leak, redSess)
+		}
+	}
+	for _, keep := range []string{"gsessionid=%3Credacted%3E", "SID=%3Credacted%3E", "VER=8", "RID=rpc", "AID=3"} {
+		if !strings.Contains(redSess, keep) {
+			t.Errorf("脱敏后的 URL 丢了 %q: %s", keep, redSess)
+		}
+	}
+	// 参数名按 name= 精确匹配：X-HTTP-Session-Id=gsessionid 的值恰好等于字符串
+	// "gsessionid"，但它不是 gsessionid 参数，不能被误伤。
+	if !strings.Contains(wcRedactURL(raw), "X-HTTP-Session-Id=gsessionid") {
+		t.Errorf("X-HTTP-Session-Id=gsessionid 被误脱敏: %s", wcRedactURL(raw))
+	}
+	// 同名参数出现多次时全部替换。
+	dup := wcEndpoint + "?SID=ONE_PLACEHOLDER&zx=abc&SID=TWO_PLACEHOLDER&t=1"
+	redDup := wcRedactURL(dup)
+	if strings.Contains(redDup, "ONE_PLACEHOLDER") || strings.Contains(redDup, "TWO_PLACEHOLDER") {
+		t.Errorf("重复的 SID 没全部脱敏: %s", redDup)
+	}
+	if strings.Count(redDup, "SID=%3Credacted%3E") != 2 {
+		t.Errorf("期望两个 SID=<redacted>: %s", redDup)
+	}
+}
+
+// 传输层失败走代理分支（stdlib）时，*url.Error 里不能再见到凭据；
+// Op 和底层错误要保留，Timeout() 之类行为不变。
+func TestWCSendRedactsURLError(t *testing.T) {
+	const apiKey = wcTestAPIKey
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+
+	fail := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp: connection refused")
+	})
+	const fakeProxy = "http://wcredact.invalid:3128"
+	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: fail})
+	defer stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+
+	sess := "gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER"
+	getURL := fmt.Sprintf("%s?%s&VER=8&RID=rpc&AID=0&CI=0&TYPE=xmlhttp&zx=abc123&t=1", wcEndpoint, sess)
+
+	_, err := wcSend(context.Background(), "POST", hsURL, "count=0", "SAPISID=x", fakeProxy)
+	if err == nil {
+		t.Fatal("传输层失败应报错")
+	}
+	msg := err.Error()
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey), "$httpHeaders=" + url.QueryEscape(wcHTTPHeaders(apiKey, r))} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("错误信息泄露 %q: %s", leak, msg)
+		}
+	}
+	// 会话值也不能出现在错误里：下行 GET 的 URL 带着 SID/gsessionid。
+	_, err = wcSend(context.Background(), "GET", getURL, "", "SAPISID=x", fakeProxy)
+	if err == nil {
+		t.Fatal("传输层失败应报错")
+	}
+	sessMsg := err.Error()
+	if strings.Contains(sessMsg, "SID_PLACEHOLDER") || strings.Contains(sessMsg, "GSESSION_PLACEHOLDER") {
+		t.Errorf("错误信息泄露会话值: %s", sessMsg)
+	}
+	for _, keep := range []string{"SID=%3Credacted%3E", "gsessionid=%3Credacted%3E", "RID=rpc"} {
+		if !strings.Contains(sessMsg, keep) {
+			t.Errorf("错误信息里 %q 应保留参数名并脱敏值: %s", keep, sessMsg)
+		}
+	}
+	for _, keep := range []string{"geminiweb-pa.clients6.google.com", "VER=8", "connection refused"} {
+		if !strings.Contains(msg, keep) {
+			t.Errorf("错误信息丢了非敏感定位信息 %q: %s", keep, msg)
+		}
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("应保留 *url.Error 类型便于调用方判断: %T", err)
+	}
+	if strings.Contains(ue.URL, "SAPISIDHASH") || !strings.Contains(ue.URL, "%3Credacted%3E") {
+		t.Errorf("url.Error.URL 没脱敏: %s", ue.URL)
+	}
+
+	// 非 *url.Error 的错误按字符串脱敏。
+	nonURL := wcRedactErr(fmt.Errorf("POST %s failed", hsURL))
+	if strings.Contains(nonURL.Error(), "SAPISIDHASH") || strings.Contains(nonURL.Error(), apiKey) ||
+		!strings.Contains(nonURL.Error(), "%3Credacted%3E") || !strings.Contains(nonURL.Error(), "VER=8") {
+		t.Errorf("非 *url.Error 脱敏不对: %s", nonURL)
+	}
+	// 底层 error 里带 URL 原文的场景（tls-client 不包 *url.Error 时）；
+	// 脱敏后错误链仍要保留，上层靠 errors.Is 判 context.Canceled 之类。
+	wrapped := wcRedactErr(fmt.Errorf("request failed: %w", io.ErrUnexpectedEOF))
+	if !strings.Contains(wrapped.Error(), "unexpected EOF") {
+		t.Errorf("底层错误信息不该丢: %s", wrapped)
+	}
+	if !errors.Is(wrapped, io.ErrUnexpectedEOF) {
+		t.Errorf("脱敏包装丢了错误链: %T", wrapped)
+	}
+	canceled := wcRedactErr(fmt.Errorf("get %s?SID=SID_PLACEHOLDER&gsessionid=GSESSION_PLACEHOLDER: %w", wcEndpoint, context.Canceled))
+	if !errors.Is(canceled, context.Canceled) {
+		t.Errorf("脱敏包装后 errors.Is(context.Canceled) 失效: %T", canceled)
+	}
+	if strings.Contains(canceled.Error(), "SID_PLACEHOLDER") || strings.Contains(canceled.Error(), "GSESSION_PLACEHOLDER") {
+		t.Errorf("非 *url.Error 的错误消息泄露会话值: %s", canceled)
+	}
+}
+
+// 脱敏必须覆盖整条错误链：调用方走 Unwrap()/errors.As 拿到的任何节点都不能
+// 带出原文 URL（$httpHeaders、SID、gsessionid），同时 sentinel 的 errors.Is 判定不变。
+func TestWCRedactErrChainIsRedacted(t *testing.T) {
+	const apiKey = wcTestAPIKey
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+	sessURL := wcEndpoint + "?gsessionid=GSESSION_PLACEHOLDER&SID=SID_PLACEHOLDER&VER=8&RID=rpc"
+
+	// 两层 fmt 包装 + sentinel 叶子：链中间节点的文本里也有 URL。
+	sentinel := errors.New("SENTINEL_MARK")
+	orig := fmt.Errorf("POST %s: %w", hsURL,
+		fmt.Errorf("inner %s: %w", sessURL, sentinel))
+	w := wcRedactErr(orig)
+	if !errors.Is(w, sentinel) {
+		t.Fatalf("errors.Is 应沿链命中 sentinel: %T", w)
+	}
+	if errors.Is(w, context.Canceled) {
+		t.Fatalf("无关 sentinel 不应误判为真")
+	}
+	for depth, cur := 0, w; cur != nil && depth < 8; depth++ {
+		msg := cur.Error()
+		for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey), "SID_PLACEHOLDER", "GSESSION_PLACEHOLDER"} {
+			if strings.Contains(msg, leak) {
+				t.Fatalf("错误链第 %d 层泄露 %q: %s", depth, leak, msg)
+			}
+		}
+		cur = errors.Unwrap(cur)
+	}
+	if got := errors.Unwrap(w).Error(); !strings.Contains(got, "SID=%3Credacted%3E") {
+		t.Errorf("Unwrap 层应保留参数名并脱敏值: %s", got)
+	}
+
+	// 链深处嵌 *url.Error：errors.As 命中的必须是脱敏副本，不能是原文。
+	nested := fmt.Errorf("req %s failed: %w", sessURL,
+		&url.Error{Op: "post", URL: hsURL, Err: sentinel})
+	w2 := wcRedactErr(nested)
+	if !errors.Is(w2, sentinel) {
+		t.Fatalf("*url.Error 子节点后 errors.Is 失效: %T", w2)
+	}
+	var ue *url.Error
+	if !errors.As(w2, &ue) {
+		t.Fatalf("链上 *url.Error 应仍能被 errors.As 命中: %T", w2)
+	}
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)} {
+		if strings.Contains(ue.URL, leak) {
+			t.Errorf("errors.As 拿到的 url.Error.URL 泄露 %q: %s", leak, ue.URL)
+		}
+	}
+	if !strings.Contains(ue.URL, "%3Credacted%3E") {
+		t.Errorf("errors.As 拿到的 url.Error.URL 应含脱敏占位符: %s", ue.URL)
+	}
+	// url.Error 底下包的 sentinel 也要原样可达。
+	if !errors.Is(ue, sentinel) {
+		t.Errorf("url.Error.Err 的 sentinel 丢失: %v", ue)
+	}
+
+	// 叶子 sentinel 文本干净时必须保持 identity；万一叶子文本带 URL，宁可牺牲
+	// identity 也不外泄。
+	dirty := wcRedactErr(fmt.Errorf("leaf %s", sessURL))
+	if strings.Contains(dirty.Error(), "SID_PLACEHOLDER") {
+		t.Errorf("叶子错误文本泄露会话值: %s", dirty)
+	}
+}
+
+// 请求构造失败（URL 含非法字符）时，*url.Error 的 Error() 带完整 URL ——
+// $httpHeaders 里有 API key 和 SAPISIDHASH，必须经 wcRedactErr 脱敏。
+func TestWCSendRedactsRequestBuildError(t *testing.T) {
+	const apiKey = wcTestAPIKey
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+	badURL := hsURL + "\x7f" // url.Parse 拒控制字符，NewRequestWithContext 返回 *url.Error
+
+	leaks := []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)}
+	// 代理分支（stdlib http.NewRequestWithContext）
+	if _, err := wcSend(context.Background(), "POST", badURL, "count=0", "SAPISID=x", "http://wcbuild.invalid:3128"); err == nil {
+		t.Fatal("非法 URL 应让请求构造失败")
+	} else {
+		for _, leak := range leaks {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("stdlib 构造错误泄露 %q: %s", leak, err)
+			}
+		}
+		var ue *url.Error
+		if errors.As(err, &ue) && strings.Contains(ue.URL, "SAPISIDHASH") {
+			t.Errorf("stdlib 构造错误链上的 URL 未脱敏: %s", ue.URL)
+		}
+	}
+	// 直连分支（fhttp.NewRequestWithContext）
+	if _, err := wcSend(context.Background(), "POST", badURL, "count=0", "SAPISID=x", ""); err == nil {
+		t.Log("fhttp 未拒绝该 URL（本环境差异），仅校验 stdlib 分支")
+	} else {
+		for _, leak := range leaks {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("fhttp 构造错误泄露 %q: %s", leak, err)
+			}
+		}
+	}
+}
+
+// S3 回归：脱敏包装不能把传输层超时弄丢。isUpstreamTimeout 靠
+// errors.As(err, &net.Error) + Timeout() 认上游超时（决定 retry_on_timeout 开关）；
+// 重建的链节点要么原样返回、要么 Timeout()/Temporary() 转发给底层。
+func TestWCRedactErrPreservesTimeout(t *testing.T) {
+	timeoutErr := &net.OpError{Op: "dial", Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}
+
+	// 情形 0：整链真·无改动 —— URL 与错误文本都不含敏感参数，wcSanitizeErr
+	// 返回同一对象（identity 指针相等），经 wcRedactErr 后超时判定不变。
+	clean := &url.Error{Op: "Post", URL: "https://h/?q=1", Err: timeoutErr}
+	if got := wcSanitizeErr(clean); got != error(clean) {
+		t.Fatalf("干净链未原样返回（identity 丢失）: %T %v", got, got)
+	}
+	w0 := wcRedactErr(clean)
+	if !isUpstreamTimeout(w0) {
+		t.Fatalf("干净链 isUpstreamTimeout 应判超时: %T %v", w0, w0)
+	}
+
+	// 情形 1：脏 URL + 干净底层 —— 顶层 URL 被脱敏重建，底层超时节点
+	// 原样保留，超时判定不变。
+	dirtyURL := &url.Error{Op: "Post", URL: "https://h/?SID=SIDV", Err: timeoutErr}
+	w := wcRedactErr(dirtyURL)
+	var ne net.Error
+	if !errors.As(w, &ne) || !ne.Timeout() {
+		t.Fatalf("脏 URL 链 Timeout() 丢失: %T %v", w, w)
+	}
+	if !isUpstreamTimeout(w) {
+		t.Fatalf("脏 URL 链 isUpstreamTimeout 应判超时: %T %v", w, w)
+	}
+	var ue *url.Error
+	if !errors.As(w, &ue) {
+		t.Fatalf("脏 URL 链应保留 *url.Error: %T", w)
+	}
+	// 顶层 URL 已被脱敏（SID 是 wcRedactParams），但底层超时节点什么都没脱敏
+	// 时必须原样返回 —— 旧代码一律包成 *wcRedactedError，net.Error 断言失效。
+	if ue.Err != timeoutErr {
+		t.Fatalf("底层超时错误未原样保留（被重建包装）: %T %v", ue.Err, ue.Err)
+	}
+	if !errors.Is(w, timeoutErr) {
+		t.Fatalf("errors.Is 沿链命中原超时对象失效: %T", w)
+	}
+
+	// 情形 1b：真正的 net.Error 埋在多层 %w 包装之内 —— Timeout()/Temporary()
+	// 必须沿 Unwrap 链下钻取到实现者（errors.As 命中本类型后不再下钻），
+	// 只看直接子节点会把深链超时判丢。
+	deep := wcRedactErr(fmt.Errorf("outer %s: %w",
+		"https://h/?SID=SIDV", fmt.Errorf("inner: %w", timeoutErr)))
+	var neDeep net.Error
+	if !errors.As(deep, &neDeep) || !neDeep.Timeout() {
+		t.Fatalf("深链 Timeout() 丢失: %T %v", deep, deep)
+	}
+	if !isUpstreamTimeout(deep) {
+		t.Fatalf("深链 isUpstreamTimeout 应判超时: %T %v", deep, deep)
+	}
+
+	// 情形 2：确实需要脱敏（URL 带 $httpHeaders/SID）—— 文本已脱敏，
+	// 重建的节点 Timeout() 转发给底层，超时语义仍 survives。
+	dirty := &url.Error{Op: "Post",
+		URL: "https://h/?$httpHeaders=X-Goog-Api-Key%3A" + wcTestAPIKey + "&SID=SID_PLACEHOLDER",
+		Err: timeoutErr}
+	w2 := wcRedactErr(dirty)
+	for _, leak := range []string{"SID_PLACEHOLDER", wcTestAPIKey} {
+		if strings.Contains(w2.Error(), leak) {
+			t.Fatalf("脱敏后错误仍含 %q: %s", leak, w2)
+		}
+	}
+	var ne2 net.Error
+	if !errors.As(w2, &ne2) || !ne2.Timeout() {
+		t.Fatalf("脱敏链 Timeout() 丢失: %T %v", w2, w2)
+	}
+	if !isUpstreamTimeout(w2) {
+		t.Fatalf("脱敏链 isUpstreamTimeout 应判超时: %T %v", w2, w2)
+	}
+
+	// 情形 3：链中间节点文本带 URL（非 *url.Error 节点）—— 重建为
+	// *wcRedactedError 时 Timeout() 也必须沿链转发。
+	wrapped := wcRedactErr(fmt.Errorf("req %s failed: %w",
+		"https://h/?SID=SID_PLACEHOLDER", timeoutErr))
+	if strings.Contains(wrapped.Error(), "SID_PLACEHOLDER") {
+		t.Fatalf("中间节点未脱敏: %s", wrapped)
+	}
+	var ne3 net.Error
+	if !errors.As(wrapped, &ne3) || !ne3.Timeout() {
+		t.Fatalf("wcRedactedError 包装后 Timeout() 丢失: %T %v", wrapped, wrapped)
+	}
+	if !isUpstreamTimeout(wrapped) {
+		t.Fatalf("wcRedactedError 包装后 isUpstreamTimeout 应判超时: %T %v", wrapped, wrapped)
+	}
+}
+
+// 握手返 200 但 X-HTTP-Session-Id 缺失时，错误文本不能回传响应体 ——
+// 体里的 ["c","<SID>"] 帧是可复用会话值，会经 last_error 和 502 响应外泄。
+func TestWCHandshakeFailureRedactsBody(t *testing.T) {
+	const probe = "SID_PROBE_VALUE"
+	cases := []struct {
+		name       string
+		hsStatus   int
+		hsBody     string
+		wantStatus int
+	}{
+		// 200 但无 X-HTTP-Session-Id：body 带 c 帧（含 SID 探针值）。
+		{"200-无会话帧", 200, "40\n[[0,[\"c\",\"" + probe + "\"]]]", 502},
+		// 非 200：上游错误体原样回传会经 lastErr 进 requests.error、502 响应
+		// 和三张 last_error 表，探针串绝不能出现。
+		{"非200-400", 400, "[[\"er\",\"" + probe + "\",400]]", 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				resp := func(status int, h http.Header, body string) *http.Response {
+					return &http.Response{
+						StatusCode: status, Status: fmt.Sprintf("%d", status),
+						Header:  h,
+						Body:    io.NopCloser(strings.NewReader(body)),
+						Request: req,
+					}
+				}
+				switch req.URL.Path {
+				case "/app", "/u/0/app":
+					return resp(200, http.Header{}, `"d2zJAe":"`+wcTestAPIKey+`"`), nil
+				case "/v1/processSession":
+					return resp(c.hsStatus, http.Header{}, c.hsBody), nil
+				}
+				return resp(404, http.Header{}, ""), nil
+			})
+			const fakeProxy = "http://wchsredact.invalid:3128"
+			stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+			stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+			defer func() {
+				stdlibClientCache.Delete(fakeProxy + "|0")
+				stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+			}()
+
+			wcKeyMu.Lock()
+			oldKey, oldAt := wcKey, wcKeyAt
+			wcKey, wcKeyAt = "", time.Time{}
+			wcKeyMu.Unlock()
+			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
+
+			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
+			status, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			if err != nil {
+				t.Fatalf("握手失败应走状态码而不是 err: %v", err)
+			}
+			if status != c.wantStatus {
+				t.Fatalf("status=%d（期望 %d）body=%q", status, c.wantStatus, raw)
+			}
+			if strings.Contains(string(raw), probe) {
+				t.Fatalf("握手失败错误文本回传了响应体里的探针串: %s", raw)
+			}
+			// 锁死：诊断文本里不能出现任何凭据项。
+			msg := string(raw)
+			for _, leak := range []string{"SAPISIDHASH", "X-Goog-Api-Key", wcTestAPIKey} {
+				if strings.Contains(msg, leak) {
+					t.Fatalf("握手失败诊断泄露 %q: %s", leak, msg)
+				}
+			}
+			// 仍要留可定位信息：HTTP 状态或响应体字节数。
+			if !strings.Contains(msg, "HTTP") || !strings.Contains(msg, "字节") {
+				t.Fatalf("错误文本应含状态码/字节数便于定位: %s", msg)
+			}
+		})
+	}
+}
+
+// 握手成功后下行/上行拿到非 200：错误文本同样不能回传上游响应体 ——
+// 原样带出会经 lastErr 进 requests.error、502 响应和三张 last_error 表，
+// 与握手分支是同类泄露。两个分支各盖一条，探针串绝不能出现。
+func TestWCStreamUploadFailureRedactsBody(t *testing.T) {
+	const probe = "LEAK_PROBE"
+	cases := []struct {
+		name string
+		mode string // get: 下行长轮询回 500；post: 上行 ofs=0 回 500
+	}{
+		{"下行非200", "get"},
+		{"上行非200", "post"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				resp := func(status int, h http.Header, body string) *http.Response {
+					return &http.Response{
+						StatusCode: status, Status: fmt.Sprintf("%d", status),
+						Header:  h,
+						Body:    io.NopCloser(strings.NewReader(body)),
+						Request: req,
+					}
+				}
+				switch req.URL.Path {
+				case "/app", "/u/0/app":
+					return resp(200, http.Header{}, `"d2zJAe":"`+wcTestAPIKey+`"`), nil
+				case "/v1/processSession":
+					switch {
+					case req.Method == "POST" && strings.HasPrefix(req.URL.RawQuery, "VER=8&RID="):
+						// 握手：带 X-HTTP-Session-Id 和 c 帧。
+						h := http.Header{}
+						h.Set("X-HTTP-Session-Id", "GSID_TEST")
+						return resp(200, h, "40\n[[0,[\"c\",\"SID_TEST\"]]]"), nil
+					case req.Method == "GET" && c.mode == "get":
+						return resp(500, http.Header{}, `[["er","`+probe+`",500]]`), nil
+					case req.Method == "GET":
+						// 上行分支：下行先建立（200），帧体挂住直到 ctx 取消，
+						// 错误只能来自上行。不能堵在 RoundTrip —— 主流程要等
+						// 下行 200 的 getReady 信号后才发上行。
+						return &http.Response{
+							StatusCode: 200, Status: "200", Header: http.Header{},
+							Body: hangBody{req.Context()}, Request: req,
+						}, nil
+					case req.Method == "POST" && c.mode == "post":
+						return resp(500, http.Header{}, `[["er","`+probe+`",500]]`), nil
+					}
+					return resp(200, http.Header{}, ""), nil
+				}
+				return resp(404, http.Header{}, ""), nil
+			})
+			const fakeProxy = "http://wcstreamredact.invalid:3128"
+			stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+			stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+			defer func() {
+				stdlibClientCache.Delete(fakeProxy + "|0")
+				stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+			}()
+
+			wcKeyMu.Lock()
+			oldKey, oldAt := wcKey, wcKeyAt
+			wcKey, wcKeyAt = "", time.Time{}
+			wcKeyMu.Unlock()
+			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
+
+			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
+			_, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			if err == nil {
+				t.Fatalf("%s应报错", c.name)
+			}
+			msg := err.Error() + string(raw)
+			if strings.Contains(msg, probe) {
+				t.Fatalf("%s错误文本回传了上游响应体探针串: %s", c.name, msg)
+			}
+			// 仍要留可定位信息：HTTP 状态或响应体字节数。
+			if !strings.Contains(msg, "HTTP") || !strings.Contains(msg, "字节") {
+				t.Fatalf("%s错误文本应含状态码/字节数便于定位: %s", c.name, msg)
+			}
+		})
 	}
 }

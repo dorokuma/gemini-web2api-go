@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -196,6 +197,148 @@ type wcResp struct {
 	body      io.ReadCloser
 }
 
+// wcRedactURL 把 URL 里 wcRedactParams 所列参数的值换成占位符，只用于错误/日志呈现。
+// $httpHeaders 里塞着 X-Goog-Api-Key 和 Authorization:SAPISIDHASH；SID 和 gsessionid
+// 是会话绑定值（握手响应带出，见文件头），虽不是凭据本身但可复用会话，同样不能外泄。
+// *url.Error 的 Error() 会带完整 URL，不脱敏就直接进日志和 HTTP 响应。
+// 实际发给上游的 URL 不动 —— 只在往外报错时调用。
+var wcRedactParams = []string{"$httpHeaders", "SID", "gsessionid"}
+
+func wcRedactURL(raw string) string {
+	for _, name := range wcRedactParams {
+		raw = wcRedactParam(raw, name)
+	}
+	return raw
+}
+
+// wcRedactParam 把 raw 里每个 name= 参数（参数名精确匹配、值不限）的值换成
+// %3Credacted%3E，同名参数出现多次时全部替换。
+func wcRedactParam(raw, name string) string {
+	key := name + "="
+	var b strings.Builder
+	for {
+		i := strings.Index(raw, key)
+		if i < 0 {
+			break
+		}
+		// 参数名要在值开头或 & 之后出现，才不会误伤「值里含 gsessionid= 之类」的参数。
+		if i > 0 && raw[i-1] != '&' && raw[i-1] != '?' {
+			b.WriteString(raw[:i+len(key)])
+			raw = raw[i+len(key):]
+			continue
+		}
+		end := strings.IndexByte(raw[i+len(key):], '&')
+		if end < 0 {
+			end = len(raw)
+		} else {
+			end += i + len(key)
+		}
+		b.WriteString(raw[:i+len(key)])
+		b.WriteString("%3Credacted%3E")
+		raw = raw[end:]
+	}
+	return b.String() + raw
+}
+
+// wcRedactErr 包装一次 wcSend 的失败：保留 *url.Error 的 Op 和底层 Err（Timeout()
+// 等行为不变），只把 URL 换成脱敏后的；不是 *url.Error 的错误按字符串脱敏后包一层。
+// Unwrap 返回的链也整体脱敏 —— 调用方 errors.As(&ue) 或 Unwrap().Error() 拿到的
+// 任何节点都不能再带出原文 URL；sentinel 的 errors.Is 判定不变。
+func wcRedactErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		out := *ue
+		out.URL = wcRedactURL(ue.URL)
+		out.Err = wcSanitizeErr(ue.Err)
+		return &out
+	}
+	// 非 *url.Error 也保留错误链，但不能用 fmt.Errorf("%s: %w")：那样 Error() 会
+	// 把原始消息（带未脱敏 URL）又拼回来。自定义类型让 Unwrap 走链、Error 只出脱敏文本。
+	return &wcRedactedError{msg: wcRedactURL(err.Error()), err: wcSanitizeErr(err)}
+}
+
+// wcSanitizeErr 返回一个脱敏后的等价错误，让错误链上每个节点的 Error() 都不带
+// 敏感参数：
+//   - *url.Error：浅拷贝、URL 换成脱敏版、底层 Err 递归脱敏（类型和 Is 判定不变）；
+//   - 带 Unwrap 的 fmt 包装：脱敏各节点文本后重建整链，sentinel 的 Is 仍成立；
+//   - 整链没有任何节点需要脱敏时原样返回原错误：identity、errors.Is 和底层
+//     net.Error 的 Timeout()/Temporary() 等接口能力全部保留；
+//   - 文本干净的叶子直接返回原值，保证 sentinel 的 errors.Is 命中原对象；
+//   - 文本带敏感参数且不能再向下走的叶子：返回脱敏副本，此时 identity 判定
+//     不再可用（相比外泄 SID/$httpHeaders 是更优取舍）。
+//
+// 重建节点只能是 *url.Error 或 *wcRedactedError，两者都把 Timeout()/Temporary()
+// 转发给底层 Err，超时语义在不得不重建时也 survives。
+func wcSanitizeErr(err error) error {
+	san, changed := wcSanitizeErrChg(err)
+	if !changed {
+		return err
+	}
+	return san
+}
+
+// wcSanitizeErrChg 是 wcSanitizeErr 的内部版，附带报告链上是否有节点被真正脱敏；
+// 什么都没动时返回 (err, false)，调用方据此决定是否原样返回。
+func wcSanitizeErrChg(err error) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		out := *ue
+		out.URL = wcRedactURL(ue.URL)
+		sanInner, chg := wcSanitizeErrChg(ue.Err)
+		out.Err = sanInner
+		if out.URL == ue.URL && !chg {
+			return err, false
+		}
+		return &out, true
+	}
+	if inner := errors.Unwrap(err); inner != nil {
+		msg := wcRedactURL(err.Error())
+		sanInner, chg := wcSanitizeErrChg(inner)
+		if msg == err.Error() && !chg {
+			return err, false
+		}
+		return &wcRedactedError{msg: msg, err: sanInner}, true
+	}
+	if red := wcRedactURL(err.Error()); red != err.Error() {
+		return errors.New(red), true
+	}
+	return err, false
+}
+
+// wcRedactedError 错误消息是脱敏文本，Unwrap 指向脱敏后的错误，整条链都安全。
+// Timeout()/Temporary() 转发给底层 err（底层不支持则 false）：上层靠
+// net.Error.Timeout() 认上游超时（isUpstreamTimeout），重建包装后不能把它弄丢。
+type wcRedactedError struct {
+	msg string
+	err error
+}
+
+func (e *wcRedactedError) Error() string { return e.msg }
+func (e *wcRedactedError) Unwrap() error { return e.err }
+
+// Timeout/Temporary 沿 Unwrap 链下钻：e.err 可能是 fmt.Errorf("%w") 包装、
+// 真正的 net.Error 在更内层，只看直接子节点会丢（errors.As 命中本类型后
+// 不再下钻，必须自己转发）。不新增分配。
+func (e *wcRedactedError) Timeout() bool {
+	for cur := e.err; cur != nil; cur = errors.Unwrap(cur) {
+		if t, ok := cur.(interface{ Timeout() bool }); ok {
+			return t.Timeout()
+		}
+	}
+	return false
+}
+func (e *wcRedactedError) Temporary() bool {
+	for cur := e.err; cur != nil; cur = errors.Unwrap(cur) {
+		if t, ok := cur.(interface{ Temporary() bool }); ok {
+			return t.Temporary()
+		}
+	}
+	return false
+}
+
 // wcSend 发一条请求。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
 func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {
 	headers := map[string]string{
@@ -217,7 +360,8 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 	if proxyURL != "" {
 		req, err := http.NewRequestWithContext(ctx, method, u, rd)
 		if err != nil {
-			return nil, err
+			// URL 含非法字符时 *url.Error.Error() 带完整 URL（$httpHeaders 在里面）。
+			return nil, wcRedactErr(err)
 		}
 		applyChromeHeaders(req)
 		for k, v := range headers {
@@ -225,21 +369,21 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 		}
 		resp, err := getStdlibClient(proxyURL).Do(req)
 		if err != nil {
-			return nil, err
+			return nil, wcRedactErr(err)
 		}
 		return &wcResp{resp.StatusCode, resp.Header.Values("Set-Cookie"),
 			resp.Header.Get("X-HTTP-Session-Id"), resp.Body}, nil
 	}
 	req, err := fhttp.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
-		return nil, err
+		return nil, wcRedactErr(err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	resp, err := getTLSClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, wcRedactErr(err)
 	}
 	return &wcResp{resp.StatusCode, resp.Header.Values("Set-Cookie"),
 		resp.Header.Get("X-HTTP-Session-Id"), resp.Body}, nil
@@ -424,7 +568,19 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	hsBody, _ := io.ReadAll(io.LimitReader(hs.body, 1<<20))
 	hs.body.Close()
 	if hs.status != 200 {
-		return hs.status, hsBody, 0, setCookie, nil
+		// 不回传响应体：非 200 的体可能是上游错误 JSON 或含会话帧，原样作 raw 会经
+		// lastErr 拼进 requests.error、502 响应和三张 last_error 表（同下方缺 sid
+		// 分支的考量）。只给状态码/字节数/是否疑似含会话帧的定位信息。
+		// 上层依赖核查：非 200 只读 statusCode 与 raw 文本；XSRF 自愈判 400+正文含
+		// "xsrf"（isXSRFError），这里把该信号原样透出成标记以保住判定，不带正文。
+		// WC 不参与 XSRF 自愈（本协议不发 xsrf token），该标记仅为与旧协议错误分类
+		// 保持文本一致；若后续确认无消费者可一并删除。
+		diag := fmt.Sprintf("processSession 握手 HTTP %d: 响应体 %d 字节, 含会话帧=%v",
+			hs.status, len(hsBody), bytes.Contains(hsBody, []byte(`["c","`)))
+		if bytes.Contains(hsBody, []byte(`"xsrf"`)) {
+			diag += `, "xsrf"`
+		}
+		return hs.status, []byte(diag), 0, setCookie, nil
 	}
 	var sid string
 	_ = wcReadFrames(strings.NewReader(string(hsBody)), func(it wcItem) bool {
@@ -437,7 +593,11 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	})
 	gsid := hs.sessionID
 	if sid == "" || gsid == "" {
-		return 502, []byte("processSession 握手没拿到会话: " + truncate(string(hsBody), 200)), 0, setCookie, nil
+		// 不回传响应体：体里的 ["c","<SID>"] 帧是可复用会话值，原样拼进错误
+		// 会经 last_error 和 502 响应外泄。只给状态码/字节数/是否解析到 sid 的
+		// 元信息用于定位。
+		return 502, []byte(fmt.Sprintf("processSession 握手没拿到会话: HTTP %d, 响应体 %d 字节, sid=%v, gsessionid=%v",
+			hs.status, len(hsBody), sid != "", gsid != "")), 0, setCookie, nil
 	}
 	sess := fmt.Sprintf("gsessionid=%s&SID=%s", url.QueryEscape(gsid), url.QueryEscape(sid))
 
@@ -461,7 +621,10 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			if g.status != 200 {
 				b, _ := io.ReadAll(io.LimitReader(g.body, 4096))
 				g.body.Close()
-				getErr <- fmt.Errorf("processSession 下行 HTTP %d: %s", g.status, truncate(string(b), 200))
+				// 不回传上游响应体：本错误经 lastErr 进 requests.error、502 响应
+				// 和三张 last_error 表，原样带出会外泄。
+				diag := fmt.Sprintf("processSession 下行 HTTP %d: 响应体 %d 字节", g.status, len(b))
+				getErr <- errors.New(diag)
 				return
 			}
 			readyOnce.Do(func() { close(getReady) })
@@ -513,7 +676,9 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		b, _ := io.ReadAll(io.LimitReader(resp.body, 4096))
 		resp.body.Close()
 		if resp.status != 200 {
-			return fmt.Errorf("processSession 上行 ofs=%d HTTP %d: %s", ofs, resp.status, truncate(string(b), 200))
+			// 同下行分支：不回传上游响应体（见下行处注释）。
+			diag := fmt.Sprintf("processSession 上行 ofs=%d HTTP %d: 响应体 %d 字节", ofs, resp.status, len(b))
+			return errors.New(diag)
 		}
 		return nil
 	}

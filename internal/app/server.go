@@ -178,6 +178,13 @@ func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig
 	if len(tools) > 0 {
 		text, toolCalls = parseToolCalls(text)
 	}
+	// 回复只有一个解析不了的 ```tool_call``` 围栏（JSON 写坏 / 没有工具名）时，
+	// parseToolCalls 剥掉围栏后正文为空、也没有调用。跟 callGeminiConv 一样报错，
+	// 不能回 200 + content:null 且不带 tool_calls —— 客户端看不出请求其实失败了。
+	// 画布/媒体两类「正文可空」的路径在上面已先 return，这里不会误伤。
+	if text == "" && len(toolCalls) == 0 {
+		return "", nil, res, fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw))
+	}
 	return text, toolCalls, res, nil
 }
 

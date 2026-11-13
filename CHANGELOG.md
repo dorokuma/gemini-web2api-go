@@ -2,6 +2,26 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+### 修复
+
+- **回复只剩一个无法解析的 ```tool_call``` 围栏时不再返回空回答**。之前返回
+  200 且 `content: null`（客户端静默拿不到内容）；现在返回错误，客户端会出现 5xx，
+  OpenAI SDK 按默认策略会重试。
+- **WebChannel 握手 URL 中的 `$httpHeaders`/`SID`/`gsessionid` 在错误信息中脱敏**。
+  请求构造失败、握手失败和 `errors.Unwrap`/`errors.As` 拿到的错误链上都不再回传
+  API key、SAPISIDHASH 或会话值。当前 `web_channel` 未启用（`useWC=false`），无运行时影响。
+- **WebChannel 下行/上行非 200 响应不再回传上游响应体**，只给状态码与字节数等
+  定位信息，避免上游错误内容经 `requests.error`/502/`last_error` 外泄。
+- **WebChannel 脱敏错误链的 `Timeout()`/`Temporary()` 沿链下钻**，但深链转发只发生在
+  重建的 `*wcRedactedError` 节点上（复制 `*url.Error` 时仅对其 `Err` 字段递归脱敏）；
+  `*url.Error` 自身的 `Timeout()` 仍只看直接 `Err` 一层——`url.Error→fmt→net.Error`
+  链路下超时判定照丢，属既有边界（见 `.agents/notes/webchannel-enable-prerequisites.md`
+  观察项 O-2）。
+- **WebChannel 凭据脱敏覆盖握手、请求构造与错误链**（`wcRedactErr`/`wcSanitizeErr`），
+  `Unwrap`/`errors.As` 命中的每个节点都脱敏。
+
 ## 4.28.0
 
 ### 新增
