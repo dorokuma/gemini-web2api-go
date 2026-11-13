@@ -1,9 +1,14 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // feed 按给定的切法把整段文本喂进闸门，返回实际发给客户端的内容。
@@ -219,5 +224,97 @@ func TestParseToolCallsArgsShapes(t *testing.T) {
 		if err := json.Unmarshal([]byte(f.Arguments), &m); err != nil || m == nil {
 			t.Errorf("%s: args 不是 JSON 对象：%s", c.fence, f.Arguments)
 		}
+	}
+}
+
+// 回复只有一个解析不了的围栏时，parseToolCalls 返回空正文、无调用（PR #72 自带用例）。
+// callGemini / callGeminiConv 都要把这种结果当失败，不能回 200 + content:null。
+func TestParseToolCallsOnlyBadFenceIsEmpty(t *testing.T) {
+	for _, body := range []string{`{"arguments":{"command":"x"}}`, `{"name":`} {
+		text, calls := parseToolCalls("```tool_call\n" + body + "\n```")
+		if text != "" || len(calls) != 0 {
+			t.Errorf("body %q: got text=%q calls=%d, want empty", body, text, len(calls))
+		}
+	}
+}
+
+// 端到端回归（上游 PR #72）：回复只有一个解析不了的 ```tool_call``` 围栏时，
+// callGemini 必须报错而不是返回 text==""、err==nil（那会回客户端 200 + content:null
+// 且不带 tool_calls）。
+//
+// 假上游按 URL 分派：/app 出 XSRF，StreamGenerate 回一帧只装坏围栏的内容。
+// 出口侧不打真网络：把该 proxyURL 的 stdlibClientCache 换成走假 RoundTripper 的
+// 客户端（同 argon_test.go 的做法），走代理分支（stdlib）发请求。
+func TestCallGeminiRejectsEmptyReplyAfterToolFence(t *testing.T) {
+	cid := "c_badfencereply1"
+	// 内容帧形状同 argon_test.go：inner[1]=[cid,rid]，inner[4]=[["rc_x",[文本]]]。
+	// 正文就是一个缺工具名的闭合围栏：剥掉后 text=""。行要够长——
+	// textsInLine 对太短的行直接跳过，坏围栏体的 JSON 里塞字段撑长度。
+	badFence := "```tool_call\n{\"arguments\":{\"command\":\"" + strings.Repeat("x", 200) + "\"}}\n```"
+	inner := make([]any, 43)
+	inner[1] = []any{cid, "r_1"}
+	inner[4] = []any{[]any{"rc_x", []any{badFence}}}
+	ib, _ := json.Marshal(inner)
+	line, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(ib), nil}})
+
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := func(status int, body string) *http.Response {
+			return &http.Response{
+				StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header:  http.Header{},
+				Body:    io.NopCloser(strings.NewReader(body)),
+				Request: req,
+			}
+		}
+		switch req.URL.Path {
+		case "/app":
+			return resp(200, `"SNlM0e":"tok-xyz:1700000000000","cfb2h":"boq_x_20260101.01_p1"`), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			return resp(200, ")]}'\n"+string(line)+"\n"), nil
+		}
+		return resp(404, ""), nil
+	})
+	const fakeProxy = "http://fake-exit.invalid:3128"
+	stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+	defer func() {
+		stdlibClientCache.Delete(fakeProxy + "|0")
+		stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+	}()
+
+	withPoolCookie(t)
+	acct, ok := pickCookieAccount()
+	if !ok {
+		t.Fatal("池里没有号")
+	}
+	proxyMu.Lock()
+	oldProxies := proxyCache
+	proxyCache = []Proxy{{ID: 998, Name: "test", URL: fakeProxy, Enabled: true}}
+	proxyMu.Unlock()
+	defer func() { proxyMu.Lock(); proxyCache = oldProxies; proxyMu.Unlock() }()
+
+	cookie := acct.Cookie
+	invalidateXSRF(cookie)
+	xsrfMu.Lock()
+	xsrfCache[xsrfKey(cookie, acct.AuthUser)] = xsrfEntry{token: "tok", fetched: time.Now()}
+	xsrfMu.Unlock()
+
+	// rtVal 在测试进程里是零值：RetryAttempts=0 会让重试循环一次都不跑。
+	saveRt := rtVal
+	defer func() { rtMu.Lock(); rtVal = saveRt; rtMu.Unlock() }()
+	rtMu.Lock()
+	rtVal.RetryAttempts, rtVal.RetryDelaySec = 1, 0
+	rtMu.Unlock()
+
+	text, calls, _, err := callGemini(context.Background(), "run ls", promptCtx{Latest: "run ls"},
+		ModelConfig{HexID: hexFlash36, Mode: 1}, toolsFixture("bash"), nil, nil, nil)
+	if err == nil {
+		t.Fatalf("回复只有一个解析不了的 tool_call 围栏，应报错而不是 text=%q、err==nil", text)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("不应解析出工具调用: %+v", calls)
+	}
+	if !strings.Contains(err.Error(), "raw ") {
+		t.Fatalf("错误信息应带原始字节数便于排查: %v", err)
 	}
 }

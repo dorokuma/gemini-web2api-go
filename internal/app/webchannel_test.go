@@ -1,6 +1,12 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -111,5 +117,88 @@ func TestWCInnerWithoutPrompt(t *testing.T) {
 	}
 	if inner[0].([]interface{})[0] != "hello" {
 		t.Errorf("改到了原数组")
+	}
+}
+
+// 握手 URL 的 $httpHeaders 塞着 API key 和 SAPISIDHASH：错误往外带 URL 时必须脱敏，
+// 但 host、VER= 等非敏感参数要留着便于定位；实际发送的 URL 不能动。
+func TestWCRedactURL(t *testing.T) {
+	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	raw := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+
+	red := wcRedactURL(raw)
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey)} {
+		if strings.Contains(red, leak) {
+			t.Errorf("脱敏后的 URL 还含 %q: %s", leak, red)
+		}
+	}
+	for _, keep := range []string{"VER=8", "RID=10001", "zx=abc123", "geminiweb-pa.clients6.google.com", "$httpHeaders=%3Credacted%3E"} {
+		if !strings.Contains(red, keep) {
+			t.Errorf("脱敏后的 URL 丢了 %q: %s", keep, red)
+		}
+	}
+	// $httpHeaders 不在或落在末尾也要安全。
+	if got := wcRedactURL(raw + "&extra=1"); !strings.HasSuffix(got, "&extra=1") || strings.Contains(got, "SAPISIDHASH") {
+		t.Errorf("末尾还有参数时脱敏不对: %s", got)
+	}
+	if got := wcRedactURL("https://x/?VER=8"); got != "https://x/?VER=8" {
+		t.Errorf("没 $httpHeaders 的 URL 不该动: %s", got)
+	}
+	// 实际发送的 URL 原样不动：raw 本身必须还含完整 headers（脱敏只作用于错误呈现）。
+	if !strings.Contains(raw, url.QueryEscape("X-Goog-Api-Key:"+apiKey)) {
+		t.Fatal("前提不成立：构造的握手 URL 没带 API key")
+	}
+}
+
+// 传输层失败走代理分支（stdlib）时，*url.Error 里不能再见到凭据；
+// Op 和底层错误要保留，Timeout() 之类行为不变。
+func TestWCSendRedactsURLError(t *testing.T) {
+	const apiKey = "AIzaTESTKEY00000000000000000000000aa"
+	r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x"}
+	hsURL := fmt.Sprintf("%s?VER=8&RID=10001&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=abc123&t=1",
+		wcEndpoint, url.QueryEscape(wcHTTPHeaders(apiKey, r)))
+
+	fail := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp: connection refused")
+	})
+	const fakeProxy = "http://wcredact.invalid:3128"
+	stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: fail})
+	defer stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+
+	_, err := wcSend(context.Background(), "POST", hsURL, "count=0", "SAPISID=x", fakeProxy)
+	if err == nil {
+		t.Fatal("传输层失败应报错")
+	}
+	msg := err.Error()
+	for _, leak := range []string{"SAPISIDHASH", apiKey, url.QueryEscape(apiKey), "$httpHeaders=" + url.QueryEscape(wcHTTPHeaders(apiKey, r))} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("错误信息泄露 %q: %s", leak, msg)
+		}
+	}
+	for _, keep := range []string{"geminiweb-pa.clients6.google.com", "VER=8", "connection refused"} {
+		if !strings.Contains(msg, keep) {
+			t.Errorf("错误信息丢了非敏感定位信息 %q: %s", keep, msg)
+		}
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("应保留 *url.Error 类型便于调用方判断: %T", err)
+	}
+	if strings.Contains(ue.URL, "SAPISIDHASH") || !strings.Contains(ue.URL, "%3Credacted%3E") {
+		t.Errorf("url.Error.URL 没脱敏: %s", ue.URL)
+	}
+
+	// 非 *url.Error 的错误按字符串脱敏。
+	nonURL := wcRedactErr(fmt.Errorf("POST %s failed", hsURL))
+	if strings.Contains(nonURL.Error(), "SAPISIDHASH") || strings.Contains(nonURL.Error(), apiKey) ||
+		!strings.Contains(nonURL.Error(), "%3Credacted%3E") || !strings.Contains(nonURL.Error(), "VER=8") {
+		t.Errorf("非 *url.Error 脱敏不对: %s", nonURL)
+	}
+	// 底层 error 里带 URL 原文的场景（tls-client 不包 *url.Error 时）。
+	wrapped := wcRedactErr(fmt.Errorf("request failed: %w", io.ErrUnexpectedEOF))
+	if !strings.Contains(wrapped.Error(), "unexpected EOF") {
+		t.Errorf("底层错误信息不该丢: %s", wrapped)
 	}
 }

@@ -196,6 +196,37 @@ type wcResp struct {
 	body      io.ReadCloser
 }
 
+// wcRedactURL 把 URL 里 $httpHeaders 参数的值换成占位符，只用于错误/日志呈现。
+// 握手 URL 的这个参数里塞着 X-Goog-Api-Key 和 Authorization:SAPISIDHASH，
+// *url.Error 的 Error() 会带完整 URL，不脱敏就直接进日志和 HTTP 响应。
+// 实际发给上游的 URL 不动 —— 只在往外报错时调用。
+func wcRedactURL(raw string) string {
+	const key = "$httpHeaders="
+	i := strings.Index(raw, key)
+	if i < 0 {
+		return raw
+	}
+	end := strings.IndexByte(raw[i+len(key):], '&')
+	if end < 0 {
+		end = len(raw)
+	} else {
+		end += i + len(key)
+	}
+	return raw[:i+len(key)] + "%3Credacted%3E" + raw[end:]
+}
+
+// wcRedactErr 包装一次 wcSend 的失败：保留 *url.Error 的 Op 和底层 Err（Timeout()
+// 等行为不变），只把 URL 换成脱敏后的；不是 *url.Error 的错误按字符串脱敏后包一层。
+func wcRedactErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		out := *ue
+		out.URL = wcRedactURL(ue.URL)
+		return &out
+	}
+	return errors.New(wcRedactURL(err.Error()))
+}
+
 // wcSend 发一条请求。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
 func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {
 	headers := map[string]string{
@@ -225,7 +256,7 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 		}
 		resp, err := getStdlibClient(proxyURL).Do(req)
 		if err != nil {
-			return nil, err
+			return nil, wcRedactErr(err)
 		}
 		return &wcResp{resp.StatusCode, resp.Header.Values("Set-Cookie"),
 			resp.Header.Get("X-HTTP-Session-Id"), resp.Body}, nil
@@ -239,7 +270,7 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 	}
 	resp, err := getTLSClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, wcRedactErr(err)
 	}
 	return &wcResp{resp.StatusCode, resp.Header.Values("Set-Cookie"),
 		resp.Header.Get("X-HTTP-Session-Id"), resp.Body}, nil
