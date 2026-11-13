@@ -1,16 +1,18 @@
-# TASK-502 结果草稿（事实记录 · 未提交状态）
+# TASK-502 结果记录（事实记录 · 候选已 commit）
 
-> 本文件是结果草稿，非最终交付报告。**所有改动均未 commit**（工作区状态：
-> 14 个 tracked 文件修改 + 新增 `internal/app/upstream_err.go` 未跟踪），
-> 最终 commit SHA 待门禁授权后写入。当前结果状态：**待三方门禁补全**——
-> verifier round2 七判据全部通过（证据见 `.agents/notes/task-502-verifier-round2.txt`），
-> reviewer 影响面补完与 oracle round2 尚未完成。round1 的 "unauthorized retries"
-> 问题轮次不作为最终门禁通过依据。
+> 本文件是事实记录，非门禁证据本身。**当前候选 commit：`c57860d`**（基线 `8647ba1`，
+> 由 rebase 前旧快照 `a8d1bc1` + 工作区改动 rebase 后 squash 而来）。
+> **重要**：文中「verifier round2 七判据」证据对应的是 **rebase 前的旧快照**（`a8d1bc1`
+> + 未提交改动），**不构成本候选 `c57860d` 的门禁证据**；当前候选的三方门禁
+> （verifier / reviewer / oracle）仍在进行中，通过结论以新一轮证据为准。
+> round1 的 "unauthorized retries" 问题轮次同样不作为最终门禁通过依据。
 
 ## 一、四项修改与精确位置
 
+> 以下代码位置已基于候选 `c57860d` 逐一校核。
+
 ### 1. 502 响应体结构化
-- 新增文件 `internal/app/upstream_err.go`（未跟踪）：`upstreamDiag`、`upstreamFrameStats`
+- 新增文件 `internal/app/upstream_err.go`（已含于 `c57860d`）：`upstreamDiag`、`upstreamFrameStats`
   （L48，逐 wrb.fr 条目解析帧统计）、`diagErr`、`upstreamErrorJSON`、`writeUpstreamError`（L199）、
   `geminiErrorJSON`（L205，Google 形状走 `error.details` 块）。
 - 接入点：
@@ -94,6 +96,8 @@
 证据文件：`.agents/notes/task-502-verifier-round2.txt`（本仓持久路径，
 sha256 `ff43bb65c7d7a200988e168180ef938494ba6ed812813c922e346ae898820d9e`；
 不以 /tmp 为持久证据）。每判据一个隔离 clone（base a8d1bc1），无自行重试。
+**该轮证据基于 rebase 前旧快照 `a8d1bc1` + 未提交改动，不构成候选 `c57860d`
+的门禁证据**（见文件顶部状态段）。
 
 | 判据 | 命令 | 退出码（原文） | 结果 |
 |---|---|---|---|
@@ -115,6 +119,6 @@ sha256 `ff43bb65c7d7a200988e168180ef938494ba6ed812813c922e346ae898820d9e`；
 
 - **未执行任何线上真实账号调用**；不对「原用户账号已恢复」下任何结论。本改动交付的是
   **可诊断的失败**（结构化 reason + 落库现场），不凭空承诺权限/协议层面的修复。
-- 当前 SHA：`a8d1bc1` + 未提交工作区（候选 tracked diff +788/-68，patch sha256
-  `401c24b4…2725a3`；`upstream_err.go` sha256 `abdda7c7…cc2384`）。新 commit SHA 待
-  主代理门禁授权后由后续 worker 写入。
+- 候选已固化：base `8647ba1` + commit `c57860d`（`fix-upstream-502-diagnostics` 分支，
+  由 rebase 前 `a8d1bc1` + 工作区改动 squash 而来）；rebase 后改动内容未变，文中行号
+  已按 `c57860d` 复核一致。
