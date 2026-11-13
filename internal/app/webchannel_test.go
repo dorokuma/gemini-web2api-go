@@ -22,6 +22,12 @@ const wcTestText = "伦敦是英国的首都，一座将千年历史与现代文
 // AGENTS.md：测试里严禁真实密钥；39 位 Google API key 形状的常量一律用它。
 const wcTestAPIKey = "AIzaTESTKEYAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
+// hangBody 的 Read 挂住直到 ctx 取消，模拟下行长轮询建立后暂时没有帧。
+type hangBody struct{ ctx context.Context }
+
+func (b hangBody) Read([]byte) (int, error) { <-b.ctx.Done(); return 0, b.ctx.Err() }
+func (b hangBody) Close() error             { return nil }
+
 func wcContentPayload(flag string) string {
 	x := `[null,["c_1","r_2"],null,null,[["rc_3",["` + wcTestText + `"],null,null,null,null,null,null,[1],"zh"]],` +
 		`null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,` +
@@ -375,19 +381,31 @@ func TestWCRedactErrPreservesTimeout(t *testing.T) {
 	timeoutErr := &net.OpError{Op: "dial", Net: "tcp",
 		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}
 
-	// 情形 1：本次没有任何东西可脱敏 —— 整链原样返回，超时判定不变。
-	clean := &url.Error{Op: "Post", URL: "https://h/?SID=SIDV", Err: timeoutErr}
-	w := wcRedactErr(clean)
+	// 情形 0：整链真·无改动 —— URL 与错误文本都不含敏感参数，wcSanitizeErr
+	// 返回同一对象（identity 指针相等），经 wcRedactErr 后超时判定不变。
+	clean := &url.Error{Op: "Post", URL: "https://h/?q=1", Err: timeoutErr}
+	if got := wcSanitizeErr(clean); got != error(clean) {
+		t.Fatalf("干净链未原样返回（identity 丢失）: %T %v", got, got)
+	}
+	w0 := wcRedactErr(clean)
+	if !isUpstreamTimeout(w0) {
+		t.Fatalf("干净链 isUpstreamTimeout 应判超时: %T %v", w0, w0)
+	}
+
+	// 情形 1：脏 URL + 干净底层 —— 顶层 URL 被脱敏重建，底层超时节点
+	// 原样保留，超时判定不变。
+	dirtyURL := &url.Error{Op: "Post", URL: "https://h/?SID=SIDV", Err: timeoutErr}
+	w := wcRedactErr(dirtyURL)
 	var ne net.Error
 	if !errors.As(w, &ne) || !ne.Timeout() {
-		t.Fatalf("clean 链 Timeout() 丢失: %T %v", w, w)
+		t.Fatalf("脏 URL 链 Timeout() 丢失: %T %v", w, w)
 	}
 	if !isUpstreamTimeout(w) {
-		t.Fatalf("clean 链 isUpstreamTimeout 应判超时: %T %v", w, w)
+		t.Fatalf("脏 URL 链 isUpstreamTimeout 应判超时: %T %v", w, w)
 	}
 	var ue *url.Error
 	if !errors.As(w, &ue) {
-		t.Fatalf("clean 链应保留 *url.Error: %T", w)
+		t.Fatalf("脏 URL 链应保留 *url.Error: %T", w)
 	}
 	// 顶层 URL 已被脱敏（SID 是 wcRedactParams），但底层超时节点什么都没脱敏
 	// 时必须原样返回 —— 旧代码一律包成 *wcRedactedError，net.Error 断言失效。
@@ -396,6 +414,19 @@ func TestWCRedactErrPreservesTimeout(t *testing.T) {
 	}
 	if !errors.Is(w, timeoutErr) {
 		t.Fatalf("errors.Is 沿链命中原超时对象失效: %T", w)
+	}
+
+	// 情形 1b：真正的 net.Error 埋在多层 %w 包装之内 —— Timeout()/Temporary()
+	// 必须沿 Unwrap 链下钻取到实现者（errors.As 命中本类型后不再下钻），
+	// 只看直接子节点会把深链超时判丢。
+	deep := wcRedactErr(fmt.Errorf("outer %s: %w",
+		"https://h/?SID=SIDV", fmt.Errorf("inner: %w", timeoutErr)))
+	var neDeep net.Error
+	if !errors.As(deep, &neDeep) || !neDeep.Timeout() {
+		t.Fatalf("深链 Timeout() 丢失: %T %v", deep, deep)
+	}
+	if !isUpstreamTimeout(deep) {
+		t.Fatalf("深链 isUpstreamTimeout 应判超时: %T %v", deep, deep)
 	}
 
 	// 情形 2：确实需要脱敏（URL 带 $httpHeaders/SID）—— 文本已脱敏，
@@ -503,6 +534,87 @@ func TestWCHandshakeFailureRedactsBody(t *testing.T) {
 			// 仍要留可定位信息：HTTP 状态或响应体字节数。
 			if !strings.Contains(msg, "HTTP") || !strings.Contains(msg, "字节") {
 				t.Fatalf("错误文本应含状态码/字节数便于定位: %s", msg)
+			}
+		})
+	}
+}
+
+// 握手成功后下行/上行拿到非 200：错误文本同样不能回传上游响应体 ——
+// 原样带出会经 lastErr 进 requests.error、502 响应和三张 last_error 表，
+// 与握手分支是同类泄露。两个分支各盖一条，探针串绝不能出现。
+func TestWCStreamUploadFailureRedactsBody(t *testing.T) {
+	const probe = "LEAK_PROBE"
+	cases := []struct {
+		name string
+		mode string // get: 下行长轮询回 500；post: 上行 ofs=0 回 500
+	}{
+		{"下行非200", "get"},
+		{"上行非200", "post"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				resp := func(status int, h http.Header, body string) *http.Response {
+					return &http.Response{
+						StatusCode: status, Status: fmt.Sprintf("%d", status),
+						Header:  h,
+						Body:    io.NopCloser(strings.NewReader(body)),
+						Request: req,
+					}
+				}
+				switch req.URL.Path {
+				case "/app", "/u/0/app":
+					return resp(200, http.Header{}, `"d2zJAe":"`+wcTestAPIKey+`"`), nil
+				case "/v1/processSession":
+					switch {
+					case req.Method == "POST" && strings.HasPrefix(req.URL.RawQuery, "VER=8&RID="):
+						// 握手：带 X-HTTP-Session-Id 和 c 帧。
+						h := http.Header{}
+						h.Set("X-HTTP-Session-Id", "GSID_TEST")
+						return resp(200, h, "40\n[[0,[\"c\",\"SID_TEST\"]]]"), nil
+					case req.Method == "GET" && c.mode == "get":
+						return resp(500, http.Header{}, `[["er","`+probe+`",500]]`), nil
+					case req.Method == "GET":
+						// 上行分支：下行先建立（200），帧体挂住直到 ctx 取消，
+						// 错误只能来自上行。不能堵在 RoundTrip —— 主流程要等
+						// 下行 200 的 getReady 信号后才发上行。
+						return &http.Response{
+							StatusCode: 200, Status: "200", Header: http.Header{},
+							Body: hangBody{req.Context()}, Request: req,
+						}, nil
+					case req.Method == "POST" && c.mode == "post":
+						return resp(500, http.Header{}, `[["er","`+probe+`",500]]`), nil
+					}
+					return resp(200, http.Header{}, ""), nil
+				}
+				return resp(404, http.Header{}, ""), nil
+			})
+			const fakeProxy = "http://wcstreamredact.invalid:3128"
+			stdlibClientCache.Store(fakeProxy+"|0", &http.Client{Transport: rt})
+			stdlibClientCache.Store(fakeProxy+"|"+fmt.Sprint(rtCfg().RequestTimeout), &http.Client{Transport: rt})
+			defer func() {
+				stdlibClientCache.Delete(fakeProxy + "|0")
+				stdlibClientCache.Delete(fakeProxy + "|" + fmt.Sprint(rtCfg().RequestTimeout))
+			}()
+
+			wcKeyMu.Lock()
+			oldKey, oldAt := wcKey, wcKeyAt
+			wcKey, wcKeyAt = "", time.Time{}
+			wcKeyMu.Unlock()
+			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
+
+			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
+			_, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			if err == nil {
+				t.Fatalf("%s应报错", c.name)
+			}
+			msg := err.Error() + string(raw)
+			if strings.Contains(msg, probe) {
+				t.Fatalf("%s错误文本回传了上游响应体探针串: %s", c.name, msg)
+			}
+			// 仍要留可定位信息：HTTP 状态或响应体字节数。
+			if !strings.Contains(msg, "HTTP") || !strings.Contains(msg, "字节") {
+				t.Fatalf("%s错误文本应含状态码/字节数便于定位: %s", c.name, msg)
 			}
 		})
 	}

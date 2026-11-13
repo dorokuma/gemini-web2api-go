@@ -318,15 +318,23 @@ type wcRedactedError struct {
 
 func (e *wcRedactedError) Error() string { return e.msg }
 func (e *wcRedactedError) Unwrap() error { return e.err }
+
+// Timeout/Temporary 沿 Unwrap 链下钻：e.err 可能是 fmt.Errorf("%w") 包装、
+// 真正的 net.Error 在更内层，只看直接子节点会丢（errors.As 命中本类型后
+// 不再下钻，必须自己转发）。不新增分配。
 func (e *wcRedactedError) Timeout() bool {
-	if t, ok := e.err.(interface{ Timeout() bool }); ok {
-		return t.Timeout()
+	for cur := e.err; cur != nil; cur = errors.Unwrap(cur) {
+		if t, ok := cur.(interface{ Timeout() bool }); ok {
+			return t.Timeout()
+		}
 	}
 	return false
 }
 func (e *wcRedactedError) Temporary() bool {
-	if t, ok := e.err.(interface{ Temporary() bool }); ok {
-		return t.Temporary()
+	for cur := e.err; cur != nil; cur = errors.Unwrap(cur) {
+		if t, ok := cur.(interface{ Temporary() bool }); ok {
+			return t.Temporary()
+		}
 	}
 	return false
 }
@@ -611,7 +619,15 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			if g.status != 200 {
 				b, _ := io.ReadAll(io.LimitReader(g.body, 4096))
 				g.body.Close()
-				getErr <- fmt.Errorf("processSession 下行 HTTP %d: %s", g.status, truncate(string(b), 200))
+				// 不回传上游响应体：本错误经 lastErr 进 requests.error、502 响应
+				// 和三张 last_error 表，原样带出会外泄。"xsrf" 信号同握手分支
+				// 透出成标记，保住上层 isXSRFError 判定（当前 useWC=false 不可达，
+				// 属防御性一致）。
+				diag := fmt.Sprintf("processSession 下行 HTTP %d: 响应体 %d 字节", g.status, len(b))
+				if bytes.Contains(b, []byte(`"xsrf"`)) {
+					diag += `, "xsrf"`
+				}
+				getErr <- errors.New(diag)
 				return
 			}
 			readyOnce.Do(func() { close(getReady) })
@@ -663,7 +679,12 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		b, _ := io.ReadAll(io.LimitReader(resp.body, 4096))
 		resp.body.Close()
 		if resp.status != 200 {
-			return fmt.Errorf("processSession 上行 ofs=%d HTTP %d: %s", ofs, resp.status, truncate(string(b), 200))
+			// 同下行分支：不回传上游响应体（见下行处注释）。
+			diag := fmt.Sprintf("processSession 上行 ofs=%d HTTP %d: 响应体 %d 字节", ofs, resp.status, len(b))
+			if bytes.Contains(b, []byte(`"xsrf"`)) {
+				diag += `, "xsrf"`
+			}
+			return errors.New(diag)
 		}
 		return nil
 	}
