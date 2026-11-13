@@ -14,8 +14,11 @@
   API key、SAPISIDHASH 或会话值。当前 `web_channel` 未启用（`useWC=false`），无运行时影响。
 - **WebChannel 下行/上行非 200 响应不再回传上游响应体**，只给状态码与字节数等
   定位信息，避免上游错误内容经 `requests.error`/502/`last_error` 外泄。
-- **WebChannel 脱敏错误链的 `Timeout()`/`Temporary()` 沿链下钻**，重建后的
-  `*wcRedactedError`/`*url.Error` 转发到底层 `net.Error`，超时重试判定不丢。
+- **WebChannel 脱敏错误链的 `Timeout()`/`Temporary()` 沿链下钻**，但深链转发只发生在
+  重建的 `*wcRedactedError` 节点上（复制 `*url.Error` 时仅对其 `Err` 字段递归脱敏）；
+  `*url.Error` 自身的 `Timeout()` 仍只看直接 `Err` 一层——`url.Error→fmt→net.Error`
+  链路下超时判定照丢，属既有边界（见 `.agents/notes/webchannel-enable-prerequisites.md`
+  观察项 O-2）。
 - **WebChannel 凭据脱敏覆盖握手、请求构造与错误链**（`wcRedactErr`/`wcSanitizeErr`），
   `Unwrap`/`errors.As` 命中的每个节点都脱敏。
 
