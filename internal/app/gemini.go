@@ -817,7 +817,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	// 无害性：正常会话不会被误删 —— 该条件本身就意味着「这条会话不该留在账号里」，删掉它
 	// 正是本意；multi_turn 开着时这个函数整体不生效（会话要留给续接）。
 	// XSRF 值在 retry 循环里可能被自愈换掉，用闭包读取保证收尾用的总是当前最新的。
-	phantomCleanup := phantomCleanupFunc(func() (cookie, sapisid, xsrf string, authuser int) {
+	phantomCleanup := phantomCleanupFunc(func() (string, string, string, int) {
 		return cookieStr, sapisid, xsrfToken, authUser
 	}, proxyURL)
 	defer phantomCleanup.flush()

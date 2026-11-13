@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -755,7 +756,13 @@ func TestPhantomCleanupGateAndCollect(t *testing.T) {
 // must-fix 回归：400+XSRF 自愈换 token 之后，phantomCleanup 收尾必须带新 token ——
 // 旧版拿的是创建时快照的旧 token，自愈后取消/超时会让 GzXR5e 带着已被拒的旧 token
 // 去删，幽灵照样残留。成功路径不再直调 deleteConversation：同一 cid 由
-// defer phantomCleanup.flush() 删一次，计数断言防"成功分支 + flush"双删。
+// defer phantomCleanup.flush() 删一次。
+//
+// 「恰好一次」计数必须下沉到假传输层：只数 deleteConversationFn 桩点的话，
+// 成功分支若被改回直调 go deleteConversation(...)（不经过桩点），请求照样发出、
+// 测试却假绿。所以在 RoundTripper 里按 rpcids=GzXR5e 拦截真实出站请求计数，
+// 并校验它带的 XSRF（at=）与 Authorization（SAPISIDHASH 认证）—— 后者能直接
+// 检出 cleanup 凭据闭包里 sapisid 被遮蔽成零值的 bug。桩点只作旁证保留。
 //
 // 出口侧不打真网络：streamGenerateOnce 走代理分支（stdlib 客户端），测试把该
 // proxyURL 的 stdlibClientCache 换成走假 RoundTripper 的客户端，handler 按 URL
@@ -776,6 +783,14 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 	crow, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(cpayload), nil}})
 	contentLine := string(crow)
 
+	// 传输层证据：GzXR5e（删会话）出站请求的认证信息与 cid，桩点之外的第二见证。
+	type delReq struct {
+		at   string // form at=，flush 用的 XSRF
+		auth string // Authorization 头，sapisid 为空时 buildGeminiHeaders 不会写它
+		cid  string
+	}
+	delReqs := make(chan delReq, 4)
+
 	var first atomic.Bool
 	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		var body []byte
@@ -790,6 +805,23 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 				Body:    io.NopCloser(strings.NewReader(body)),
 				Request: req,
 			}
+		}
+		if req.URL.Query().Get("rpcids") == "GzXR5e" || strings.Contains(string(body), `"GzXR5e"`) {
+			d := delReq{auth: req.Header.Get("Authorization")}
+			if vals, err := url.ParseQuery(string(body)); err == nil {
+				d.at = vals.Get("at")
+				// f.req 形状：[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]，防御式逐层取。
+				var outer [][][]any
+				if json.Unmarshal([]byte(vals.Get("f.req")), &outer) == nil &&
+					len(outer) > 0 && len(outer[0]) > 0 && len(outer[0][0]) > 1 {
+					var inner []string
+					if s, _ := outer[0][0][1].(string); json.Unmarshal([]byte(s), &inner) == nil && len(inner) > 0 {
+						d.cid = inner[0]
+					}
+				}
+			}
+			delReqs <- d
+			return resp(200, `")']'\n[[\"wrb.fr\",\"GzXR5e\",null]]"`), nil
 		}
 		switch req.URL.Path {
 		case "/app":
@@ -844,11 +876,14 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 	rtVal.TemporaryChat, rtVal.AutoDeleteConversation, rtVal.MultiTurn = true, false, false
 	rtMu.Unlock()
 
-	// 打桩：数删除次数，记 token。
+	// 打桩只作旁证（防绕过计数主要靠上面的传输层 delReqs）：透传调用真实
+	// deleteConversation，让 GzXR5e 真打到假 RoundTripper 被计数；若有人把删除
+	// 改成绕开 deleteConversationFn 的写法，桩点静默而传输层仍会计数。
 	deleted := make(chan string, 4)
 	prevDel := deleteConversationFn
 	deleteConversationFn = func(cid, cookie, sapisid, xsrf, proxy string, authuser int) {
 		deleted <- xsrf + "|" + cid
+		prevDel(cid, cookie, sapisid, xsrf, proxy, authuser)
 	}
 	defer func() { deleteConversationFn = prevDel }()
 
@@ -862,22 +897,37 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 		t.Fatalf("没取回产物: artifacts=%d mediaErr=%v raw=%.400s", len(res.Artifacts), res.MediaErr, res.Raw)
 	}
 
+	// 传输层证据是主判据：同一 cid 的 GzXR5e 出站请求恰好一次，且带自愈后的
+	// 新 XSRF 与非空认证（sapisid 被遮蔽成零值时这里没有 Authorization）。
 	select {
-	case got := <-deleted:
-		parts := strings.SplitN(got, "|", 2)
-		if parts[1] != cid {
-			t.Fatalf("删的 cid=%q want %s", parts[1], cid)
+	case d := <-delReqs:
+		if d.cid != cid {
+			t.Fatalf("删的 cid=%q want %s", d.cid, cid)
 		}
-		if parts[0] != "tok-new-xyz:1700000000000" {
-			t.Fatalf("用的 XSRF=%q want tok-new-xyz:1700000000000（旧 token 已被拒，flush 必须用新的）", parts[0])
+		if d.at != "tok-new-xyz:1700000000000" {
+			t.Fatalf("用的 XSRF=%q want tok-new-xyz:1700000000000（旧 token 已被拒，flush 必须用新的）", d.at)
+		}
+		if !strings.HasPrefix(d.auth, "SAPISIDHASH ") {
+			t.Fatalf("删除请求缺 Authorization（sapisid 没传下去？）: auth=%q", d.auth)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("flush 没有发出 GzXR5e 删除请求")
 	}
 	select {
-	case extra := <-deleted:
-		t.Fatalf("同一 cid 被删了第二次: %q", extra)
+	case extra := <-delReqs:
+		t.Fatalf("同一 cid 的 GzXR5e 发了第二次: %+v", extra)
 	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 桩点旁证：现有实现下也应被命中一次、带新 token。
+	select {
+	case got := <-deleted:
+		parts := strings.SplitN(got, "|", 2)
+		if parts[1] != cid || parts[0] != "tok-new-xyz:1700000000000" {
+			t.Fatalf("桩点记的删除=%q want %s|%s", got, "tok-new-xyz:1700000000000", cid)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("deleteConversationFn 桩点未命中（传输层已见请求，路径变了？）")
 	}
 }
 
