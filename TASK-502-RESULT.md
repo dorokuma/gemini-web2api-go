@@ -113,7 +113,9 @@ round1 的 "unauthorized retries" 问题轮次同样不作为最终门禁通过�
 
 ### 4.1 verifier 初轮（c57860d，8 判据全过）
 
-原件逐字副本：`.agents/notes/task-502-gate-verifier.md`（源 `/tmp/herdr-role-sessions/default/role-verifier-8496f4a0/report.md`，28633 字节，sha256 `bd7648f685071da4d9ccacfa22afd9f2858c47c99be8e40e165f305448b86654`）。要点：
+原件逐字副本：`.agents/notes/task-502-gate-verifier.md`（来源文件 sha256：`/tmp/herdr-role-sessions/default/role-verifier-8496f4a0/report.md`，28633 字节，`bd7648f685071da4d9ccacfa22afd9f2858c47c99be8e40e165f305448b86654`）。
+本 md 文件 sha256（sha256sum 实测）：`b1387d4e7bb125e1aa49ed2748dba07390f91a845c75d3f4c12bccc2ad3e9e72`。
+要点：
 
 - 判据 1 门禁基础：dev-audit `L1 OK`；make check RC=0（gofmt 0 / vet 0 / test ok 18.087s / build 0）；`-v` 顶层 PASS 183。
 - 判据 2/3/4：4 个 502 用例全 PASS，reason/`upstream_model`/`frames`/`content_frame`/`hint` 断言齐备；`log_requests=false` 下 requests 行仍落库。
@@ -129,7 +131,8 @@ round1 的 "unauthorized retries" 问题轮次同样不作为最终门禁通过�
 
 ### 4.3 oracle 审计（恢复件）
 
-原件：`.agents/notes/task-502-gate-oracle.md`（正文 2930 字符，sha256 `7fbbe9b7f3fd88db2dc61d72e91ed21d79bbf94f5ba0f594ad9b6dd2f5d30c9f`，恢复方式与 transcript 指纹见文件头）。
+原件：`.agents/notes/task-502-gate-oracle.md`（提取正文 sha256（UTF-8）：`7fbbe9b7f3fd88db2dc61d72e91ed21d79bbf94f5ba0f594ad9b6dd2f5d30c9f`，正文 2930 字符；恢复方式与 transcript 指纹见文件头）。
+本 md 文件 sha256（sha256sum 实测）：`1f15169e02e26d60174a60fb6d229abc6b5bd9efbf5a6e7f85db45e2c1da61e1`。
 结论：**无 must fix / should fix**，本仓改动成立；1 项观察项为跨仓 `backend-release.mjs` 对 `const Version` 的文本替换依赖（→ `.agents/notes/cross-repo-version-coupling.md`，分诊 out-of-scope / followup）。
 
 历史如实记录：oracle 首轮报告正文曾随终端缓冲丢失（hc send 未达），经 pig session
@@ -147,7 +150,8 @@ transcript 取文**恢复成功**（transcript 7603212 字节，sha256
 
 ### 4.4 reviewer 两轮
 
-原件：`.agents/notes/task-502-gate-reviewer.md`（源 `/tmp/reviewer-502-original.txt`，2054 字节，sha256 `d6b5559ab873ef5ffa9a947388c5bb0cc3cd97dd5f381e8b1795d80265116be6`）。
+原件：`.agents/notes/task-502-gate-reviewer.md`（来源文件 sha256：`/tmp/reviewer-502-original.txt`，2054 字节，`d6b5559ab873ef5ffa9a947388c5bb0cc3cd97dd5f381e8b1795d80265116be6`）。
+本 md 文件 sha256（sha256sum 实测）：`c3cf3e650aebe820413a49ae31f320f195df688af94b8a56c388a7a1f73fe097`。
 首轮结论：未回退既有修复、无新增代码阻断；**唯一 must fix = 缺当前快照独立证据**（round2 是 a8d1bc1+旧补丁，非当前候选）。该 must fix 已由 §4.2 verifier 补证覆盖；最终裁决由协调方做出。
 
 ### 4.5 旧轮材料（历史，非本候选门禁）
