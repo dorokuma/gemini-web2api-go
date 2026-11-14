@@ -16,11 +16,13 @@ COPY . .
 
 # TARGETARCH 由 buildx 注入(amd64 / arm64 ...)。经典 builder 不注入,兜底 amd64。
 ARG TARGETARCH
+# VERSION 由 docker.yml 的 --build-arg 注入（tag 去 v 前缀），兜底 dev。
+ARG VERSION=dev
 
 # CGO disabled — modernc/sqlite is pure Go.
-# -ldflags strip symbols to shave ~5MB off binary.
+# -ldflags strip symbols to shave ~5MB off binary; -X 注入版本号。
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X gemini-web2api/internal/app.Version=${VERSION}" \
     -trimpath \
     -o /out/gemini-web2api .
 

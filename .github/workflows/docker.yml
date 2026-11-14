@@ -38,6 +38,14 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # 版本号跟 release workflow 同一套：tag 去掉 v 前缀注入，分支构建给 dev。
+      - name: Compute image version
+        id: ver
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/v*) echo "version=$v" >> "$GITHUB_OUTPUT" ;;
+          *) echo "version=dev" >> "$GITHUB_OUTPUT" ;; esac
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -45,5 +53,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 镜像里 --version 报的版本跟 tag 走；分支构建没有 tag，注入 "dev"。
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

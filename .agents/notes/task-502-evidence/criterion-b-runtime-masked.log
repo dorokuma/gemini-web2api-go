@@ -1,0 +1,14 @@
+gemini-web2api-go vtask502-probe
+  Listening:   http://0.0.0.0:21883
+  Base URL:    http://localhost:21883/v1
+  API key:     3adb8021fde4...35fd  (locked by flag/env)
+  Admin UI:    http://localhost:21883/admin  (token auth)
+  DB:          /tmp/vrfy-502/probe-data/gemini.db
+  Models:      [gemini-3.5-flash-lite gemini-3.6-flash]
+  Cookie:      none (anonymous)
+  Proxy:       none (direct)
+  Impersonate: chrome_146
+  Tokenizer:   tiktoken cl100k_base
+  Per-IP 限流: 并发=5 / RPM=30 / RPH=80
+  Retry:       3x / 2s
+

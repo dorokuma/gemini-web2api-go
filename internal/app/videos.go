@@ -153,7 +153,28 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 			"retry_after": retryAfterSeconds(reset)}})
 		return
 	}
-	writeJSON(w, 200, startVideoJob(model, prompt, size, images))
+	writeJSON(w, 200, videoJobSnapshot(startVideoJob(model, prompt, size, images)))
+}
+
+// videoJobSnapshot 在 videoJobsMu 下复制一份任务的可 JSON 字段：后台 goroutine 会改
+// job（status / account / mp4 …），HTTP 序列化若直接读同一个 *videoJob 就是 data race。
+// 只拷 JSON 字段，mp4/mime/会话引用等内部字段不进响应，不必复制。
+func videoJobSnapshot(j *videoJob) videoJob {
+	videoJobsMu.Lock()
+	defer videoJobsMu.Unlock()
+	return videoJob{
+		ID:          j.ID,
+		Object:      j.Object,
+		Model:       j.Model,
+		Status:      j.Status,
+		CreatedAt:   j.CreatedAt,
+		Prompt:      j.Prompt,
+		Size:        j.Size,
+		Error:       j.Error,
+		RemixedFrom: j.RemixedFrom,
+		Account:     j.Account,
+		Seconds:     j.Seconds,
+	}
 }
 
 // startVideoJob 建一个视频任务并在后台跑，立即返回（status=queued）。
@@ -252,12 +273,14 @@ func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvR
 		videoJobsMu.Unlock()
 	}
 	if err != nil {
-		recordRequest("videos", j.Model, j.Prompt, "", res, 502, err.Error(), false)
+		// job.Error 保持原样（errVideoQuota 等前缀是客户端可匹配的契约）；
+		// reason 前缀只落在 requests.error 列，供面板检索。
+		recordUpstreamFailure("videos", j.Model, j.Prompt, res, 502, err, false)
 		finishVideoJob(j, nil, "", err.Error())
 		return
 	}
 	if res == nil || len(res.Artifacts) == 0 {
-		recordRequest("videos", j.Model, j.Prompt, "", res, 502, "no video produced", false)
+		recordUpstreamFailure("videos", j.Model, j.Prompt, res, 502, errors.New("no video produced"), false)
 		finishVideoJob(j, nil, "", "no video produced")
 		return
 	}
@@ -387,7 +410,7 @@ func handleExtendVideo(w http.ResponseWriter, r *http.Request, parentID string) 
 	}
 	putVideoJob(j)
 	go runVideoJobWith(j, images, acct, &ConvRef{CID: cid, RID: rid, RCID: rcid, Turn: turn + 1})
-	writeJSON(w, 200, j)
+	writeJSON(w, 200, videoJobSnapshot(j))
 }
 
 // mp4Duration reads mvhd (movie header) duration; 0 if not found.
@@ -448,5 +471,5 @@ func handleVideoItem(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(mp4)
 		return
 	}
-	writeJSON(w, 200, j)
+	writeJSON(w, 200, videoJobSnapshot(j))
 }

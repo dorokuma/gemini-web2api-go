@@ -667,9 +667,11 @@ func classifyError(errStr string) string {
 	switch {
 	case errStr == "":
 		return ""
-	case strings.Contains(errStr, "no content frame"), strings.Contains(errStr, "failure reply"):
-		// 上游返回 200 但一个内容帧都没有。实测是瞬时拒绝，隔几分钟自行恢复，
-		// 跟频率/并发/累积次数都无关，重试即可。
+	case strings.Contains(errStr, "no content frame"), strings.Contains(errStr, "failure reply"),
+		strings.Contains(errStr, "[no_content_frame]"), strings.Contains(errStr, "[failure_reply]"),
+		strings.Contains(errStr, "[empty_content]"):
+		// 上游返回 200 但一个内容帧都没有（或帧在但抽不出正文）。实测是瞬时拒绝，
+		// 隔几分钟自行恢复，跟频率/并发/累积次数都无关，重试即可。
 		return "upstream_rejected"
 	case strings.Contains(errStr, "slot full") || strings.Contains(errStr, "limit reached"):
 		return "rate_limited_local"

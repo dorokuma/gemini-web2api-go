@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -277,20 +278,24 @@ func writeGeminiError(w http.ResponseWriter, code int, msg string) {
 		"code": code, "message": msg, "status": geminiStatus(code)}})
 }
 
-// writeGeminiCallError 跟 OpenAI 那两条路同一套分流：降级 429、超长 400、限流 429、其余 502。
-func writeGeminiCallError(w http.ResponseWriter, err error) {
-	switch e := err.(type) {
-	case *ModelDowngradedError:
-		if e.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(e.RetryAfter.Seconds()))))
+// writeGeminiCallError 跟 OpenAI 那两条路同一套分流：降级 429、超长 400、限流 429、
+// 其余 502（诊断字段走 Google 的 details 块，跟 OpenAI error 字段同一份数据）。
+func writeGeminiCallError(w http.ResponseWriter, err error, res *StreamResult) {
+	var mde *ModelDowngradedError
+	var ptl *PromptTooLongError
+	var rle *RateLimitError
+	switch {
+	case errors.As(err, &mde):
+		if mde.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(mde.RetryAfter.Seconds()))))
 		}
-		writeGeminiError(w, 429, e.Error())
-	case *PromptTooLongError:
-		writeGeminiError(w, 400, e.Error())
-	case *RateLimitError:
-		writeGeminiError(w, 429, e.Error())
+		writeGeminiError(w, 429, mde.Error())
+	case errors.As(err, &ptl):
+		writeGeminiError(w, 400, ptl.Error())
+	case errors.As(err, &rle):
+		writeGeminiError(w, 429, rle.Error())
 	default:
-		writeGeminiError(w, 502, "upstream error: "+err.Error())
+		writeJSON(w, 502, geminiErrorJSON(err, res))
 	}
 }
 
@@ -539,11 +544,12 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 			return
 		}
 		status := 502
-		if _, ok := err.(*ModelDowngradedError); ok {
+		var mde *ModelDowngradedError
+		if errors.As(err, &mde) {
 			status = 429
 		}
-		recordRequest("gemini.generateContent", g.modelName, g.prompt, "", res, status, err.Error(), false)
-		writeGeminiCallError(w, err)
+		recordUpstreamFailure("gemini.generateContent", g.modelName, g.prompt, res, status, err, false)
+		writeGeminiCallError(w, err, res)
 		return
 	}
 	recordRequest("gemini.generateContent", g.modelName, g.prompt, text, res, 200, "", false)
@@ -643,10 +649,10 @@ func (s *geminiStream) thought(d string) {
 	s.chunk([]interface{}{map[string]interface{}{"text": d, "thought": true}}, "", nil)
 }
 
-// fail 在已开流后报错：HTTP 状态码改不了了，就把 Google 形状的错误体当最后一块发出去。
-func (s *geminiStream) fail(err error) {
-	s.write(map[string]interface{}{"error": map[string]interface{}{
-		"code": 502, "message": err.Error(), "status": geminiStatus(502)}})
+// fail 在已开流后报错：HTTP 状态码改不了了，就把 Google 形状的错误体当最后一块
+// 发出去（details 里带同一份 reason/upstream_model/frames/hint 诊断）。
+func (s *geminiStream) fail(err error, res *StreamResult) {
+	s.write(geminiErrorJSON(err, res))
 	s.end()
 }
 
@@ -687,15 +693,16 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 			return
 		}
 		status := 502
-		if _, ok := err.(*ModelDowngradedError); ok {
+		var mde *ModelDowngradedError
+		if errors.As(err, &mde) {
 			status = 429
 		}
-		recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, "", res, status, err.Error(), true)
+		recordUpstreamFailure("gemini.streamGenerateContent", g.modelName, g.prompt, res, status, err, true)
 		if st.Started() {
-			st.fail(err)
+			st.fail(err, res)
 			return
 		}
-		writeGeminiCallError(w, err)
+		writeGeminiCallError(w, err, res)
 		return
 	}
 	recordRequest("gemini.streamGenerateContent", g.modelName, g.prompt, text, res, 200, "", true)

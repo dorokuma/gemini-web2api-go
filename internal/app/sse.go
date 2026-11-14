@@ -126,14 +126,15 @@ func (s *sseWriter) Finish(reason string, usage map[string]int) {
 }
 
 // Fail 在已经开流之后出错时用：发一个带 error 的 chunk 再收尾。
-// 此时 HTTP 状态码已经是 200，改不了了。
-func (s *sseWriter) Fail(err error) {
+// 此时 HTTP 状态码已经是 200，改不了了；诊断字段跟未开流那条 502 完全同一份，
+// 客户端拿到的结构化信息不因「太晚开流」变少。
+func (s *sseWriter) Fail(err error, res *StreamResult) {
 	s.start()
 	c := map[string]interface{}{
 		"id": s.id, "object": "chat.completion.chunk",
 		"created": s.created, "model": s.model,
 		"choices": []map[string]interface{}{},
-		"error":   map[string]string{"message": err.Error(), "type": "upstream_error"},
+		"error":   upstreamErrorJSON(err, res),
 	}
 	b, _ := json.Marshal(c)
 	fmt.Fprintf(s.w, "data: %s\n\n", b)

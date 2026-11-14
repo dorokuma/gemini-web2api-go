@@ -1,0 +1,13 @@
+=== VERIFIER CRITERION A (isolated clone, origin removed) ===
+PRE-REGISTERED COMMAND (verbatim, single line):
+GOTOOLCHAIN=go1.27.1 go test -race ./internal/app -count=3 ; echo "EXIT=$?"
+CWD: /tmp/vrfy-502/race-clone
+HEAD: d4167899bf6aa51fa9003f51c7ae05a9fd93dead
+TOOLCHAIN RESOLVED: go version go1.27.1 linux/arm64
+--- BEGIN RAW OUTPUT OF PRE-REGISTERED COMMAND ---
+ok  	gemini-web2api/internal/app	58.790s
+EXIT=0
+--- END RAW OUTPUT OF PRE-REGISTERED COMMAND ---
+ELAPSED_SECONDS=68
+ECHOED_EXIT_CODE_FROM_PRE_REGISTERED_COMMAND=0
+LOG_FILE=/tmp/vrfy-502/race-clone/race-full.log
