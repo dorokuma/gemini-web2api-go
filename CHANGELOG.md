@@ -4,21 +4,37 @@
 
 ## Unreleased
 
+## 4.28.0-magpie.5
+
 ### 修复
 
-- **502 响应体结构化 + 失败原因落库**。上游调用失败（无内容帧 / 出错话术 / 超时 /
-  抽取后为空）时，502 body 现在带 `reason`/`upstream_model`/`frames`/`content_frame`/`hint` 字段，
-  `requests.error` 写 `[reason]` 前缀、`upstream_model` 记上游自报显示名——即使
-  `log_requests` 关闭也落库，用户现场不再只剩一句 “upstream error”。
-  字段语义：`frames` 是该次响应 `wrb.fr` 条目总数（含结束帧）；`content_frame` 是
-  既有文本或思考检测能否认出内容帧的判据；`upstream_model` 为 `unknown` 表示该最终
-  尝试无可解析的自报名，不代表模型权限结论。多轮续接的「续接无内容帧」中文报错
-  现在带显式 `no_content_frame` reason（错误串无英文特征，单靠串匹配会漏归兜底）；
-  面板错误分类直接认 `[no_content_frame]`/`[failure_reply]` 前缀，不再误归 network。
-  reasoning-only（只有思考链没有正文）明确返回 `empty_content`：思考链是
-  `reasoning_content` 辅助字段不能顶替正文，回假 200 比报错更误导。
+- **502 响应体结构化**。上游调用失败（无内容帧 / 出错话术 / 超时 / 抽取后为空）时，
+  502 body 现在带 `reason`/`upstream_model`/`frames`/`content_frame`/`hint` 字段，
+  已开流的 SSE 错误块带同一份字段；Google 原生接口（`/v1beta`）同一套诊断走
+  `error.details` 块。字段语义：`frames` 是该次响应 `wrb.fr` 条目总数（含结束帧）；
+  `content_frame` 是既有文本或思考检测能否认出内容帧的判据；`upstream_model` 为
+  `unknown` 表示该最终尝试无可解析的自报名，不代表模型权限结论。
+- **失败原因落库**。`requests.error` 写 `[reason]` 前缀、`upstream_model` 列记上游
+  自报显示名——即使 `log_requests` 关闭也落库（该开关只管 stderr），用户现场不再
+  只剩一句 “upstream error”。多轮续接的「续接无内容帧」中文报错现在带显式
+  `no_content_frame` reason（错误串无英文特征，单靠串匹配会漏归兜底）；面板错误
+  分类直接认 `[no_content_frame]`/`[failure_reply]`/`[empty_content]` 前缀，
+  不再误归 network。
+- **空正文不再静默返回 200**。有内容帧但抽取后为空 → `empty_content`；完全无内容帧 →
+  `no_content_frame`；只有思考链没有正文（reasoning-only）也返回 `empty_content`：
+  `reasoning_content` 是正文之外的辅助字段，拿它顶替正文等于回一个「成功但没答案」
+  的假 200，比报错更误导。canvas / 媒体产物 / 有效 tool_call / 纯代码产物四类合法
+  空正文路径不受影响。
 - **`Version` 改为构建注入**。源码里恒为 `var Version = "dev"`，release workflow 与
   Docker 构建用 `-ldflags -X` 注入 tag，不再出现「发了新版、`GET /` 还报旧版」的固化问题。
+- **视频任务响应的 data race**。`handleCreateVideo` / `handleExtendVideo` /
+  `handleVideoItem` 原来把 `*videoJob` 直接交给 HTTP 序列化，后台 goroutine 同时在
+  写 status / account / mp4 等字段（`-race` 下 `TestCreateVideoAcceptsInputReference`
+  报 DATA RACE）。新增 `videoJobSnapshot` 在 `videoJobsMu` 下复制可 JSON 字段后返回。
+
+## 4.28.0-magpie.4
+
+### 修复
 
 - **回复只剩一个无法解析的 ```tool_call``` 围栏时不再返回空回答**。之前返回
   200 且 `content: null`（客户端静默拿不到内容）；现在返回错误，客户端会出现 5xx，
