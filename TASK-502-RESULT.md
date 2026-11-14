@@ -1,8 +1,9 @@
 # TASK-502 结果记录（事实记录 · 候选已 commit，门禁待验收）
 
 > 本文件是事实记录，非门禁证据本身，**不代表任务完成或门禁通过**。
-> **当前候选 commit：`c57860d`**（基线 `8647ba1`，由 rebase 前旧快照 `a8d1bc1`
-> + 工作区改动 rebase 后 squash 而来）；HEAD `d416789` / `2007fa0` 仅追加文档。
+> **业务候选 commit：`c57860d`**（基线 `8647ba1`，由 rebase 前旧快照 `a8d1bc1`
+> + 工作区改动 rebase 后 squash 而来）；其后仅追加文档/证据提交（见提交历史），
+> **业务代码自 `c57860d` 起未变**。
 > **状态：待验收。** 当前候选的三方门禁原件均已收齐并落盘（见第六节），
 > 收口裁决由协调方做出。
 
@@ -10,7 +11,7 @@
 
 | 类别 | 内容 | 对 `c57860d` 的门禁效力 |
 |---|---|---|
-| **当前候选验证** | verifier 初轮（8/8 判据通过）+ verifier 补证（全包 race 3 轮 + 受体演练）+ oracle 恢复件（无阻断）+ reviewer 两轮（首轮唯一 must fix 已由补证覆盖） | **有效**，是本次验收依据 |
+| **当前候选验证** | verifier 初轮（原报告自述 8 项判据通过，其中包含以下协议偏差：①判据 1-5 复用同一 A clone；②`dev-audit` 曾因 `git archive` 快照空转后改用真 clone 重做；③变异反例首轮不可编译、调整后才跑通）+ verifier 补证（全包 race 3 轮 + 受体演练）+ oracle 恢复件（无阻断）+ reviewer 两轮（首轮唯一 must fix 已由补证覆盖） | **有效**，是本次验收依据 |
 | **旧轮真实 baseline 红灯历史材料** | `a8d1bc1` 时代 verifier round2（`.agents/notes/task-502-verifier-round2.txt`）的红绿对照 | **历史材料**：是在未提交旧快照上测出的真实差异，**不作为本候选门禁证据** |
 | **当前变异敏感性测试** | verifier 初轮判据 7/8：在 `c57860d` 隔离 clone 上**人为改坏**业务文件（去掉空正文守卫 / 去掉落库前缀），测试转红 | 证明测试有效性感，**不是真实基线回归红灯**，反例改动不在候选代码内 |
 
@@ -111,7 +112,12 @@ round1 的 "unauthorized retries" 问题轮次同样不作为最终门禁通过�
 
 ## 四、当前候选验证记录（verifier 初轮 + 补证 + oracle 恢复件 + reviewer）
 
-### 4.1 verifier 初轮（c57860d，8 判据全过）
+### 4.1 verifier 初轮（c57860d，原报告自述 8 项判据通过）
+
+> 口径说明：原报告自述 8 项通过，其中包含以下已记录的协议偏差，不得以报告
+> 「未重试」字样抹去：①判据 1-5 复用同一 A clone；②`dev-audit` 曾因
+> `git archive` 快照空转后改用真 clone 重做；③变异反例首轮不可编译、
+> 调整后才跑通。
 
 原件逐字副本：`.agents/notes/task-502-gate-verifier.md`（来源文件 sha256：`/tmp/herdr-role-sessions/default/role-verifier-8496f4a0/report.md`，28633 字节，`bd7648f685071da4d9ccacfa22afd9f2858c47c99be8e40e165f305448b86654`）。
 本 md 文件 sha256（sha256sum 实测）：`b1387d4e7bb125e1aa49ed2748dba07390f91a845c75d3f4c12bccc2ad3e9e72`。
@@ -126,8 +132,8 @@ round1 的 "unauthorized retries" 问题轮次同样不作为最终门禁通过�
 ### 4.2 verifier 补证（c57860d 独立快照）
 
 目录 `.agents/notes/task-502-evidence/`（`task-502-gate-verifier-supplement.md`，16694 字节，sha256 `110518e42a00057fc2d2ddf71a012370ae1ce85c015a1b240be9943af4ca9691`，加 criterion-a/b 原始证据文件）：
-- 判据 A：`c57860d` 上全包 `go test -race -count=3` PASS（补 reviewer 要的当前快照 -race 3 轮）。
-- 判据 B：受体演练——`git archive` 快照注入 `Version=task502-probe` 构建，`--version` 与 `GET /` 运行时 `version` 字段严格相等。
+- 判据 A：`c57860d` 上精确未过滤全包命令 `GOTOOLCHAIN=go1.27.1 go test -race ./internal/app -count=3` 实测 `EXIT=0`、`ok gemini-web2api/internal/app 58.790s`、DATA RACE 0、FAIL 0（补 reviewer 要的当前快照 -race 3 轮）。
+- 判据 B：受体演练——在**另一新 `git clone`** 上注入 `Version=task502-probe` 构建，`--version` 与 `GET /` 运行时 `version` 字段严格相等。
 
 ### 4.3 oracle 审计（恢复件）
 
@@ -152,12 +158,14 @@ transcript 取文**恢复成功**（transcript 7603212 字节，sha256
 
 原件：`.agents/notes/task-502-gate-reviewer.md`（来源文件 sha256：`/tmp/reviewer-502-original.txt`，2054 字节，`d6b5559ab873ef5ffa9a947388c5bb0cc3cd97dd5f381e8b1795d80265116be6`）。
 本 md 文件 sha256（sha256sum 实测）：`c3cf3e650aebe820413a49ae31f320f195df688af94b8a56c388a7a1f73fe097`。
-首轮结论：未回退既有修复、无新增代码阻断；**唯一 must fix = 缺当前快照独立证据**（round2 是 a8d1bc1+旧补丁，非当前候选）。该 must fix 已由 §4.2 verifier 补证覆盖；最终裁决由协调方做出。
+首轮结论：未回退既有修复、无新增代码阻断；**唯一 must fix = 缺当前快照独立证据**（round2 是 a8d1bc1+旧补丁，非当前候选）。
+
+**该 must fix 已闭环**：本次真实基线对照（证据落盘 `.agents/notes/task-502-evidence/baseline-*.txt`、`candidate-output.txt`、`baseline-report.md`）实测 baseline `8647ba1` + test-only overlay 红（r2 外层 RC=0、内层 RC=1、`tests=9`、命中「error 缺字段」）、candidate `c57860d` 同命令绿（`EXIT=0`、六顶层全 PASS），基线红 → 候选绿的对照证据链补齐；此闭环结论由协调方最终裁决。
 
 ### 4.5 旧轮材料（历史，非本候选门禁）
 
 - `.agents/notes/task-502-verifier-round1.txt`（31028 字节，sha256 `7250d8bdad1397ce2007e6eb322583189e5e3a4797b07d5736174bd1608dc0aa`）。
-- `.agents/notes/task-502-verifier-round2.txt`（17367 字节，sha256 `ff43bb65c7d7a200988e168180ef938494ba6ed812813c922e346ae898820d9e`）——基于 `a8d1bc1` + 未提交改动，是**真实 baseline 红灯**但属旧快照，仅作历史材料。
+- `.agents/notes/task-502-verifier-round2.txt`（17367 字节，sha256 `ff43bb65c7d7a200988e168180ef938494ba6ed812813c922e346ae898820d9e`）——基于 `a8d1bc1` + 未提交改动，是**真实 baseline 红灯**但属旧快照；且该轮存在**同 clone cached 复跑**的历史偏差（输出中出现过 `(cached)`）。仅作**历史材料**，不并入当前候选门禁。
 
 ## 五、边界声明
 

@@ -11,7 +11,7 @@
 
 ## 我方现状
 
-- `internal/app/server.go:17` 为 `var Version = "dev"`（**不是** `:13`）；`server.go:13` 是 `)` 收尾的 import 块，`:14-16` 为注释行。
+- `internal/app/server.go:17` 为 `var Version = "dev"`；`server.go:12` 是 `)` 收尾的 import 块，`:13` 为空行，`:14-16` 为注释行。
 - 本仓 release/docker 构建已全部改走 `-ldflags -X gemini-web2api/internal/app.Version=<ver>` 注入（release.yml:47、Dockerfile:20/25），发行侧不依赖源码内版本声明形态。
 
 ## 触发面
