@@ -4,6 +4,15 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v5.0.0); leave empty on a branch for dry-run check'
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write   # 建 Release、传附件要写权限
@@ -12,49 +21,148 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 解析构建目标：手动派发 inputs.tag > push tag > 分支演练。
+      # tag   保留 v 前缀（文件名、Release 名、git ref 用）
+      # version 去掉 v（注入 ldflags、CHANGELOG 小节匹配用）
+      - name: Resolve build target
+        id: target
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            cand="$INPUT_TAG"
+            if ! awk -v s="$cand" 'BEGIN { exit !(s !~ /[\r\n]/ && s ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) }'; then
+              echo "::error::inputs.tag '$INPUT_TAG' is not strict SemVer vX.Y.Z"
+              exit 1
+            fi
+            tag="$INPUT_TAG"
+            echo "is_release=true"        >> "$GITHUB_OUTPUT"
+            echo "tag=$tag"               >> "$GITHUB_OUTPUT"
+            echo "version=${tag#v}"       >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            tag="${GITHUB_REF_NAME}"
+            cand="$tag"
+            if ! awk -v s="$cand" 'BEGIN { exit !(s !~ /[\r\n]/ && s ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) }'; then
+              echo "::error::tag '$tag' is not strict SemVer vX.Y.Z"
+              exit 1
+            fi
+            echo "is_release=true"   >> "$GITHUB_OUTPUT"
+            echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+            echo "version=${tag#v}"  >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false"  >> "$GITHUB_OUTPUT"
+            echo "tag=dev"           >> "$GITHUB_OUTPUT"
+            echo "version=dev"       >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+      # release 资产不可变：已发布的同 tag release 直接拒绝，绝不覆写。
+      - name: Guard against overwriting published release
+        if: steps.target.outputs.is_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; refusing to overwrite immutable release assets"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      # actions/checkout 会把 tag 变成 detached HEAD 但不保证本地有
+      # refs/tags/<tag> 对象；发版时显式拉一次，让 release-check 的
+      # git cat-file -t 能拿到真实 annotated tag 对象。
+      - name: Fetch release tag object
+        if: steps.target.outputs.is_release == 'true'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          git fetch --no-tags --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      # Version 是 var、由发布构建用 -ldflags -X 注入 tag 值，源码里恒为 "dev"
-      # （详见 README「版本号」）。这里只校验源码里没被改回写死的版本号——
-      # 写成 const 或具体版本都会让注入和检查失效。
-      - name: Check Version stays injectable
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          # -x 整行精确匹配：注释行或 OtherVersion 之类同名串都不能顶替真实声明行。
-          grep -nx 'var Version = "dev"' internal/app/server.go \
-            || { echo "::error::internal/app/server.go 里 Version 应保持 var Version = \"dev\"，由构建注入"; exit 1; }
+      - name: make check
+        run: make check
 
-      - run: go test ./...
+      - name: make release-check
+        if: steps.target.outputs.is_release == 'true'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: make release-check TAG="$TAG"
 
       # CGO_ENABLED=0：SQLite 用的是 modernc.org/sqlite（纯 Go），
       # 所以交叉编译不需要各平台的 C 工具链，直接 GOOS/GOARCH 就行。
+      # 资产文件名用含 v 的 TAG；-ldflags 注入用去 v 的 VERSION。
       - name: Cross compile
         env:
           CGO_ENABLED: "0"
+          TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
           mkdir -p dist
-          ver="${GITHUB_REF_NAME}"
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             os="${target%/*}"; arch="${target#*/}"
-            out="dist/gemini-web2api-go_${ver}_${os}_${arch}"
+            out="dist/gemini-web2api-go_${TAG}_${os}_${arch}"
             [ "$os" = "windows" ] && bin="$out.exe" || bin="$out"
             echo "building $bin"
-            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w -X gemini-web2api/internal/app.Version=${GITHUB_REF_NAME#v}" -o "$bin" .
+            GOOS="$os" GOARCH="$arch" go build -trimpath -buildvcs=false \
+              -ldflags="-s -w -X gemini-web2api/internal/app.Version=${VERSION}" \
+              -o "$bin" .
           done
-          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      # 硬校验：linux/amd64 二进制 --version 输出格式正确且与 VERSION 精确相等；
+      # 独立二次编译并比对 SHA-256，确保构建可复现。
+      - name: Verify binary version and reproducibility
+        env:
+          CGO_ENABLED: "0"
+          TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+          IS_RELEASE: ${{ steps.target.outputs.is_release }}
+        run: |
+          ver_out="$(./dist/gemini-web2api-go_${TAG}_linux_amd64 --version)"
+          echo "binary reports: $ver_out"
+          if [ "$IS_RELEASE" = "true" ]; then
+            # 先断言无 v 前缀混入（防 TAG 直接注入 ldflags）
+            printf '%s\n' "$ver_out" \
+              | grep -Eq '^gemini-web2api-go (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              || { echo "::error::unexpected version string: $ver_out"; exit 1; }
+            [ "$ver_out" = "gemini-web2api-go ${VERSION}" ] \
+              || { echo "::error::version mismatch: got '$ver_out', want 'gemini-web2api-go ${VERSION}'"; exit 1; }
+          else
+            [ "$ver_out" = "gemini-web2api-go dev" ] \
+              || { echo "::error::unexpected dev version string: $ver_out"; exit 1; }
+          fi
+          GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X gemini-web2api/internal/app.Version=${VERSION}" \
+            -o /tmp/repro-check .
+          a=$(sha256sum "dist/gemini-web2api-go_${TAG}_linux_amd64" | cut -d' ' -f1)
+          b=$(sha256sum /tmp/repro-check | cut -d' ' -f1)
+          rm -f /tmp/repro-check
+          [ "$a" = "$b" ] \
+            || { echo "::error::reproducibility check failed: $a != $b"; exit 1; }
+          echo "reproducibility OK: $a"
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist && sha256sum gemini-web2api-go_* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       # 从 CHANGELOG.md 抽出本 tag 对应的那一节，拼进 Release 说明。
-      # 抽法：从 `## <版本号>` 那行的下一行起，到下一个 `## ` 之前。
-      # 抽不到（没写 CHANGELOG）就留空，靠下面 generate_release_notes 的提交列表兜底。
+      # 抽不到或抽出来只有标题/空行时硬阻断，不再靠提交列表兜底。
       - name: Build release notes
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.target.outputs.is_release == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
           {
             echo "单二进制，下载对应平台的那个直接跑，不需要 Go 也不需要 Docker："
             echo
@@ -64,18 +172,28 @@ jobs:
             echo '```'
             echo
             echo "容器部署见 \`ghcr.io/${{ github.repository }}\`。校验完整性用 \`SHA256SUMS.txt\`。"
-            section=$(awk -v v="$ver" '$0=="## "v{f=1;next} /^## /{f=0} f' CHANGELOG.md)
-            if [ -n "$section" ]; then
-              echo
-              echo "## 本版更新"
-              echo "$section"
+            section=$(awk -v v="$VERSION" '$0 == "## " v || index($0, "## " v " ") == 1 {f=1;next} /^## /{f=0} f' CHANGELOG.md)
+            # 去掉空行和 ### 子标题后必须还有实质内容，否则视为空日志硬阻断
+            substantive=$(printf '%s\n' "$section" \
+              | awk 'NF && $0 !~ /^###/ { print }')
+            if [ -z "$substantive" ]; then
+              echo "::error::CHANGELOG.md has no substantive content for version $VERSION"
+              exit 1
             fi
+            echo
+            echo "## 本版更新"
+            echo "$section"
           } > release_body.md
           cat release_body.md
 
       - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.target.outputs.is_release == 'true'
         with:
+          tag_name: ${{ steps.target.outputs.tag }}
+          name: ${{ steps.target.outputs.tag }}
+          make_latest: legacy
+          prerelease: false
+          overwrite_files: false
           files: dist/*
           generate_release_notes: true
           body_path: release_body.md

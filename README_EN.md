@@ -4,16 +4,16 @@
 
 <img src="docs/banner.svg" alt="gemini-web2api-go — Gemini web to OpenAI-compatible API, native Gemini API and MCP" width="100%">
 
-[![Release](https://img.shields.io/github/v/release/zexadev/gemini-web2api-go?label=release)](https://github.com/zexadev/gemini-web2api-go/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/zexadev/gemini-web2api-go/total?label=downloads)](https://github.com/zexadev/gemini-web2api-go/releases)
-[![Stars](https://img.shields.io/github/stars/zexadev/gemini-web2api-go?style=flat&label=stars)](https://github.com/zexadev/gemini-web2api-go/stargazers)
+[![Release](https://img.shields.io/github/v/release/dorokuma/gemini-web2api-go?label=release)](https://github.com/dorokuma/gemini-web2api-go/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dorokuma/gemini-web2api-go/total?label=downloads)](https://github.com/dorokuma/gemini-web2api-go/releases)
+[![Stars](https://img.shields.io/github/stars/dorokuma/gemini-web2api-go?style=flat&label=stars)](https://github.com/dorokuma/gemini-web2api-go/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.21%2B-00ADD8.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8.svg)](https://golang.org)
 [![Docker](https://img.shields.io/badge/docker-distroless-blue)](Dockerfile)
 
 [中文文档](README.md) | English
 
-> Official repository: **[github.com/zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)** — releases, issues and docs live here; forks are not maintained by this project.
+> Official repository: **[github.com/dorokuma/gemini-web2api-go](https://github.com/dorokuma/gemini-web2api-go)** — releases, issues and docs live here; forks are not maintained by this project. This is a maintained fork of [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go); thanks to the original author for open-sourcing the project.
 
 Turn the Google Gemini web app into an OpenAI-compatible API, with a native Gemini API and MCP tools on the same port. **Single binary**, **no account needed** (anonymous works), **real Chrome 146 fingerprint**, **SQLite / MySQL / PostgreSQL**, ships with an **admin dashboard**.
 
@@ -129,7 +129,7 @@ The projects most often compared with this one are the Python [Sophomoresty/gemi
 ### Prebuilt binary (simplest)
 
 Grab the one for your platform from
-[Releases](https://github.com/zexadev/gemini-web2api-go/releases). No Go, no Docker —
+[Releases](https://github.com/dorokuma/gemini-web2api-go/releases). No Go, no Docker —
 the single file is the whole thing:
 
 ```bash
@@ -157,13 +157,13 @@ docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
   -e ADMIN_TOKEN=your-admin-token \
-  ghcr.io/zexadev/gemini-web2api-go:latest
+  ghcr.io/dorokuma/gemini-web2api-go:latest
 ```
 
 For compose, just grab the file — no clone required:
 
 ```bash
-curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/dorokuma/gemini-web2api-go/main/docker-compose.yml
 ADMIN_TOKEN=your-admin-token docker compose up -d
 ```
 
@@ -172,7 +172,7 @@ ADMIN_TOKEN=your-admin-token docker compose up -d
 If you have Go, skip Docker entirely:
 
 ```bash
-git clone https://github.com/zexadev/gemini-web2api-go
+git clone https://github.com/dorokuma/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
@@ -180,13 +180,21 @@ go build -o gemini-web2api-go .
 
 A plain `go build` prints `dev` for `--version`: the version isn't a hardcoded
 constant — `internal/app` has `var Version = "dev"` and the release pipeline
-injects it at build time (`-ldflags "-X gemini-web2api/internal/app.Version=<tag>"`
-in `release.yml`; Docker images take `--build-arg VERSION=<tag>`, see `Dockerfile`).
+injects it at build time (`-ldflags "-X gemini-web2api/internal/app.Version=<version>"`
+in `release.yml`; Docker images take `--build-arg VERSION=<version>`, where `<version>`
+is the version number without the `v` prefix, e.g. `5.0.0`; see `Dockerfile`).
 To stamp a local build:
 
 ```bash
 go build -ldflags "-X gemini-web2api/internal/app.Version=my-build" -o gemini-web2api-go .
 ```
+
+### Versioning and release conventions
+
+- Release tags use strict SemVer `vX.Y.Z` (annotated git tag); the `-magpie.N` suffix is retired.
+- `internal/app/server.go` keeps `var Version = "dev"` as an injectable variable; builds inject the version (without the `v` prefix) via `-ldflags -X`.
+- Before every release, the corresponding `## X.Y.Z` section must be filled in `CHANGELOG.md`, and `make release-check TAG=vX.Y.Z` must pass.
+- This repo is the single authoritative source for 6-platform prebuilt binaries and GHCR multi-arch images; the downstream plugin `@dorokuma/magpie-gemini-web` (since v0.15.0) pins the official release binary SHA-256 via `lib/backend-release.json`.
 
 Changed the code and want it in a container? Uncomment the two `build:` lines in
 `docker-compose.yml`, then `docker compose up -d --build`.
@@ -194,7 +202,7 @@ Changed the code and want it in a container? Uncomment the two `build:` lines in
 The startup banner:
 
 ```
-gemini-web2api-go v4.28.0
+gemini-web2api-go v5.0.0
   Listening:   http://0.0.0.0:8083
   Base URL:    http://localhost:8083/v1
   API key:     sk-gemini-XX...XXXX  (mutable in admin UI)
@@ -823,7 +831,7 @@ single instance; MySQL / PostgreSQL only matter when several instances share one
 
 If you read this far, it probably solves something for you. A ⭐ helps others find it; open an issue when something breaks, and send a PR when you have fixed it.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=zexadev/gemini-web2api-go&type=Date)](https://star-history.com/#zexadev/gemini-web2api-go&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=dorokuma/gemini-web2api-go&type=Date)](https://star-history.com/#dorokuma/gemini-web2api-go&Date)
 
 ## Acknowledgments
 
