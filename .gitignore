@@ -28,3 +28,6 @@ docs/local/
 
 # ─── 代理笔记（白名单模式，需公开者 git add -f 逐条入库）──
 .agents/notes/
+
+# ─── CodeGraph 本地索引（工作树内生成，不入库）──
+.codegraph/

@@ -4,7 +4,10 @@
 # --platform=$BUILDPLATFORM: builder 永远跑在构建机的原生架构上,靠 GOARCH 交叉
 # 编译出目标架构的二进制。多架构构建时如果让 builder 跟着目标平台走,arm64 那份
 # 会在 QEMU 里模拟编译,Go 编译是 CPU 密集型,慢一个数量级。
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS builder
+
+# 钉死镜像内 Go 工具链：禁用自动下载切换，保证与 go.mod/Makefile/CI 的 go1.27.1 一致。
+ENV GOTOOLCHAIN=local
 
 WORKDIR /src
 
@@ -23,7 +26,7 @@ ARG VERSION=dev
 # -ldflags strip symbols to shave ~5MB off binary; -X 注入版本号。
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build \
     -ldflags="-s -w -X gemini-web2api/internal/app.Version=${VERSION}" \
-    -trimpath \
+    -trimpath -buildvcs=false \
     -o /out/gemini-web2api .
 
 # ─── Runtime stage ───────────────────────────────────────────────────────────

@@ -4,6 +4,65 @@
 
 ## Unreleased
 
+## 5.0.0
+
+### 架构与发版规范
+
+- **正式启用标准语义化版本 `v5.0.0`（annotated git tag）**，退役 `-magpie.N` 后缀；
+  后续版本按 `vX.Y.Z` 递增，由 CI 门禁强制校验。
+- **一仓一制品解耦**。本仓统一负责 6 平台预编译二进制（linux/darwin/windows ×
+  amd64/arm64）与 GHCR 多架构镜像（linux/amd64、linux/arm64）发布；下游插件
+  `@dorokuma/magpie-gemini-web`（自 v0.15.0 起）通过 `lib/backend-release.json`
+  直接固定本仓正式 Release 二进制 SHA-256，不再走源码构建。
+- **统一 Go `1.27.1` 与 `-trimpath -buildvcs=false` 可复现构建**。`go.mod`、
+  `Makefile`、`Dockerfile`、CI 全部钉在 `go1.27.1`；发布构建统一加
+  `-buildvcs=false` 消除 VCS 元数据对产物哈希的干扰。
+- **CI 发版强门禁**。`make check` 新增 `var Version = "dev"` 断言；新增
+  `make release-check TAG=vX.Y.Z`（TAG 严格 SemVer、CHANGELOG 小节非空、
+  已存在 tag 必须为 annotated）；release notes 抽取结果为空直接 `::error::`
+  硬阻断；linux/amd64 产物独立二次编译并比对 SHA-256 一致性；`workflow_dispatch`
+  支持手动 `inputs.tag` 派发作为兜底发版通道。
+
+### 新增与改进（相对于上游 4.28.0 累计内聚能力）
+
+- **`capabilities.account_proxy_binding`**：账号可绑定专属代理出口，导入 cookie 前
+  可先配代理绑定，保证首次请求就走指定出口，避免「号还没绑 IP 就先直连」的窗口。
+- **Gemini 4 Carbon / 4 Hydrogen / 4 Argon 模型接入**：`4 Carbon` 与 `4 Argon`
+  共用 `hexArgon4` / `Mode=8` 槽位，由 PR #71 `argonMode8Slots` 扩展单/多轮载荷
+  槽位；`4 Hydrogen` 为 `3.8 Flash` 同槽位（`hexFlash38` / `Mode=1`）原位升级，
+  保留按模型 `HexID` 映射表。
+- **`strict_model` 互认（上游原位改名不判降级）**：`modelDowngraded` 新增两条同槽
+  判定——Mode-8 槽位自报 `"4 Carbon"` 与 `"4 Argon"` 为同一模型原位改名，双向
+  互认不判降级；Mode-1 槽位请求 `"3.8 Flash"` 收到 `"4 Hydrogen"` 自报属同槽单向
+  升级，豁免降级误判（避免误回 429），反向请求 `4 Hydrogen` 收到 Flash 族自报仍判降级。
+- **XSRF token 20 分钟缓存 + 5 分钟异步续期**：XSRF 令牌按稳定账号身份
+  （`SAPISID + __Secure-1PSID`）缓存 20 分钟，满 5 分钟后命中时触发后台异步
+  重抓续期，避免 `*SIDCC` 轮换导致请求频繁重抓页面；冷号首请求延迟从 ~1.2s
+  降到 ~200ms；失败自动回源重取。
+- **幽灵会话自动清理**：请求被客户端中途断开或上游错误路径下，仍保证
+  `GzXR5e` 删除 rpc 恰好执行一次；`StreamGenerate` 错误/取消路径保留已读 raw，
+  不再漏删。XSRF 自愈后的收尾删除使用新 token 重试；`auto_delete_conversation`
+  默认开启（07ed36e）。
+- **请求沉默计时器与工具调用收尾**：流式响应设沉默窗口阈值，超时未出帧主动
+  掐断并返回明确错误；工具调用围栏在超长上下文下协议保留，分词器超时走兜底
+  估算不阻塞响应。
+- **管理面板「关于」页仓库地址指向本维护仓**，新增「维护分支」署名行，英文
+  i18n 同步补齐。
+
+### 修复
+
+- **502 结构化诊断落库**（沿用 magpie.5）：`reason`/`upstream_model`/`frames`/
+  `content_frame`/`hint` 字段进 502 body 与 `requests.error`，面板可按类过滤。
+- **空正文 / 损坏 `tool_call` 围栏假 200 拦截**（沿用 magpie.4/.5）：有帧但正文
+  为空、reasoning-only、围栏解析失败三类均返回错误而非 `content: null` 假 200。
+- **视频任务并发快照修复 data race**：`videoJobSnapshot` 替代直接序列化
+  `*videoJob`（`-race` 下 `TestCreateVideoAcceptsInputReference` 曾报 DATA RACE）。
+- **WebChannel 错误链凭据脱敏**（沿用 magpie.4）：`SID`/`gsessionid`/`SAPISIDHASH`/
+  `$httpHeaders` 在握手、请求构造与 `Unwrap`/`errors.As` 链上均脱敏。
+- **管理面板硬编码上游仓库地址**：`REPO` 常量、外链与 `releases/latest` 更新
+  检查全部指向 `dorokuma/gemini-web2api-go`，「作者」行保留原作者署名，新增
+  「维护分支」行。
+
 ## 4.28.0-magpie.5
 
 ### 修复
@@ -51,6 +110,52 @@
   观察项 O-2）。
 - **WebChannel 凭据脱敏覆盖握手、请求构造与错误链**（`wcRedactErr`/`wcSanitizeErr`），
   `Unwrap`/`errors.As` 命中的每个节点都脱敏。
+
+## 4.28.0-magpie.2
+
+### 新增
+
+- **Gemini 4 Carbon / 4 Hydrogen 模型接入**（feat/magpie-carbon-hydrogen-phantom
+  分支合并，e6c2bd5）。`4 Carbon` 与 `4 Argon` 共用 `hexArgon4` / `Mode=8` 槽位，
+  由 PR #71 `argonMode8Slots` 扩展单/多轮载荷槽位；`4 Hydrogen` 为 `3.8 Flash`
+  同槽位（`hexFlash38` / `Mode=1`）原位升级，保留按模型 `HexID` 映射表。付费号
+  cookie 可用，未授权号被静默降级时由 `strict_model` 互认逻辑识别并换号重试。
+- **`capabilities.account_proxy_binding`**：账号可预先绑定专属代理出口，导入
+  cookie 前先配绑定，首次请求即走指定出口，消除「号未绑 IP 先直连」的窗口期。
+- **XSRF token 20 分钟缓存 + 5 分钟异步续期**：XSRF 令牌按稳定账号身份
+  （`SAPISID + __Secure-1PSID`）缓存 20 分钟，满 5 分钟后命中时触发后台异步
+  重抓续期，避免 `*SIDCC` 轮换导致请求频繁重抓页面；缓存失败自动回源重取，
+  不影响后续请求。
+- **`strict_model` 同槽互认**：上游原位改名不再误判降级。`modelDowngraded` 认两条：
+  Mode-8 槽位自报 `"4 Carbon"` 与 `"4 Argon"` 为同一模型原位改名，双向互认不判降级；
+  Mode-1 槽位请求 `"3.8 Flash"` 收到 `"4 Hydrogen"` 自报属同槽单向升级，豁免降级
+  误判（避免误回 429），反向请求 `4 Hydrogen` 收到 Flash 族自报仍判降级。
+- **Chrome / TLS 客户端指纹改进**：`impersonate` 对齐 Chrome 146 指纹，
+  `Sec-CH-UA` 等 Chromium 专有头补齐，减少被上游特征识别拦截的概率。
+
+### 修复
+
+- **幽灵会话自动清理**：请求被客户端中途断开或上游错误路径下，仍保证
+  `GzXR5e` 删除 rpc 恰好执行一次；`StreamGenerate` 错误/取消路径保留已读
+  raw，幽灵会话不再漏删（5d3540d / 4304472 / 42976fb）。
+- **XSRF 自愈后收尾用新 token 删幽灵会话**；成功路径删除收口到 `defer flush`
+  防双删（4304472）。`auto_delete_conversation` 默认开启（07ed36e）。
+- **phantom cleanup 凭据闭包改无名返回值修 sapisid 遮蔽**；`GzXR5e` 恰好一次
+  断言下沉到假传输层（42976fb）。
+- **请求沉默计时器（`stallWatch`）**：原客户端 `Timeout` 管整次请求，上游排队
+  超过限时就被拦腰截断、重发又从头排队。改为按沉默计时：上游 `request_timeout_sec`
+  这么久一个字节都没来（连心跳都断了）才取消这次请求并返回明确 `StallError`，
+  没出字的照常重试；排队中的心跳帧让请求一直等下去。
+- **工具调用提前收尾**：累积正文里出现闭合且能解析、函数名在 `tools` 里的
+  ```tool_call``` 块即收尾（`toolCallComplete` + `stopReader` 提前结束读取），
+  不再空等上游收完；函数名不认识或 JSON 不完整时不收尾，照旧等上游结束。
+- **超长上下文保留工具协议行**：prompt 超预算转 `message.txt` 附件时，工具协议
+  （`promptCtx.Head` 格式说明 + `Tail` 末尾锚点）留在正文不随历史进附件，避免模型
+  不再稳定吐 ```tool_call```；工具说明本身超预算才退回整段进附件。
+- **分词器下载超时 `chars/4` 兜底**：tiktoken 首次加载要远端下 BPE 表，默认 loader
+  无超时、黑洞代理下会卡住启动；改用带超时的 `boundedBpeLoader`，超时或加载失败
+  立即回退 `chars/4` 估算，不阻塞响应。
+- **stall 测试沉默窗口放宽**，防 `-race` 下握手假红（5d3540d）。
 
 ## 4.28.0
 
@@ -314,6 +419,7 @@
   （`56fdd199312815e2`）原地升成了 3.8——同 hex，服务端显示名从 `"3.7 Flash"` 变 `"3.8 Flash"`
   （付费号 HAR 响应帧确认）。**付费 Gemini 账号专属**（不是灰度）：免费号仍降级成 3.5 Flash-Lite。
   `gemini-3.7-flash` / `gemini-3.7-flash-thinking` 保留为别名（同 hex），老客户端不受影响。
+
 ## 4.15.0
 
 ### 新增

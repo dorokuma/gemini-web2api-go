@@ -4,16 +4,16 @@
 
 <img src="docs/banner.svg" alt="gemini-web2api-go — Gemini web to OpenAI-compatible API, native Gemini API and MCP" width="100%">
 
-[![Release](https://img.shields.io/github/v/release/zexadev/gemini-web2api-go?label=release)](https://github.com/zexadev/gemini-web2api-go/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/zexadev/gemini-web2api-go/total?label=downloads)](https://github.com/zexadev/gemini-web2api-go/releases)
-[![Stars](https://img.shields.io/github/stars/zexadev/gemini-web2api-go?style=flat&label=stars)](https://github.com/zexadev/gemini-web2api-go/stargazers)
+[![Release](https://img.shields.io/github/v/release/dorokuma/gemini-web2api-go?label=release)](https://github.com/dorokuma/gemini-web2api-go/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dorokuma/gemini-web2api-go/total?label=downloads)](https://github.com/dorokuma/gemini-web2api-go/releases)
+[![Stars](https://img.shields.io/github/stars/dorokuma/gemini-web2api-go?style=flat&label=stars)](https://github.com/dorokuma/gemini-web2api-go/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.21%2B-00ADD8.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8.svg)](https://golang.org)
 [![Docker](https://img.shields.io/badge/docker-distroless-blue)](Dockerfile)
 
 中文 | [English](README_EN.md)
 
-> 官方仓库：**[github.com/zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)** —— 发版、issue、文档都在这里；各 fork 不由本仓维护。
+> 官方仓库：**[github.com/dorokuma/gemini-web2api-go](https://github.com/dorokuma/gemini-web2api-go)** —— 发版、issue、文档都在这里；各 fork 不由本仓维护。本项目是 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go) 的维护分支，感谢原作者的开源贡献。
 
 把 Google Gemini 网页端反代成 OpenAI 兼容 API，同一端口还提供 Gemini 原生接口和 MCP 工具。**单二进制**，**零账号**（匿名可跑），**Chrome 146 真指纹**，**SQLite / MySQL / PostgreSQL**，自带**中文管理面板**。
 
@@ -112,7 +112,7 @@
 
 ### 下载二进制（最省事）
 
-[Releases](https://github.com/zexadev/gemini-web2api-go/releases) 里挑对应平台的下载，
+[Releases](https://github.com/dorokuma/gemini-web2api-go/releases) 里挑对应平台的下载，
 不用 Go、不用 Docker，单个文件就是全部：
 
 ```bash
@@ -140,13 +140,13 @@ docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
   -e ADMIN_TOKEN=your-admin-token \
-  ghcr.io/zexadev/gemini-web2api-go:latest
+  ghcr.io/dorokuma/gemini-web2api-go:latest
 ```
 
 用 compose 的话把 `docker-compose.yml` 单独下下来就行，也不用 clone：
 
 ```bash
-curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/dorokuma/gemini-web2api-go/main/docker-compose.yml
 ADMIN_TOKEN=your-admin-token docker compose up -d
 ```
 
@@ -155,7 +155,7 @@ ADMIN_TOKEN=your-admin-token docker compose up -d
 装了 Go 就不必绕 Docker：
 
 ```bash
-git clone https://github.com/zexadev/gemini-web2api-go
+git clone https://github.com/dorokuma/gemini-web2api-go
 cd gemini-web2api-go
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
@@ -163,19 +163,26 @@ go build -o gemini-web2api-go .
 
 源码 `go build` 出来的二进制 `--version` 报 `dev`：版本号不是写在代码里的常量，
 `internal/app` 里是 `var Version = "dev"`，由发布流程在构建时注入 ——
-release workflow（`.github/workflows/release.yml`）用 `-ldflags "-X gemini-web2api/internal/app.Version=<tag>"`、
-Docker 镜像走 `--build-arg VERSION=<tag>`（见 `Dockerfile`）。本地想注入版本号也一样：
+release workflow（`.github/workflows/release.yml`）用 `-ldflags "-X gemini-web2api/internal/app.Version=<version>"`、
+Docker 镜像走 `--build-arg VERSION=<version>`（`<version>` 为去 `v` 前缀的版本号，如 `5.0.0`；见 `Dockerfile`）。本地想注入版本号也一样：
 
 ```bash
 go build -ldflags "-X gemini-web2api/internal/app.Version=my-build" -o gemini-web2api-go .
 ```
+
+### 版本与发版规范
+
+- 正式版标签使用标准语义化版本 `vX.Y.Z`（annotated git tag），不再使用 `-magpie.N` 后缀。
+- `internal/app/server.go` 中 `var Version = "dev"` 保持为可注入变量，由构建统一以 `-ldflags -X` 注入去 `v` 版本号。
+- 每次发版前必须在 `CHANGELOG.md` 补齐对应 `## X.Y.Z` 小节，并通过 `make release-check TAG=vX.Y.Z`。
+- 本仓是 6 平台预编译二进制与 GHCR 多架构镜像的唯一权威发布源；下游插件 `@dorokuma/magpie-gemini-web`（自 v0.15.0 起）通过 `lib/backend-release.json` 直接固定本仓正式 Release 二进制 SHA-256。
 
 改了代码想用容器跑，把 `docker-compose.yml` 里 `build:` 那两行的注释去掉，再 `docker compose up -d --build`。
 
 启动后会看到 banner：
 
 ```
-gemini-web2api-go v4.28.0
+gemini-web2api-go v5.0.0
   Listening:   http://0.0.0.0:8083
   Base URL:    http://localhost:8083/v1
   API key:     sk-gemini-XX...XXXX  (mutable in admin UI)
@@ -863,7 +870,7 @@ Function calling 是 prompt 级实现，模型不一定每次都按格式返回�
 
 读到这儿，说明它对你有用。点个 ⭐ 让更多人找到它；遇到问题开 issue，改好的功能提 PR。
 
-[![Star History Chart](https://api.star-history.com/svg?repos=zexadev/gemini-web2api-go&type=Date)](https://star-history.com/#zexadev/gemini-web2api-go&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=dorokuma/gemini-web2api-go&type=Date)](https://star-history.com/#dorokuma/gemini-web2api-go&Date)
 
 ## 致谢
 
