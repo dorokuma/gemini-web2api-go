@@ -1,4 +1,0 @@
-ok  	gemini-web2api/internal/app	58.790s
-EXIT=0
-EXIT=0
-ELAPSED_SECONDS=68
