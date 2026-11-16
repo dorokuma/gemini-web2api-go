@@ -19,6 +19,7 @@
 - 仓库与测试用例中严禁出现真实 Cookie、密钥、Token；配置示例一律用占位符。
 - 不留 `*.bak*` 备份文件，回滚靠 git。
 - `.agents/notes/` 采用白名单模式：默认忽略入库，值得公开的结论性/缺陷登记性笔记 `git add -f` 逐条入库；入库前确认不含凭据与未脱敏环境细节。
+- `internal/app/gemini.go` 当前硬编码锁定 `useWC := false`；未来启用 WebChannel 前必须先逐项完成 `.agents/notes/webchannel-enable-prerequisites.md` 所列全部 6 项前置条件。
 
 ## 发版规范（本仓专有）
 - 正式版标签使用带注解的标准语义化版本 `vX.Y.Z`（annotated git tag，起点 `v5.0.0`），不再使用 `-magpie.N` 后缀。
