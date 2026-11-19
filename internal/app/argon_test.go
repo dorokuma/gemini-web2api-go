@@ -1106,6 +1106,15 @@ func TestNeonMediumUpgradedToHighNotDowngraded(t *testing.T) {
 	if errors.As(err, &mde) {
 		t.Fatalf("中档→高档是同槽升级，不应转成 ModelDowngradedError: %v", err)
 	}
+	// 真实链路把转换后的 err 交给 retryOnAnotherAccount（本请求账号 #42）：升级错档
+	// 不是 ModelDowngradedError，不换号、不进 exclude、不写 300 分钟冷却。
+	exclude := map[int64]bool{}
+	if retryOnAnotherAccount(&StreamResult{}, err, med, exclude) {
+		t.Fatal("同槽升级错档不应触发换号重试")
+	}
+	if len(exclude) != 0 {
+		t.Fatalf("同槽升级不应把账号加入排除表: %v", exclude)
+	}
 	if cooling, _ := coolingAccounts(med); len(cooling) != 0 {
 		t.Fatalf("同槽升级不应写入降级冷却: %v", cooling)
 	}
