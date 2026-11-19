@@ -45,7 +45,7 @@ func longConversation(turns int) []map[string]interface{} {
 func TestPromptOverLimitErrors(t *testing.T) {
 	withBudget(t, 20000) // 字节
 
-	prompt, _ := messagesToPrompt(longConversation(200), nil, nil)
+	prompt, _ := messagesToPrompt(longConversation(200), nil, nil, false)
 	if len(prompt) <= 20000 {
 		t.Fatalf("测试用例本身没超预算（%d 字节）", len(prompt))
 	}
@@ -77,8 +77,8 @@ func TestPromptUnderLimitUntouched(t *testing.T) {
 	withBudget(t, 10000000)
 	msgs := longConversation(3)
 
-	got, _ := messagesToPrompt(msgs, nil, nil)
-	if want := buildPrompt(msgs, nil, nil); got != want {
+	got, _ := messagesToPrompt(msgs, nil, nil, false)
+	if want := buildPrompt(msgs, nil, nil, false); got != want {
 		t.Error("没超限却改动了 prompt")
 	}
 	if !strings.Contains(got, "读取一下 task.md") {
@@ -91,7 +91,7 @@ func TestPromptLimitDisabled(t *testing.T) {
 	withBudget(t, 0)
 	msgs := longConversation(200)
 
-	got, _ := messagesToPrompt(msgs, nil, nil)
+	got, _ := messagesToPrompt(msgs, nil, nil, false)
 	if len(got) < 20000 {
 		t.Error("关掉检查后不该有任何裁剪")
 	}
@@ -106,7 +106,7 @@ func TestPromptLimitCountsToolDefs(t *testing.T) {
 		"parameters": map[string]interface{}{"type": "object"}}}}
 	msgs := []map[string]interface{}{{"role": "user", "content": "你好"}}
 
-	if p, _ := messagesToPrompt(msgs, tools, nil); len(p) <= 5000 {
+	if p, _ := messagesToPrompt(msgs, tools, nil, false); len(p) <= 5000 {
 		t.Errorf("工具定义应该把 prompt 撑到 5000 字节以上，实际 %d", len(p))
 	}
 }

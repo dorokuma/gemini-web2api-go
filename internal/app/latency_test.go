@@ -64,7 +64,7 @@ func toolsFixture(names ...string) []map[string]interface{} {
 
 func TestToolSchemaIsCompact(t *testing.T) {
 	msgs := []map[string]interface{}{{"role": "user", "content": "hi"}}
-	p, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil)
+	p, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil, false)
 	if strings.Contains(pc.Head, "\n  \"") {
 		t.Error("工具定义仍是缩进格式")
 	}
@@ -74,7 +74,7 @@ func TestToolSchemaIsCompact(t *testing.T) {
 	if pc.Tail == "" || !strings.HasPrefix(p, pc.Head) || !strings.HasSuffix(p, pc.Tail) {
 		t.Fatal("prompt 首尾应分别是工具说明和末尾锚点")
 	}
-	if p != buildPrompt(msgs, toolsFixture("bash"), nil) {
+	if p != buildPrompt(msgs, toolsFixture("bash"), nil, false) {
 		t.Fatal("messagesToPrompt 和 buildPrompt 结果不一致")
 	}
 }
@@ -82,7 +82,7 @@ func TestToolSchemaIsCompact(t *testing.T) {
 // 超长转附件时，工具说明和末尾锚点留在正文，附件里只有历史。
 func TestContextFileKeepsToolProtocolInline(t *testing.T) {
 	msgs := longConversation(300)
-	prompt, pc := messagesToPrompt(msgs, toolsFixture("bash", "read"), nil)
+	prompt, pc := messagesToPrompt(msgs, toolsFixture("bash", "read"), nil, false)
 	budget := len(prompt) / 2
 
 	history, inline := planContextFile(prompt, pc, budget)
@@ -106,7 +106,7 @@ func TestContextFileKeepsToolProtocolInline(t *testing.T) {
 	}
 
 	// 没有工具：跟原来一样整段进附件。
-	plain, ppc := messagesToPrompt(msgs, nil, nil)
+	plain, ppc := messagesToPrompt(msgs, nil, nil, false)
 	if history, _ := planContextFile(plain, ppc, len(plain)/2); history != plain {
 		t.Fatal("没有工具时附件内容变了")
 	}

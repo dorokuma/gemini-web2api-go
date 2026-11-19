@@ -509,7 +509,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	if fresh {
 		// 首轮带上 tools 指令：模型要靠它知道怎么吐 tool_call 围栏，续接轮不再重发
 		//（指令已在服务端首轮历史里）。
-		prompt, _ = messagesToPrompt(messages, tools, toolChoice)
+		prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
 		logf("[conv] 新会话，首轮发 %d 字节（tools=%d）", len(prompt), len(tools))
 	} else {
 		prompt = formatNewTurn(messages[len(messages)-1])

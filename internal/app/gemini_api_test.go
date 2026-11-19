@@ -37,7 +37,7 @@ func TestGeminiAPIToMessagesFunctionCalling(t *testing.T) {
 	if m, _ := choice.(map[string]interface{}); m == nil {
 		t.Fatalf("ANY + one allowed name should force that function, got %v", choice)
 	}
-	prompt, _ := messagesToPrompt(messages, tools, choice)
+	prompt, _ := messagesToPrompt(messages, tools, choice, false)
 	for _, want := range []string{
 		"[System instruction]: be brief",
 		`You MUST call the tool "get_weather"`,

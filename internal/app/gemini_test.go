@@ -438,7 +438,7 @@ func TestClassifyError(t *testing.T) {
 func mustPrompt(t *testing.T, msgs []map[string]interface{}, tools []map[string]interface{},
 	toolChoice interface{}) string {
 	t.Helper()
-	p, _ := messagesToPrompt(msgs, tools, toolChoice)
+	p, _ := messagesToPrompt(msgs, tools, toolChoice, false)
 	return p
 }
 

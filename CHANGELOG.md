@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+### 修复
+
+- **Task 模式不再注入对话模式专属平台免疫词**：`buildPromptParts` / `messagesToPrompt` /
+  `buildPrompt` 新增 `taskMode` 参数（一律由该请求的 `ModelConfig.TaskMode` 传入，覆盖
+  `/v1/chat/completions`、`/v1/responses`、多轮续接 `callGeminiConv` 与
+  `/v1beta/models/*:generateContent|streamGenerateContent|countTokens` 全部路径）。末尾
+  工具锚点中的「疫苗式点破」段（`Heads-up — platform notice` / `0 remaining` /
+  `summarize now`）只针对 Chat 模式才有意义——平台不会在 Task 模式的独立任务通道后追加
+  该收尾通知，提前点破反而凭空引入一条不存在的警告。task 模型（`gemini-4-carbon-task` /
+  `gemini-4-neon-task` / `gemini-4-hydrogen-task`）现在只注入通用工具格式锚点，对话模型
+  行为不变。
+
 ## 6.2.1
 
 ### 修复

@@ -371,7 +371,7 @@ func handleGeminiModelItem(w http.ResponseWriter, r *http.Request) {
 	case action == "streamGenerateContent":
 		handleStreamGenerateContent(w, r, model)
 	case action == "countTokens":
-		handleGeminiCountTokens(w, r)
+		handleGeminiCountTokens(w, r, model)
 	default:
 		writeGeminiError(w, 404, fmt.Sprintf("unsupported method %q", action))
 	}
@@ -400,12 +400,15 @@ func parseGeminiRequest(w http.ResponseWriter, r *http.Request) (*geminiAPIReque
 
 // handleGeminiCountTokens: 用跟 usage 同一个 tiktoken 口径数拼好的 prompt。
 // 只是估算——上游没有给 token 数的接口。
-func handleGeminiCountTokens(w http.ResponseWriter, r *http.Request) {
+func handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, model string) {
 	_, messages, tools, toolChoice, ok := parseGeminiRequest(w, r)
 	if !ok {
 		return
 	}
-	prompt, _ := messagesToPrompt(messages, tools, toolChoice)
+	// 拼 prompt 时要知道是不是 Task 模式（末尾锚点分支按它走）；模型名不合法
+	// 不影响估算，退回对话模式拼接。
+	_, modelCfg, _ := resolveModel(model)
+	prompt, _ := messagesToPrompt(messages, tools, toolChoice, modelCfg.TaskMode)
 	writeJSON(w, 200, map[string]interface{}{"totalTokens": countTokens(prompt)})
 }
 
@@ -511,7 +514,7 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, err.Error())
 		return nil, false
 	}
-	prompt, pc := messagesToPrompt(messages, tools, toolChoice)
+	prompt, pc := messagesToPrompt(messages, tools, toolChoice, modelCfg.TaskMode)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeGeminiError(w, 400, "contents is empty")
 		return nil, false
