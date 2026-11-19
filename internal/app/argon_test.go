@@ -1066,6 +1066,319 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 	}
 }
 
+// 任务模式（Task Mode）槽位防回归：taskModeSlots 按浏览器 Task Mode 抓包逐槽核对；
+// 普通对话模型不触发、Mode=8（Carbon）仍只走 argonMode8Slots、两块不混用。
+//
+// 走真实生产路径：streamGenerateOnce（单轮）与 streamGenerateConv（多轮）都要验，
+// 把假 RoundTripper 钉进 stdlibClientCache + 代理池指向假出口（同 toolgate_test.go
+// 的 fakeUpstreamServer 模式），拦截真实发出的 f.req 表单、解出 inner 数组逐槽断言。
+// 不再在测试里手写 if mc.TaskMode/Mode==8 拼 inner——那种写法把生产路由复制一遍，
+// 生产代码删了任务槽位测试照样假绿。
+func TestTaskModeSlots(t *testing.T) {
+	// Models 表项先钉死：表错了后面全是无效功。
+	neonTask := Models["gemini-4-neon-task"]
+	hydrogenTask := Models["gemini-4-hydrogen-task"]
+	if neonTask.HexID != hexNeon4 || neonTask.Mode != 3 || !neonTask.TaskMode ||
+		neonTask.thinkWire() != thinkingExtended || neonTask.Upstream != "4 Neon" {
+		t.Fatalf("unexpected neon-task entry: %+v", neonTask)
+	}
+	if hydrogenTask.HexID != hexFlash38 || hydrogenTask.Mode != 1 || !hydrogenTask.TaskMode ||
+		hydrogenTask.thinkWire() != thinkingExtended || hydrogenTask.Upstream != "4 Hydrogen" {
+		t.Fatalf("unexpected hydrogen-task entry: %+v", hydrogenTask)
+	}
+	// 不注册 -task-thinking 变体。
+	if _, ok := Models["gemini-4-neon-task-thinking"]; ok {
+		t.Fatal("gemini-4-neon-task-thinking must not exist")
+	}
+	if _, ok := Models["gemini-4-hydrogen-task-thinking"]; ok {
+		t.Fatal("gemini-4-hydrogen-task-thinking must not exist")
+	}
+
+	// taskModeSlots 块本身的槽位值按抓包逐槽直接断言（与走哪条路径无关的字面值）。
+	tmInner := make([]any, innerSlots)
+	taskModeSlots(tmInner)
+	if got := fmt.Sprint(tmInner[6]); got != "[0]" {
+		t.Errorf("taskModeSlots inner[6]=%s want [0]", got)
+	}
+	if got := fmt.Sprint(tmInner[30]); got != "[4 27 28 16 19 12]" {
+		t.Errorf("taskModeSlots inner[30]=%s want [4 27 28 16 19 12]", got)
+	}
+	for i, want := range map[int]int{49: 40, 68: 1, 83: 1, 91: 1, 96: 1, 98: 1} {
+		if tmInner[i] != want {
+			t.Errorf("taskModeSlots inner[%d]=%v want %d", i, tmInner[i], want)
+		}
+	}
+
+	// 传输层见证：捕获每条 StreamGenerate 请求 f.req 里 outer[1] 的 inner 数组。
+	// f.req 形状 [null,"<innerJSON>"]，innerJSON 是 innerSlots 槽的 JSON 数组。
+	innerCh := make(chan []any, 8)
+	srvErr := make(chan error, 1)
+	// 响应帧要带模型身份槽位（[39]=hex,[40/41]=nil,[42]=显示名）：hexNeon4/hexArgon4
+	// 的请求过了 readModelCheckedBodyMode 的身份核验才算成功；hexFlash38 不在校验
+	// 集合，填了也无害。调用方按当前被测模型设置。
+	var respondAs struct{ hex, name string }
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := func(status int, body string) *http.Response {
+			return &http.Response{
+				StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header:  http.Header{},
+				Body:    io.NopCloser(strings.NewReader(body)),
+				Request: req,
+			}
+		}
+		switch req.URL.Path {
+		case "/app":
+			// getXSRF（SNlM0e）与 currentBL（cfb2h）都从这页抠，返回合法形状即可。
+			return resp(200, `"SNlM0e":"tok-task:1700000000000","cfb2h":"boq_x_20260101.01_p1"`), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			body, _ := io.ReadAll(req.Body)
+			_ = req.Body.Close()
+			vals, err := url.ParseQuery(string(body))
+			if err != nil {
+				srvErr <- fmt.Errorf("parse request body: %w", err)
+				return resp(400, ""), nil
+			}
+			var outer []any
+			if err := json.Unmarshal([]byte(vals.Get("f.req")), &outer); err != nil || len(outer) < 2 {
+				srvErr <- fmt.Errorf("f.req outer shape bad: %v", vals.Get("f.req"))
+				return resp(400, ""), nil
+			}
+			innerStr, _ := outer[1].(string)
+			var inner []any
+			if err := json.Unmarshal([]byte(innerStr), &inner); err != nil {
+				srvErr <- fmt.Errorf("inner JSON bad: %w", err)
+				return resp(400, ""), nil
+			}
+			if len(inner) != innerSlots {
+				srvErr <- fmt.Errorf("inner len=%d want %d", len(inner), innerSlots)
+				return resp(400, ""), nil
+			}
+			innerCh <- inner
+			// 回一条带内容帧 + 身份槽的响应让生产函数走成功分支（不触发重试）。
+			fields := make([]any, 43)
+			fields[1] = []any{"c_taskslot1", "r_1"}
+			fields[4] = []any{[]any{"rc_x", []any{"task-mode slot probe answer padding the frame past the 200-byte textsInLine gate"}}}
+			if respondAs.hex != "" {
+				fields[39] = respondAs.hex
+				fields[42] = respondAs.name
+			}
+			payload, _ := json.Marshal(fields)
+			row, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(payload), nil}})
+			return resp(200, ")]}'\n"+string(row)+"\n"), nil
+		}
+		t.Logf("未命中: %s %s", req.Method, req.URL.String())
+		return resp(404, ""), nil
+	})
+	fakeProxy := fakeUpstreamServer(t, rt)
+
+	seedXSRFAndRetry(t, 1)
+
+	// 每调一条生产路径后从 innerCh 收一条 inner；路径没发请求或发错形状都会立刻暴露。
+	waitInner := func(path, name string) []any {
+		t.Helper()
+		select {
+		case inner := <-innerCh:
+			return inner
+		case err := <-srvErr:
+			t.Fatalf("%s %s: fake upstream error: %v", path, name, err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s %s: no StreamGenerate request reached fake transport", path, name)
+		}
+		return nil
+	}
+
+	convOf := func(acct *CookieAccount) *convState {
+		return &convState{
+			cookie:    acct.Cookie,
+			sapisid:   extractSAPISID(acct.Cookie),
+			isLogin:   true,
+			accountID: acct.ID,
+			authuser:  acct.AuthUser,
+			proxyURL:  fakeProxy,
+		}
+	}
+
+	acct, ok := pickCookieAccount()
+	if !ok {
+		t.Fatal("池里没有号")
+	}
+
+	type want struct {
+		six  string // inner[6]
+		th30 string // inner[30]
+		i49  any    // inner[49]
+		i68  any    // inner[68]
+		i80  int    // inner[80] think 线值
+		i83  any    // inner[83]
+		i91  any
+		i96  any
+		i98  any
+	}
+	assert := func(path, name string, inner []any, w want) {
+		t.Helper()
+		if got := fmt.Sprint(inner[6]); got != w.six {
+			t.Errorf("%s %s inner[6]=%s want %s", path, name, got, w.six)
+		}
+		if got := fmt.Sprint(inner[30]); got != w.th30 {
+			t.Errorf("%s %s inner[30]=%s want %s", path, name, got, w.th30)
+		}
+		for i, wantV := range map[int]any{49: w.i49, 68: w.i68, 83: w.i83, 91: w.i91, 96: w.i96, 98: w.i98} {
+			got := inner[i]
+			// 反序列化后数字都是 float64，统一转 int 比较；nil 直接比。
+			var gotV any = got
+			if f, ok2 := got.(float64); ok2 {
+				gotV = int(f)
+			}
+			if gotV != wantV {
+				t.Errorf("%s %s inner[%d]=%v want %v", path, name, i, gotV, wantV)
+			}
+		}
+		if f, ok2 := inner[80].(float64); !ok2 || int(f) != w.i80 {
+			t.Errorf("%s %s inner[80]=%v want %d", path, name, inner[80], w.i80)
+		}
+	}
+
+	taskWant := want{six: "[0]", th30: "[4 27 28 16 19 12]", i49: 40, i68: 1, i80: thinkingExtended, i83: 1, i91: 1, i96: 1, i98: 1}
+	neonWant := want{six: "[0]", th30: "[4]", i49: nil, i68: 1, i80: thinkingNormal, i83: nil, i91: 0, i96: 0, i98: nil}
+	carbonWant := want{six: "[1]", th30: "[]", i49: 40, i68: 2, i80: thinkingNormal, i83: 1, i91: 1, i96: 1, i98: 1}
+
+	// respondAs 设成上游对该模型的真实自报：neon-task 任务模式实测自报裸名
+	// "4 Neon"，carbon 收 "4 Carbon"，neon 普通档收 "4 Neon"。
+	type tc struct {
+		name     string
+		respHex  string
+		respName string
+		w        want
+	}
+	cases := []tc{
+		{"gemini-4-neon-task", hexNeon4, "4 Neon", taskWant},
+		{"gemini-4-hydrogen-task", hexFlash38, "4 Hydrogen", taskWant},
+		// 普通对话模型（TaskMode=false）：任务槽位一律不落。
+		{"gemini-4-neon", hexNeon4, "4 Neon", neonWant},
+		// Mode=8 仍只走 argonMode8Slots（inner[68]=2，两块不混用）。
+		{"gemini-4-carbon", hexArgon4, "4 Carbon", carbonWant},
+	}
+
+	// ── 单轮：streamGenerateOnce ──
+	for _, c := range cases {
+		respondAs.hex, respondAs.name = c.respHex, c.respName
+		if _, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"}, Models[c.name], nil, nil, nil, nil, map[int64]bool{}); err != nil {
+			t.Fatalf("once %s err=%v", c.name, err)
+		}
+		assert("once", c.name, waitInner("once", c.name), c.w)
+	}
+
+	// ── 多轮：streamGenerateConv ──
+	for _, c := range cases {
+		respondAs.hex, respondAs.name = c.respHex, c.respName
+		if _, err := streamGenerateConv(context.Background(), "hi", Models[c.name], convOf(acct), nil, nil); err != nil {
+			t.Fatalf("conv %s err=%v", c.name, err)
+		}
+		assert("conv", c.name, waitInner("conv", c.name), c.w)
+	}
+}
+
+// gemini-4-neon-task 身份核验：taskMode=true + hexNeon4 + think=2 收裸名 "4 Neon"
+// 与 "4 Neon High"（未来上游恢复后缀仍兼容），拒异族/错档自报；
+// taskMode=false（对话模式）同 hex + think=2 仍只认 High 名，绝不放宽。
+func TestNeonTaskModeIdentity(t *testing.T) {
+	neonTask := Models["gemini-4-neon-task"]
+	header := buildModelHeader(neonTask.HexID, neonTask.Mode, neonTask.thinkWire(), "uuid-x")
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{"4 Neon", true},
+		{"Gemini 4 Neon", true},
+		{"4 Neon High", true},
+		{"Gemini 4 Neon High", true},
+		{"4 Neon Medium", false},
+		{"4 Carbon", false},
+		{"4 Argon", false},
+		{"4 Hydrogen", false},
+		{"3.5 Flash-Lite", false},
+		{"3.6 Flash", false},
+	}
+	for _, c := range cases {
+		for _, id := range []string{hexNeon4, hexFlashLite} {
+			frame := makeSyntheticArgonFrame(id, c.name, "ok")
+			var got []string
+			_, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), func(l string) error {
+				got = append(got, l)
+				return nil
+			}, time.Now(), 200, header, true)
+			if c.ok && (err != nil || len(got) == 0) {
+				t.Errorf("%q id=%s: want pass, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+				t.Errorf("%q id=%s: want mismatch and no output, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if _, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), nil, time.Now(), 200, header, true); (err == nil) != c.ok {
+				t.Errorf("%q id=%s non-stream: ok=%v err=%v", c.name, id, c.ok, err)
+			}
+		}
+	}
+
+	// taskMode=false + hexNeon4 + think=2：仍拒裸 "4 Neon"（对话模式规则不回归）。
+	neonHigh := Models["gemini-4-neon-thinking"]
+	highHeader := buildModelHeader(neonHigh.HexID, neonHigh.Mode, neonHigh.thinkWire(), "uuid-x")
+	bareFrame := makeSyntheticArgonFrame(hexNeon4, "4 Neon", "ok")
+	var got []string
+	_, _, err := readModelCheckedBodyMode(bytes.NewReader(bareFrame), func(l string) error {
+		got = append(got, l)
+		return nil
+	}, time.Now(), 200, highHeader, false)
+	if err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0 {
+		t.Errorf("taskMode=false think=2 + 裸 4 Neon: want mismatch and no output, err=%v lines=%d", err, len(got))
+	}
+	// 原入口 readModelCheckedBody（taskMode=false 薄封装）同样拒。
+	if _, _, err := readModelCheckedBody(bytes.NewReader(bareFrame), nil, time.Now(), 200, highHeader); err == nil {
+		t.Error("readModelCheckedBody(think=2 + 裸 4 Neon) must reject")
+	}
+
+	// 两个任务模型都要登录态。
+	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+		if !modelNeedsLogin(Models[name]) {
+			t.Errorf("%s should require login", name)
+		}
+		if _, ok := availableModels()[name]; ok {
+			t.Errorf("%s should not be available without cookie", name)
+		}
+	}
+	withPoolCookie(t)
+	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+		if _, ok := availableModels()[name]; !ok {
+			t.Errorf("%s should be available when pool cookie exists", name)
+		}
+	}
+
+	// strict_model：任务模型按登记的 Upstream 判降级——自报 "4 Neon"/"4 Hydrogen"
+	// 通过，掉到 Flash 族/异族正确识别为降级。
+	setStrictModel(t, true)
+	for _, c := range []struct {
+		model, reported string
+		want            bool
+	}{
+		{"gemini-4-neon-task", "4 Neon", false},
+		{"gemini-4-neon-task", "Gemini 4 Neon", false},
+		{"gemini-4-neon-task", "4 Neon High", false},
+		{"gemini-4-neon-task", "3.5 Flash-Lite", true},
+		{"gemini-4-neon-task", "3.6 Flash", true},
+		{"gemini-4-neon-task", "4 Carbon", true},
+		{"gemini-4-neon-task", "4 Hydrogen", true},
+		{"gemini-4-hydrogen-task", "4 Hydrogen", false},
+		{"gemini-4-hydrogen-task", "Gemini 4 Hydrogen", false},
+		{"gemini-4-hydrogen-task", "3.5 Flash-Lite", true},
+		{"gemini-4-hydrogen-task", "3.6 Flash", true},
+		{"gemini-4-hydrogen-task", "4 Neon", true},
+		{"gemini-4-hydrogen-task", "4 Carbon", true},
+	} {
+		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
+			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

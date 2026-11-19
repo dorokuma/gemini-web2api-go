@@ -368,6 +368,8 @@ Claude Code / Cursor 这类 MCP 客户端直接调用。
 | `gemini-4-carbon-thinking-medium` | 4 Carbon 的中等思考档（上游 Medium，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
 | `gemini-4-neon-thinking` | 4 Neon 的高思考档（上游自报 "4 Neon High"，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
 | `gemini-4-neon-thinking-medium` | 4 Neon 的中等思考档（上游自报 "4 Neon Medium"，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
+| `gemini-4-neon-task` | 4 Neon 的任务模式（网页端「任务」开关，与对话模式分离的独立模型），**要付费/Ultra 号 cookie** |
+| `gemini-4-hydrogen-task` | 4 Hydrogen 的任务模式（网页端「任务」开关，与对话模式分离的独立模型），**要付费号 cookie** |
 | `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
 | `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
 | `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
@@ -383,6 +385,10 @@ Claude Code / Cursor 这类 MCP 客户端直接调用。
 不是额外的模型。服务端回报的名字会带 `High`（如 `3.1 Pro High`，上游早期叫 `Extended`），
 思考链明显变长（3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 实测 2467 / 1059 / 583 字符，对应普通版 0 / 0 / 268）。
 **只在登录态生效**：匿名请求带上这个开关会被服务端静默忽略，所以没 cookie 时不暴露。
+
+`-task` 是网页端「任务」（Task）模式的独立模型，与对话模式完全分离：任务模式走另一套
+协议槽位（`inner[49]=40` 等），不是对话模型的思考档变体。`gemini-4-neon-task` /
+`gemini-4-hydrogen-task` 都**要登录态 cookie**（任务模式是账号功能，无 cookie 时不暴露）。
 
 旧的 `gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
 `gemini-3.5-flash-thinking-lite`、`gemini-auto`、`gemini-flash-lite` **已移除**
