@@ -162,6 +162,14 @@ func TestModelDowngraded(t *testing.T) {
 		{"gemini-4-neon-thinking", "4 Neon Medium", true},
 		// 2026-10-24 实测：无 Argon 权限的号请求 Argon，自报 3.5 Flash-Lite
 		{"gemini-4-carbon", "3.5 Flash-Lite", true},
+		// carbon-task 与对话 carbon 同槽同 Upstream：任务模式自报裸名不算降级，
+		// 掉到 Flash 族/异族仍判降级
+		{"gemini-4-carbon-task", "4 Carbon", false},
+		{"gemini-4-carbon-task", "4 Carbon High", false},
+		{"gemini-4-carbon-task", "4 Argon", false},
+		{"gemini-4-carbon-task", "3.5 Flash-Lite", true},
+		{"gemini-4-carbon-task", "4 Neon", true},
+		{"gemini-4-carbon-task", "4 Hydrogen", true},
 		{"gemini-4-neon", "4 Carbon", true},
 		{"gemini-4-neon", "3.5 Flash-Lite", true},
 		// 同日实测：免费号请求 3.8，自报 3.6 Flash
