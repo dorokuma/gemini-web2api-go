@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+### 修复
+
+- **工具调用提示词防幻觉**：`buildPromptParts` 末尾锚点原「do not output more than one
+  tool_call」「Know when to STOP … stop calling tools」强停手措辞，在多轮重放大量历史
+  工具调用时诱发 `gemini-4-neon` / `gemini-4-hydrogen` 泛化出「工具调用次数有上限/
+  工具被停用」而拒继调工具。现明确声明：每轮一个 `tool_call` 块只是单轮格式约定，
+  整个会话对工具调用总次数与轮数不设上限，任务未完可按需继续分步调工具，绝不编造
+  或声称存在次数/配额上限或工具被禁用；「别重复已成功步骤」限定为该步骤本身，不得
+  提前中断其它未完成步骤。`formatToolResult` 的成功提示同样收窄为「不要重复执行这条
+  命令」。
+
 ## 6.0.0
 
 ### ⚠️ 破坏性变更

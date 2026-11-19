@@ -885,3 +885,36 @@ func TestChatCompletionsMediaArtifactNotFalsePositive(t *testing.T) {
 		t.Fatal("占位链是真实内容帧，hasContentFrame 应为 true")
 	}
 }
+
+// 末尾锚点必须明说「单轮一块只是格式约定、全程没有次数上限」，否则多轮重放
+// 历史工具调用时 neon/hydrogen 会泛化出「工具调用次数有上限/工具被停用」拒调。
+// 保留的约束：每轮仍只能出一个 tool_call 块、不许拿 bash/python 代码块冒充执行。
+func TestToolPromptTailDeclaresNoCallLimit(t *testing.T) {
+	msgs := []map[string]interface{}{
+		{"role": "user", "content": "list files then read README"},
+	}
+	_, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil)
+	tail := pc.Tail
+	if tail == "" {
+		t.Fatal("带工具时末尾锚点不能为空")
+	}
+	for _, want := range []string{
+		// 无上限的显式声明
+		"NO limit on the total number of tool calls",
+		"Never invent or claim a limit on tool calls",
+		"tools are disabled",
+		// 每轮一块只是格式约定
+		"per-reply format convention",
+		"ONE ```tool_call```",
+		// 别重复已成功步骤，但不许泛化成停调所有工具
+		"Do not repeat a finished step",
+		"do not let it cut short other steps that are still unfinished",
+	} {
+		if !strings.Contains(tail, want) {
+			t.Errorf("末尾锚点缺少 %q\n---\n%s", want, tail)
+		}
+	}
+	if strings.Contains(tail, "Know when to STOP") || strings.Contains(tail, "stop calling tools") {
+		t.Error("末尾锚点不应再出现容易泛化成次数上限的停手措辞")
+	}
+}
