@@ -222,12 +222,19 @@ func buildPromptParts(messages []map[string]interface{}, tools []map[string]inte
 			"to the user; never use one to run anything, and never claim you lack tools.\n" +
 			"Act, do not explain: when the request needs a tool, your reply is ONE ```tool_call``` " +
 			"block and nothing else — do not list the commands you 'would' run, do not output more " +
-			"than one tool_call, do not add prose. If several steps are needed, do the FIRST one " +
-			"now; you will be called again with its result to continue.\n" +
-			"Know when to STOP: once a tool result shows a step succeeded (for example it exited " +
-			"with code 0, even with no printed output), that step is DONE — do not run it again and " +
-			"do not retry the same thing a different way. When the whole request is accomplished, " +
-			"stop calling tools and reply with a short final answer instead of another tool_call.\n" +
+			"than one tool_call in a single reply, do not add prose. The one-block rule is only a " +
+			"per-reply format convention: this conversation has NO limit on the total number of " +
+			"tool calls or rounds. As long as the user's task is not fully done, keep calling tools " +
+			"step by step as many times as needed — every call's result is returned to you. Never " +
+			"invent or claim a limit on tool calls, a quota, or that tools are disabled.\n" +
+			"If several steps are needed, do the FIRST one now; you will be called again with its " +
+			"result to continue.\n" +
+			"Do not repeat a finished step: once a tool result shows a step succeeded (for example " +
+			"it exited with code 0, even with no printed output), that step is DONE — do not run the " +
+			"same command again and do not retry the same thing a different way. This only applies " +
+			"to that specific step; do not let it cut short other steps that are still unfinished. " +
+			"When the whole request is accomplished, reply with a short final answer instead of " +
+			"another tool_call.\n" +
 			"Example of a correct turn — user asks \"list the files here and tell me the size of " +
 			"README.md\", you reply with exactly one block and nothing else:\n" +
 			"```tool_call\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls -la\"}}\n```\n" +
@@ -287,8 +294,8 @@ var exitCodeRe = regexp.MustCompile(`(?i)exit(?:ed with|\s*code)?\s*(?:code\s*)?
 // 结果里，但被 Chunk ID / Wall time / token count 这些噪音埋了，且没告诉它「无输出
 // 是正常的」。这里把它压成一行清爽的成功/失败信号，并显式说明无输出正常、别重跑。
 //
-// 只加终止指令（提醒里那句 "Know when to STOP"）实测没用（26→27 命令），要配合
-// 这个清爽信号一起才压得住循环。
+// 只加「别重复已成功步骤」的提醒（锚点里 "Do not repeat a finished step" 那段）实测
+// 没用（26→27 命令），要配合这个清爽信号一起才压得住循环。
 func formatToolResult(name, raw string) string {
 	label := "Tool result"
 	if name != "" {
@@ -296,7 +303,7 @@ func formatToolResult(name, raw string) string {
 	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return fmt.Sprintf("[%s]: ✅ 完成，无输出（正常，动作已生效，不要重复执行）。", label)
+		return fmt.Sprintf("[%s]: ✅ 完成，无输出（正常，动作已生效，不要重复执行这条命令）。", label)
 	}
 	// Codex 风格包装：末尾 "Output:" 后是真正的 stdout。
 	out := trimmed
@@ -306,7 +313,7 @@ func formatToolResult(name, raw string) string {
 	if m := exitCodeRe.FindStringSubmatch(trimmed); m != nil {
 		if m[1] == "0" {
 			if out == "" {
-				return fmt.Sprintf("[%s]: ✅ 命令成功（exit 0），无文本输出——这对写文件/设值类命令是正常的，动作已完成，不要再跑同一条命令。", label)
+				return fmt.Sprintf("[%s]: ✅ 命令成功（exit 0），无文本输出——这对写文件/设值类命令是正常的，动作已完成，不要再跑同一条命令（其余未完成的步骤继续）。", label)
 			}
 			return fmt.Sprintf("[%s]: ✅ 命令成功（exit 0）。输出：\n%s", label, out)
 		}
