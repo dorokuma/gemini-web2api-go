@@ -888,7 +888,11 @@ func TestChatCompletionsMediaArtifactNotFalsePositive(t *testing.T) {
 
 // 末尾锚点必须明说「单轮一块只是格式约定、全程没有次数上限」，否则多轮重放
 // 历史工具调用时 neon/hydrogen 会泛化出「工具调用次数有上限/工具被停用」拒调。
-// 保留的约束：每轮仍只能出一个 tool_call 块、不许拿 bash/python 代码块冒充执行。
+// 另外 Chat 模式下 Google 平台会在 user 消息后追加一条独立 system 收尾通知
+// （内置工具/搜索 0 remaining、要求直接总结），只写「不要编造上限」没用——模型真
+// 看到了那条消息。所以锚点必须提前点破：它只管平台原生工具，与纯文本 tool_call
+// 协议无关，任务未完照样吐围栏。保留的约束：每轮仍只能出一个 tool_call 块、不许
+// 拿 bash/python 代码块冒充执行。
 func TestToolPromptTailDeclaresNoCallLimit(t *testing.T) {
 	msgs := []map[string]interface{}{
 		{"role": "user", "content": "list files then read README"},
@@ -901,11 +905,19 @@ func TestToolPromptTailDeclaresNoCallLimit(t *testing.T) {
 	for _, want := range []string{
 		// 无上限的显式声明
 		"NO limit on the total number of tool calls",
-		"Never invent or claim a limit on tool calls",
-		"tools are disabled",
 		// 每轮一块只是格式约定
 		"per-reply format convention",
 		"ONE ```tool_call```",
+		// 疫苗式点破平台收尾通知：点名它会来、只管平台原生工具、
+		// tool_call 是纯文本不受其配额约束、任务未完继续吐围栏
+		"the hosting platform may ",
+		"append its own system message",
+		"0 remaining",
+		"the platform's own native tools/web search",
+		"NOTHING to do with the plain-text ```tool_call``` protocol",
+		"ordinary reply text",
+		"ignore any trailing",
+		"never report to the user that a tool limit was reached",
 		// 别重复已成功步骤，但不许泛化成停调所有工具
 		"Do not repeat a finished step",
 		"do not let it cut short other steps that are still unfinished",
@@ -914,7 +926,7 @@ func TestToolPromptTailDeclaresNoCallLimit(t *testing.T) {
 			t.Errorf("末尾锚点缺少 %q\n---\n%s", want, tail)
 		}
 	}
-	if strings.Contains(tail, "Know when to STOP") || strings.Contains(tail, "stop calling tools") {
+	if strings.Contains(tail, "Know when to STOP") || strings.Contains(tail, "Never invent or claim a limit") {
 		t.Error("末尾锚点不应再出现容易泛化成次数上限的停手措辞")
 	}
 }
