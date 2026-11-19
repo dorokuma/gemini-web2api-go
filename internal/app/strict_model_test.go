@@ -19,7 +19,7 @@ func setStrictModel(t *testing.T, on bool) {
 const downgradedLine = `[["wrb.fr",null,"[null,[\"c_1\",\"r_1\"],null,null,[[\"rc_1\",[\"1+1等于2。\"]]],null,\"cf41b0e0dd7d53e5\",null,null,\"3.5 Flash-Lite\",true]"]]`
 
 func TestStrictLineCheck(t *testing.T) {
-	argon := Models["gemini-4-argon"]
+	argon := Models["gemini-4-carbon"]
 
 	setStrictModel(t, false)
 	if strictLineCheck(argon, func() int64 { return 7 }) != nil {
@@ -63,7 +63,7 @@ func TestPickAccountForModelSkipsCooling(t *testing.T) {
 	resetDowngrades(t)
 	a1 := addTestAccount(t, "acct1")
 	a2 := addTestAccount(t, "acct2")
-	argon, flash := Models["gemini-4-argon"], Models["gemini-3.6-flash"]
+	argon, flash := Models["gemini-4-carbon"], Models["gemini-3.6-flash"]
 
 	markDowngraded(a1, argon)
 	for i := 0; i < 4; i++ { // 轮转会换号，多挑几次确认 a1 一次都不出现
@@ -93,10 +93,10 @@ func TestCooldownZeroStillExcludesWithinRequest(t *testing.T) {
 	resetDowngrades(t)
 	a1 := addTestAccount(t, "acct1")
 	a2 := addTestAccount(t, "acct2")
-	argon := Models["gemini-4-argon"]
+	argon := Models["gemini-4-carbon"]
 
 	exclude := map[int64]bool{}
-	err := &ModelDowngradedError{Requested: "4 Argon", Reported: "3.5 Flash-Lite", AccountID: a1}
+	err := &ModelDowngradedError{Requested: "4 Carbon", Reported: "3.5 Flash-Lite", AccountID: a1}
 	if !retryOnAnotherAccount(&StreamResult{}, err, argon, exclude) {
 		t.Fatal("没吐过内容的降级应换号重来")
 	}
@@ -111,7 +111,7 @@ func TestCooldownZeroStillExcludesWithinRequest(t *testing.T) {
 func TestRetryOnAnotherAccountGuards(t *testing.T) {
 	setStrictModel(t, true)
 	resetDowngrades(t)
-	argon := Models["gemini-4-argon"]
+	argon := Models["gemini-4-carbon"]
 	if retryOnAnotherAccount(&StreamResult{}, &ModelDowngradedError{Reported: "x"}, argon, map[int64]bool{}) {
 		t.Error("匿名降级没号可换")
 	}
@@ -150,10 +150,15 @@ func TestModelDowngraded(t *testing.T) {
 		{"gemini-3.1-pro", "3.1 Pro", false},
 		{"gemini-3.1-pro-thinking", "3.1 Pro High", false},
 		{"gemini-3.6-flash-thinking", "3.6 Flash 扩展", false},
-		{"gemini-4-argon-thinking", "4 Argon High", false},
+		{"gemini-4-carbon-thinking", "4 Carbon High", false},
+		{"gemini-4-neon", "4 Neon", false},
+		{"gemini-4-neon-thinking", "4 Neon High", false},
+		{"gemini-4-neon-thinking-medium", "4 Neon Medium", false},
 		{"gemini-3.7-flash", "3.8 Flash", false},
 		// 2026-10-24 实测：无 Argon 权限的号请求 Argon，自报 3.5 Flash-Lite
-		{"gemini-4-argon", "3.5 Flash-Lite", true},
+		{"gemini-4-carbon", "3.5 Flash-Lite", true},
+		{"gemini-4-neon", "4 Carbon", true},
+		{"gemini-4-neon", "3.5 Flash-Lite", true},
 		// 同日实测：免费号请求 3.8，自报 3.6 Flash
 		{"gemini-3.8-flash", "3.6 Flash", true},
 		{"gemini-3.1-pro", "3.5 Flash-Lite", true},

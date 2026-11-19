@@ -1,6 +1,6 @@
 # gemini-web2api-go
 
-**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Argon** included (needs a paid-account cookie).
+**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Neon / 4 Carbon** included (need a paid-account cookie).
 
 <img src="docs/banner.svg" alt="gemini-web2api-go — Gemini web to OpenAI-compatible API, native Gemini API and MCP" width="100%">
 
@@ -70,7 +70,7 @@ The projects most often compared with this one are the Python [Sophomoresty/gemi
 | Exit IPs | Proxy pool: circuit breaker, rotation, each proxy its own rate-limit slot | One proxy | One proxy | — (official API quota) |
 | Silent downgrade | `strict_model`: a downgraded answer does not count, retry on the next account, `429` when the whole pool is downgraded | README notes that a free account asking for Pro gets Flash | Not mentioned in README | — (official API quota) |
 | Admin panel | Built in | Not mentioned in README | Not mentioned in README | Companion project CPAMC, installed separately |
-| Gemini 4 Argon | With a paid-account cookie, two thinking tiers | Not mentioned in README | Models discovered per account, not named in README | Yes, depending on channel |
+| Gemini 4 Neon / 4 Carbon | With a paid-account cookie, thinking tiers included | Not mentioned in README | Models discovered per account, not named in README | Yes, depending on channel |
 
 ## Features
 
@@ -92,7 +92,7 @@ The projects most often compared with this one are the Python [Sophomoresty/gemi
 **Models**
 - `gemini-3.6-flash` and `gemini-3.5-flash-lite` work anonymously, web search included
 - `gemini-3.1-pro` needs a cookie; every reply carries a reasoning chain
-- `gemini-3.8-flash` and `gemini-4-argon` need a cookie from a paid / Ultra account
+- `gemini-3.8-flash`, `gemini-4-carbon` and `gemini-4-neon` need a cookie from a paid / Ultra account
 - Every model has a `-thinking` variant (extended thinking), available with a cookie
   (`reasoning_content`)
 - Every response records which model the backend **actually** used, so silent
@@ -369,8 +369,8 @@ The frontend is a single HTML file and Chart.js is embedded in the binary, **not
 
 ## Models
 
-Models follow the Gemini web app's model picker (the list comes from `batchexecute?rpcids=otAQ7b`): five base models,
-of which 3.6 Flash / 3.5 Flash-Lite / 3.1 Pro work with a free account and 3.8 Flash / 4 Argon need a paid one; the rest are their thinking tiers and the media tools.
+Models follow the Gemini web app's model picker (the list comes from `batchexecute?rpcids=otAQ7b`): six base models,
+of which 3.6 Flash / 3.5 Flash-Lite / 3.1 Pro work with a free account and 3.8 Flash / 4 Carbon / 4 Neon need a paid one; the rest are their thinking tiers and the media tools.
 
 | Model | Description |
 |---|---|
@@ -378,13 +378,16 @@ of which 3.6 Flash / 3.5 Flash-Lite / 3.1 Pro work with a free account and 3.8 F
 | `gemini-3.5-flash-lite` | Fast and lightweight |
 | `gemini-3.1-pro` | Most capable, **needs a cookie**; every reply carries a reasoning chain |
 | `gemini-3.8-flash` | Newer Flash, **needs a cookie from a PAID Gemini account** (free accounts get downgraded to 3.5 Flash-Lite). `gemini-3.7-flash` is an alias — Google bumped that same hex from 3.7 to 3.8 in place |
-| `gemini-4-argon` | 4 Argon (complex tasks), **needs a cookie from a PAID/Ultra Gemini account** (free accounts get downgraded to 3.5 Flash-Lite) |
+| `gemini-4-carbon` | 4 Carbon (renamed in place from 4 Argon; complex tasks/code), **needs a cookie from a PAID/Ultra Gemini account** (free accounts get downgraded to 3.5 Flash-Lite) |
+| `gemini-4-neon` | 4 Neon (deeper analysis), **needs a cookie from a PAID/Ultra Gemini account** |
 | `gemini-3.6-flash-thinking` | 3.6 Flash with extended thinking; **needs a cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite with extended thinking; **needs a cookie** |
 | `gemini-3.1-pro-thinking` | 3.1 Pro with extended thinking; **needs a cookie** |
 | `gemini-3.8-flash-thinking` | 3.8 Flash with extended thinking; **needs a paid-account cookie** (`gemini-3.7-flash-thinking` is an alias) |
-| `gemini-4-argon-thinking` | 4 Argon with extended thinking (upstream "High" tier), carries `reasoning_content`; **needs a PAID/Ultra account cookie** |
-| `gemini-4-argon-thinking-medium` | 4 Argon at the Medium thinking tier (thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
+| `gemini-4-carbon-thinking` | 4 Carbon with extended thinking (upstream "High" tier), carries `reasoning_content`; **needs a PAID/Ultra account cookie** |
+| `gemini-4-carbon-thinking-medium` | 4 Carbon at the Medium thinking tier (thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
+| `gemini-4-neon-thinking` | 4 Neon at the High thinking tier (upstream reports "4 Neon High"; thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
+| `gemini-4-neon-thinking-medium` | 4 Neon at the Medium thinking tier (upstream reports "4 Neon Medium"; thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
 | `gemini-image` | Image generation (Nano Banana); base64 output; **needs a cookie** |
 | `gemini-music` | Music (Lyria, ~30s); base64 output; **needs a cookie** |
 | `gemini-canvas` | Canvas: generates an interactive HTML document (returned inline as a ```html block); **needs a cookie** |
@@ -474,7 +477,7 @@ Saving takes effect **immediately**, no restart. Values live in the database and
 | Strict model check (`strict_model`) | off by default. When an account runs out of quota for a tier, upstream doesn't error — it silently switches to a weaker model and still returns 200. When on, if the model the server reports differs from the one requested, the downgraded answer is not treated as a success: the request retries on the next account, and if the whole pool is downgraded it returns `429 insufficient_quota` (`code: model_downgraded`, with `Retry-After`). For streaming this is decided before the first token is sent, so you never get half an answer followed by an error. Media models (image/music/video/canvas) are not checked. |
 | Downgrade cooldown (`strict_model_cooldown_min`) | Works with strict model check: how long a downgraded account rests for that model before being used again. Default 300 minutes (web usage is counted over a 5-hour window). 0 = do not remember, retry on every request. |
 | Retry attempts / retry delay / upstream timeout | |
-| Retry after timeout (`retry_on_timeout`) | on by default. When off, a request that hits the upstream timeout without finishing fails right away instead of being resent up to the retry count: a resend usually times out again, so one request can otherwise wait up to "timeout × retry attempts", which reaches 10+ minutes with very long inputs or slow models such as Argon. Other failures (empty response, failure reply, etc.) are still retried. |
+| Retry after timeout (`retry_on_timeout`) | on by default. When off, a request that hits the upstream timeout without finishing fails right away instead of being resent up to the retry count: a resend usually times out again, so one request can otherwise wait up to "timeout × retry attempts", which reaches 10+ minutes with very long inputs or slow models such as Carbon/Neon. Other failures (empty response, failure reply, etc.) are still retried. |
 | Stream keepalive (`stream_keepalive_sec`) | 0 (off) by default. When a streaming request has written nothing to the client for this many seconds, send a keepalive so an nginx / Cloudflare / newapi layer in front doesn't answer 504 for an idle connection. 15 is a good value. The two OpenAI endpoints send an SSE comment line `: ping` (clients ignore it per the SSE spec); `/v1beta` sends an empty text chunk (Google's SDK does not accept comment lines). **Trade-off**: a keepalive has to open the stream (HTTP 200) first, so a later failure can only be reported inside the stream instead of as a 502/429 status, which affects clients that switch channels on status codes; requests that fail within seconds are unaffected. It does nothing for non-streaming requests; for those, raise the timeout of the layer in front. |
 | Detail retention days | only request details expire; aggregates are kept forever |
 | TLS fingerprint | `chrome_146` (default) / `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -770,7 +773,7 @@ spread requests across exits with the proxy pool rather than adding accounts.
 Anonymous (no cookie): `gemini-3.6-flash` and `gemini-3.5-flash-lite`, web search included.
 A free account's cookie additionally unlocks `gemini-3.1-pro`, the `-thinking` variants of 3.6 Flash / 3.5 Flash-Lite / 3.1 Pro,
 image / video input, image generation, music and canvas.
-Paid accounts only: `gemini-3.8-flash`, `gemini-4-argon` (and their `-thinking` variants; free accounts are
+Paid accounts only: `gemini-3.8-flash`, `gemini-4-carbon`, `gemini-4-neon` (and their `-thinking` variants; free accounts are
 downgraded to 3.5 Flash-Lite) and video generation (`gemini-video` / `/v1/videos`).
 
 ### Why does every message create a new conversation on gemini.google.com?
@@ -794,16 +797,17 @@ the proxy. Function calling is prompt-level, so the model does not always answer
 Yes: `gemini-3.8-flash` and `gemini-3.8-flash-thinking`, for paid Gemini accounts; requests from free accounts are
 downgraded server-side to 3.5 Flash-Lite. `gemini-3.7-flash` remains as an alias so older clients keep working.
 
-### Can I use Gemini 4 Argon through this? How?
+### Can I use Gemini 4 Carbon / 4 Neon through this? How?
 
-Yes, and without a Gemini API key. The model is `gemini-4-argon`; `gemini-4-argon-thinking` is the upstream "High"
-thinking tier and carries `reasoning_content`; the Medium tier is `gemini-4-argon-thinking-medium` (see the model table).
-There is one requirement: the account behind the cookie must show "4 Argon" in the model picker on gemini.google.com.
+Yes, and without a Gemini API key. The models are `gemini-4-carbon` / `gemini-4-neon`; `gemini-4-carbon-thinking` is the upstream "High"
+thinking tier and carries `reasoning_content`; the Carbon Medium tier is `gemini-4-carbon-thinking-medium`, and the Neon tiers are
+`gemini-4-neon-thinking` / `gemini-4-neon-thinking-medium` (see the model table).
+There is one requirement: the account behind the cookie must show "4 Carbon" / "4 Neon" in the model picker on gemini.google.com.
 If it does, the account is eligible (Google AI Pro / Ultra tier; a Pro plan that came bundled or through a student offer
-counts), so add its cookie in the admin dashboard and request `gemini-4-argon`.
-Requests from a free account, or from one without Argon, are **silently downgraded to 3.5 Flash-Lite** upstream with no
-error, which is why the model is not exposed when no cookie is configured and never runs anonymously. If you have a cookie
-and still get downgraded, check the web app first for "4 Argon" on that account; if the browser has several accounts signed in,
+counts), so add its cookie in the admin dashboard and request the model.
+Requests from a free account, or from one without access, are **silently downgraded to 3.5 Flash-Lite** upstream with no
+error, which is why these models are not exposed when no cookie is configured and never run anonymously. If you have a cookie
+and still get downgraded, check the web app first for "4 Carbon" / "4 Neon" on that account; if the browser has several accounts signed in,
 also check that the entry's "account index" in the Cookie pool is right.
 
 ### Which model does image generation use? Can it output 2K?

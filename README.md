@@ -1,6 +1,6 @@
 # gemini-web2api-go
 
-**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Argon** included (needs a paid-account cookie).
+**Gemini web → OpenAI-compatible API.** A self-hosted proxy that turns the free [gemini.google.com](https://gemini.google.com) web app into `/v1/chat/completions` — **no Google API key, no paid quota**. Single Go binary, real Chrome TLS fingerprint, cookie pool with automatic renewal, proxy pool, built-in admin dashboard, SQLite / MySQL / PostgreSQL. Image, music, canvas and video generation (`/v1/videos`) included. Models track the web app, **Gemini 4 Neon / 4 Carbon** included (need a paid-account cookie).
 
 <img src="docs/banner.svg" alt="gemini-web2api-go — Gemini web to OpenAI-compatible API, native Gemini API and MCP" width="100%">
 
@@ -70,7 +70,7 @@
 | 出口 IP | 代理池：熔断、轮转，每个代理是独立限流槽 | 单个代理 | 单个代理 | —（走官方 API 额度） |
 | 静默降级 | `strict_model`：降级回答不算成功，换号重试，全池降级回 `429` | README 注明免费号请求 Pro 会落到 Flash | README 未提 | —（走官方 API 额度） |
 | 管理面板 | 内置 | README 未提 | README 未提 | 配套项目 CPAMC，另装 |
-| Gemini 4 Argon | 付费号 cookie 可用，含两档 thinking | README 未提 | 模型按账号动态发现，README 未点名 | 有，取决于渠道 |
+| Gemini 4 Neon / 4 Carbon | 付费号 cookie 可用，含思考档 | README 未提 | 模型按账号动态发现，README 未点名 | 有，取决于渠道 |
 
 ## 功能
 
@@ -91,7 +91,7 @@
 **模型**
 - `gemini-3.6-flash`、`gemini-3.5-flash-lite` 匿名可用，含联网搜索
 - `gemini-3.1-pro` 挂 cookie 后可用，每次回答带思考链（`reasoning_content`）
-- `gemini-3.8-flash`、`gemini-4-argon` 要付费 / Ultra 账号的 cookie
+- `gemini-3.8-flash`、`gemini-4-carbon`、`gemini-4-neon` 要付费 / Ultra 账号的 cookie
 - 各模型都有 `-thinking` 版（扩展思考），挂 cookie 后可用
 - 响应里记录服务端**实际**用了哪个模型，被静默降级一眼可见
 
@@ -349,8 +349,8 @@ Claude Code / Cursor 这类 MCP 客户端直接调用。
 
 ## 模型
 
-模型跟着 Gemini 网页端的模型选择器走（清单来自 `batchexecute?rpcids=otAQ7b`）：基础模型 5 个，
-3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 免费号就能用，3.8 Flash / 4 Argon 要付费号；其余是它们的思考档和媒体工具。
+模型跟着 Gemini 网页端的模型选择器走（清单来自 `batchexecute?rpcids=otAQ7b`）：基础模型 6 个，
+3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 免费号就能用，3.8 Flash / 4 Carbon / 4 Neon 要付费号；其余是它们的思考档和媒体工具。
 
 | 模型 | 描述 |
 |---|---|
@@ -358,13 +358,16 @@ Claude Code / Cursor 这类 MCP 客户端直接调用。
 | `gemini-3.5-flash-lite` | 极速、轻量 |
 | `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
 | `gemini-3.8-flash` | 新款 Flash，**要付费 Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）。`gemini-3.7-flash` 是它的别名——Google 把 3.7 那个 hex 原地升成了 3.8 |
-| `gemini-4-argon` | 4 Argon（复杂任务），**要付费/Ultra Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）|
+| `gemini-4-carbon` | 4 Carbon（原 4 Argon 原位改名，复杂任务/代码），**要付费/Ultra Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）|
+| `gemini-4-neon` | 4 Neon（深入分析），**要付费/Ultra Gemini 账号的 cookie** |
 | `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
 | `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
 | `gemini-3.8-flash-thinking` | 3.8 Flash 开扩展思考，**要付费号 cookie**（`gemini-3.7-flash-thinking` 为别名）|
-| `gemini-4-argon-thinking` | 4 Argon 开扩展思考（上游叫 High 档），带 `reasoning_content`，**要付费/Ultra 号 cookie** |
-| `gemini-4-argon-thinking-medium` | 4 Argon 的中等思考档（上游 Medium，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
+| `gemini-4-carbon-thinking` | 4 Carbon 开扩展思考（上游叫 High 档），带 `reasoning_content`，**要付费/Ultra 号 cookie** |
+| `gemini-4-carbon-thinking-medium` | 4 Carbon 的中等思考档（上游 Medium，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
+| `gemini-4-neon-thinking` | 4 Neon 的高思考档（上游自报 "4 Neon High"，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
+| `gemini-4-neon-thinking-medium` | 4 Neon 的中等思考档（上游自报 "4 Neon Medium"，思考在服务端内部完成、不带 `reasoning_content`），**要付费/Ultra 号 cookie** |
 | `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
 | `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
 | `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
@@ -484,7 +487,7 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 严格模型校验（`strict_model`） | 默认关。账号某一档额度用完时，上游不报错，而是静默换成更弱的模型照样回 200。开启后，服务端自报的模型跟请求的不一致就不把降级回答当成功：换下一个号重试，全池都被降级就回 `429 insufficient_quota`（`code: model_downgraded`，带 `Retry-After`）。流式在吐出第一个字之前就判断，不会先吐一半再报错。媒体模型（生图/音乐/视频/画布）不参与判断。 |
 | 降级冷却（`strict_model_cooldown_min`） | 配合严格模型校验：被降级的号在这个模型上歇多久再用，默认 300 分钟（网页端用量按 5 小时窗口算）。0 = 不记，每次请求都重新试。 |
 | 重试次数 / 重试间隔 / 上游超时 | |
-| 超时后重试（`retry_on_timeout`） | 默认开。关掉后上游等满「上游超时」还没回完就直接报错，不再按重试次数重发：重发多半还是超时，一个请求最坏要等「超时 × 重试次数」，超长输入或慢模型（如 Argon）下能拖十几分钟。空响应、出错话术等其他失败照常重试。 |
+| 超时后重试（`retry_on_timeout`） | 默认开。关掉后上游等满「上游超时」还没回完就直接报错，不再按重试次数重发：重发多半还是超时，一个请求最坏要等「超时 × 重试次数」，超长输入或慢模型（如 Carbon/Neon）下能拖十几分钟。空响应、出错话术等其他失败照常重试。 |
 | 流式保活（`stream_keepalive_sec`） | 默认 0（关）。流式请求连续这么多秒没往客户端写东西，就发一次保活，防止前面的 nginx / Cloudflare / newapi 等中间层因连接空闲回 504。建议 15。OpenAI 两个接口发 SSE 注释行 `: ping`（客户端按规范忽略），`/v1beta` 发一块空正文（Google SDK 不认注释行）。**代价**：保活要先开流（HTTP 200），之后再失败只能在流里报错，拿不到 502/429 状态码，依赖状态码换渠道的客户端会受影响；秒级就失败的请求不受影响。非流式请求无效，只能调大中间层的超时。 |
 | 明细保留天数 | 过期只删明细，聚合数据永久保留 |
 | TLS 指纹 | `chrome_146`（默认）/ `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -822,7 +825,7 @@ Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某�
 
 匿名（不挂 cookie）：`gemini-3.6-flash`、`gemini-3.5-flash-lite`，含联网搜索。
 挂免费账号 cookie：额外解锁 `gemini-3.1-pro`、3.6 Flash / 3.5 Flash-Lite / 3.1 Pro 的思考版（`-thinking`）、读图 / 读视频、生图、音乐、画布。
-付费账号才有：`gemini-3.8-flash`、`gemini-4-argon`（及其 `-thinking`，免费号都会被降级成 3.5 Flash-Lite）和生视频（`gemini-video` / `/v1/videos`）。
+付费账号才有：`gemini-3.8-flash`、`gemini-4-carbon`、`gemini-4-neon`（及其 `-thinking`，免费号都会被降级成 3.5 Flash-Lite）和生视频（`gemini-video` / `/v1/videos`）。
 
 ### 为什么每发一条消息，gemini.google.com 里就多出一个会话？
 
@@ -841,14 +844,14 @@ Function calling 是 prompt 级实现，模型不一定每次都按格式返回�
 有（`gemini-3.8-flash` 与 `gemini-3.8-flash-thinking`），需要付费 Gemini 账号；免费号请求它会被服务端降级成 3.5 Flash-Lite。
 `gemini-3.7-flash` 作为别名保留，老客户端不受影响。
 
-### 能用 Gemini 4 Argon 吗？怎么用？
+### 能用 Gemini 4 Carbon / 4 Neon 吗？怎么用？
 
-能，不需要 Gemini API key。模型名 `gemini-4-argon`；`gemini-4-argon-thinking` 是上游的 High 思考档，回复带 `reasoning_content`；
-中档是 `gemini-4-argon-thinking-medium`（见模型表）。
-条件只有一个：挂进来的 cookie 所属账号在 gemini.google.com 的模型选择器里能看到「4 Argon」。看得到就是有权限
-（Google AI Pro / Ultra 档，捆绑或学生优惠拿到的 Pro 一样算），把它的 cookie 配进管理面板、请求 `gemini-4-argon` 即可。
-免费号或没开 Argon 的号发它，上游会**静默降级成 3.5 Flash-Lite**、不报错，所以本项目没配 cookie 时不暴露这个模型，也不走匿名。
-配了 cookie 仍被降级，先去网页端确认该账号有没有「4 Argon」；浏览器里登了多个号的，再确认 Cookie 池里这条的「账号序号」填对了。
+能，不需要 Gemini API key。模型名 `gemini-4-carbon` / `gemini-4-neon`；`gemini-4-carbon-thinking` 是上游的 High 思考档，回复带 `reasoning_content`；
+中档是 `gemini-4-carbon-thinking-medium`，4 Neon 的两档是 `gemini-4-neon-thinking` / `gemini-4-neon-thinking-medium`（见模型表）。
+条件只有一个：挂进来的 cookie 所属账号在 gemini.google.com 的模型选择器里能看到「4 Carbon」/「4 Neon」。看得到就是有权限
+（Google AI Pro / Ultra 档，捆绑或学生优惠拿到的 Pro 一样算），把它的 cookie 配进管理面板、请求对应模型即可。
+免费号或没开权限的号发它，上游会**静默降级成 3.5 Flash-Lite**、不报错，所以本项目没配 cookie 时不暴露这些模型，也不走匿名。
+配了 cookie 仍被降级，先去网页端确认该账号有没有「4 Carbon」/「4 Neon」；浏览器里登了多个号的，再确认 Cookie 池里这条的「账号序号」填对了。
 
 ### 生图用的是哪个模型？能出 2K 吗？
 

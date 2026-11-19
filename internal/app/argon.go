@@ -18,12 +18,26 @@ func (e *argonIdentityError) Error() string {
 	return fmt.Sprintf("Argon model mismatch: upstream reported %q (%s)", e.name, e.id)
 }
 
-// argonDisplayNames 是上游对 Argon 各思考档位自报的显示名：普通档 "4 Argon"，
-// 扩展思考（think=2，上游叫 High）"4 Argon High"，中档（think=4）自报 "4 Argon" 或 "4 Argon Medium"。
-// 2026-11 起上游把同一槽位的显示名原位改名成 "4 Carbon" 家族（hex 95a4c0abcba24364、Mode=8 不变），
-// 改名滚动期两套名字都算同一模型的合法自报，按档位一起收。
-// 按请求的档位只认对应名字，档位被静默换掉也算身份不符。
-func argonDisplayNames(think int) []string {
+// argonDisplayNames 按请求的槽位（hex）和思考档位返回上游合法的自报显示名。
+//
+// Carbon 槽位（hexArgon4 / Mode=8，原 Argon 原位改名）：普通档 "4 Argon"/"4 Carbon"，
+// 高档 "4 Argon High"/"4 Carbon High"（2026-11-13 起 High 档自报又脱了后缀、回落成
+// 裸 "4 Carbon"，滚动期两套都收），中档裸名或 "* Medium"。
+// Neon 槽位（hexNeon4 / Mode=3）：think=1 只认 "4 Neon"，think=2 只认 "4 Neon High"，
+// think=4 只认 "4 Neon Medium"——Neon 的高/中档自报**带后缀**（与 Carbon High 档脱后缀
+// 不同），且各档名字不互通：档位被静默换掉同样算身份不符。
+// 两种槽位都附带 "Gemini " 前缀形态；按请求的档位只认对应名字。
+func argonDisplayNames(hexID string, think int) []string {
+	if hexID == hexNeon4 {
+		switch think {
+		case thinkingExtended:
+			return []string{"4 Neon High", "Gemini 4 Neon High"}
+		case thinkingMedium:
+			return []string{"4 Neon Medium", "Gemini 4 Neon Medium"}
+		default:
+			return []string{"4 Neon", "Gemini 4 Neon"}
+		}
+	}
 	if think == thinkingExtended {
 		// 2026-11-13 起上游对 High 档的自报又脱了 "High" 后缀、回落成裸 "4 Carbon"
 		// （与 11 月把 "4 Argon"→"4 Carbon" 同一轮滚动改名）；滚动期两套都收。
@@ -48,10 +62,11 @@ func argonThinkFromHeader(h []any) int {
 }
 
 // argonIdentityInLine 检查单行 wrb.fr 帧里的模型身份。
-// 返回 found=true 表示这行带有 names 之一的 Argon 身份；err 非 nil 表示这行报的是别的模型或档位。
+// 返回 found=true 表示这行带有 names 之一的身份；err 非 nil 表示这行报的是别的模型或档位。
 // 注意：2026-10 起上游在响应帧的 hex 槽位可能固定回 cf41b0e0dd7d53e5（hexFlashLite 占位），
-// 只有紧随其后的显示名槽位反映真实模型，因此 hex 槽位接受 hexArgon4 或 hexFlashLite 占位，同时严格核对显示名。
-func argonIdentityInLine(line string, names []string) (found bool, err error) {
+// 只有紧随其后的显示名槽位反映真实模型，因此 hex 槽位接受请求的 hexID 或 hexFlashLite 占位，
+// 同时严格核对显示名。
+func argonIdentityInLine(line string, hexID string, names []string) (found bool, err error) {
 	var rows [][]json.RawMessage
 	if json.Unmarshal([]byte(line), &rows) != nil {
 		return false, nil
@@ -85,7 +100,7 @@ func argonIdentityInLine(line string, names []string) (found bool, err error) {
 			if !validHex || !ok {
 				continue
 			}
-			if (id != hexArgon4 && id != hexFlashLite) || !slices.Contains(names, name) {
+			if (id != hexID && id != hexFlashLite) || !slices.Contains(names, name) {
 				return false, &argonIdentityError{name: name, id: id}
 			}
 			found = true
@@ -96,10 +111,10 @@ func argonIdentityInLine(line string, names []string) (found bool, err error) {
 
 var errArgonIdentityMissing = fmt.Errorf("Argon identity missing in upstream response; refusing unverified model")
 
-func validateArgonIdentity(raw []byte, names []string) error {
+func validateArgonIdentity(raw []byte, hexID string, names []string) error {
 	found := false
 	for _, line := range strings.Split(string(raw), "\n") {
-		ok, err := argonIdentityInLine(line, names)
+		ok, err := argonIdentityInLine(line, hexID, names)
 		if err != nil {
 			return err
 		}
@@ -111,7 +126,8 @@ func validateArgonIdentity(raw []byte, names []string) error {
 	return nil
 }
 
-// readModelCheckedBody 对 Argon 请求逐帧校验模型身份后再转发。
+// readModelCheckedBody 对身份校验模型（Carbon/Argon、Neon 等付费专属槽位）的请求
+// 逐帧校验模型身份后再转发。请求的 hex 不在校验集合里时与原来一样直通。
 //
 // 身份确认之前的行先暂存、不回调；第一次在帧里确认是 Argon 时把暂存的行一次放行，
 // 之后边读边转发，同时继续检查每一帧。上游对未授权账号会静默降级成别的模型，
@@ -126,23 +142,26 @@ func validateArgonIdentity(raw []byte, names []string) error {
 // onLine 为 nil（非流式）时没有转发，照旧读完整段再校验。
 func readModelCheckedBody(r io.Reader, onLine func(string) error, start time.Time, status int, modelHeader string) ([]byte, int64, error) {
 	var h []any
-	isArgon := json.Unmarshal([]byte(modelHeader), &h) == nil && len(h) > 4 && h[4] == hexArgon4
-	if !isArgon {
+	hexID := ""
+	if json.Unmarshal([]byte(modelHeader), &h) == nil && len(h) > 4 {
+		hexID, _ = h[4].(string)
+	}
+	if hexID != hexArgon4 && hexID != hexNeon4 {
 		return readBody(r, onLine, start)
 	}
-	names := argonDisplayNames(argonThinkFromHeader(h))
+	names := argonDisplayNames(hexID, argonThinkFromHeader(h))
 	if status != 200 || onLine == nil {
 		raw, ttfb, err := readBody(r, nil, start)
 		if err != nil || status != 200 {
 			return raw, ttfb, err
 		}
-		return raw, ttfb, validateArgonIdentity(raw, names)
+		return raw, ttfb, validateArgonIdentity(raw, hexID, names)
 	}
 
 	var pending []string
 	verified := false
 	raw, ttfb, err := readBody(r, func(line string) error {
-		ok, lerr := argonIdentityInLine(line, names)
+		ok, lerr := argonIdentityInLine(line, hexID, names)
 		if lerr != nil {
 			return lerr
 		}

@@ -101,7 +101,7 @@ func TestArgonTimingProbe(t *testing.T) {
 	raw, firstLine, err := readBody(resp.Body, func(line string) error {
 		lineCount++
 		ms := time.Since(start).Milliseconds()
-		if firstIdentity < 0 && validateArgonIdentity([]byte(line), argonDisplayNames(thinkingNormal)) == nil {
+		if firstIdentity < 0 && validateArgonIdentity([]byte(line), hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)) == nil {
 			firstIdentity = ms
 		}
 		if firstReasoning < 0 && reasoningInLine(line) != "" {
