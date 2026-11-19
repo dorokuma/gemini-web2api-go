@@ -31,11 +31,13 @@ func argonDisplayNames(hexID string, think int) []string {
 	return argonDisplayNamesMode(hexID, think, false)
 }
 
-// argonDisplayNamesMode 同 argonDisplayNames，taskMode=true 时对 hexNeon4 放宽一档：
-// 任务模式（gemini-4-neon-task）发 hexNeon4 + think=2 + inner[49]=40，上游实测自报
-// 裸名 "4 Neon"（而非对话模式 think=2 的 "4 Neon High"）。裸名与未来可能恢复的
-// "4 Neon High" 后缀都收，其它模型/档位仍严格拦截。
-// taskMode=false 时逐字保留原规则——对话模式校验绝不放宽。
+// argonDisplayNamesMode 同 argonDisplayNames，taskMode=true 时对任务模式放宽一档：
+//   - gemini-4-neon-task（hexNeon4 + 任务模式，think=2）：上游实测自报裸名 "4 Neon"
+//     （而非对话模式 think=2 的 "4 Neon High"），裸名与未来可能恢复的 High 后缀都收。
+//   - gemini-4-carbon-task（hexArgon4 + 任务模式，think=2）：上游实测自报被脱后缀
+//     回落成裸名 "4 Carbon"，裸名与 "* High"/"4 Argon" 同族名都收。
+//
+// 其它模型/档位仍严格拦截；taskMode=false 时逐字保留原规则——对话模式校验绝不放宽。
 func argonDisplayNamesMode(hexID string, think int, taskMode bool) []string {
 	if hexID == hexNeon4 {
 		if taskMode {
@@ -49,6 +51,12 @@ func argonDisplayNamesMode(hexID string, think int, taskMode bool) []string {
 		default:
 			return []string{"4 Neon", "Gemini 4 Neon"}
 		}
+	}
+	if taskMode {
+		// gemini-4-carbon-task：Task 模式下上游对 think=2/4 的自报都被脱后缀、回落
+		// 成裸名 "4 Carbon"（2026-11-19 实测）；裸名 + High 后缀 + Argon 旧名都收。
+		return []string{"4 Carbon", "Gemini 4 Carbon", "4 Carbon High", "Gemini 4 Carbon High",
+			"4 Argon", "Gemini 4 Argon", "4 Argon High", "Gemini 4 Argon High"}
 	}
 	if think == thinkingExtended {
 		// 2026-11-13 起上游对 High 档的自报又脱了 "High" 后缀、回落成裸 "4 Carbon"
@@ -156,8 +164,9 @@ func readModelCheckedBody(r io.Reader, onLine func(string) error, start time.Tim
 	return readModelCheckedBodyMode(r, onLine, start, status, modelHeader, false)
 }
 
-// readModelCheckedBodyMode 同 readModelCheckedBody，另带 taskMode：gemini-4-neon-task
-// （hexNeon4 + 任务模式）上游自报裸名 "4 Neon"，合法名集合见 argonDisplayNamesMode。
+// readModelCheckedBodyMode 同 readModelCheckedBody，另带 taskMode：任务模型
+// （gemini-4-neon-task / gemini-4-carbon-task）上游自报裸名 "4 Neon"/"4 Carbon"，
+// 合法名集合见 argonDisplayNamesMode。
 func readModelCheckedBodyMode(r io.Reader, onLine func(string) error, start time.Time, status int, modelHeader string, taskMode bool) ([]byte, int64, error) {
 	var h []any
 	hexID := ""

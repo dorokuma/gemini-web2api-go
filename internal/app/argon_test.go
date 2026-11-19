@@ -665,9 +665,10 @@ func TestAdminCookiesBindProxyBeforeCheck(t *testing.T) {
 	}
 }
 
-// PR #71：mode-8（4 Argon/4 Carbon）inner 槽位补齐的防回归。
-// 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用 argonMode8Slots，
-// 这里直接断言该块的槽位值，以及它对非 mode-8、mode-8 各档的作用范围。
+// PR #71 + 对话/任务拆分：Mode=8（4 Carbon）的任务模式槽位防回归。
+// 2026-11-19 起 argonMode8Slots 改为仅 mc.TaskMode && Mode==8（gemini-4-carbon-task）
+// 触发——Mode=8 的普通对话实测走纯普通 inner。这里直接断言补齐块的槽位值，以及
+// 它对非 mode-8、mode-8 对话/任务各自的作用范围。
 func TestArgonMode8Slots(t *testing.T) {
 	// 非 mode-8 的 inner 不含补齐槽位：按 streamGenerateOnce/streamGenerateConv 的
 	// 默认值拼一个 3.6-flash 的 inner，逐个核对 PR #71 动的槽位都停在原值。
@@ -683,11 +684,15 @@ func TestArgonMode8Slots(t *testing.T) {
 	inner[80] = flash.thinkWire()
 	inner[91] = 0
 	inner[96] = 0
-	if flash.Mode == 8 {
-		argonMode8Slots(inner)
+	if flash.TaskMode {
+		if flash.Mode == 8 {
+			argonMode8Slots(inner)
+		} else {
+			taskModeSlots(inner)
+		}
 	}
 	if inner[49] != nil || inner[83] != nil || inner[98] != nil {
-		t.Errorf("non-mode-8 inner 不应含补齐槽位: [49]=%v [83]=%v [98]=%v", inner[49], inner[83], inner[98])
+		t.Errorf("non-task inner 不应含任务槽位: [49]=%v [83]=%v [98]=%v", inner[49], inner[83], inner[98])
 	}
 	if got := fmt.Sprint(inner[6]); got != "[0]" {
 		t.Errorf("non-mode-8 inner[6]=%s want [0]", got)
@@ -696,9 +701,10 @@ func TestArgonMode8Slots(t *testing.T) {
 		t.Errorf("non-mode-8 inner[68]=%v inner[91]=%v want 1/0", inner[68], inner[91])
 	}
 
-	// mode-8 补齐块按 PR #71 抓包逐槽核对；三档（普通/中/高）都走同一块。
-	for _, name := range []string{"gemini-4-carbon", "gemini-4-carbon-thinking-medium", "gemini-4-carbon-thinking"} {
-		mc := Models[name]
+	// 按 streamGenerateOnce/streamGenerateConv 的任务模式路由拼 inner：
+	// Mode==8 && TaskMode → argonMode8Slots，TaskMode && Mode!=8 → taskModeSlots，
+	// TaskMode=false → 一律纯普通 inner。
+	buildInner := func(mc ModelConfig) []any {
 		inner := make([]any, innerSlots)
 		inner[6] = []any{0}
 		inner[30] = []any{4}
@@ -707,24 +713,60 @@ func TestArgonMode8Slots(t *testing.T) {
 		inner[80] = mc.thinkWire()
 		inner[91] = 0
 		inner[96] = 0
-		if mc.Mode == 8 {
-			argonMode8Slots(inner)
-		}
-		if got := fmt.Sprint(inner[6]); got != "[1]" {
-			t.Errorf("%s inner[6]=%s want [1]", name, got)
-		}
-		if got := fmt.Sprint(inner[30]); got != "[]" {
-			t.Errorf("%s inner[30]=%s want []", name, got)
-		}
-		for i, want := range map[int]int{49: 40, 68: 2, 83: 1, 91: 1, 96: 1, 98: 1} {
-			if inner[i] != want {
-				t.Errorf("%s inner[%d]=%v want %d", name, i, inner[i], want)
+		if mc.TaskMode {
+			if mc.Mode == 8 {
+				argonMode8Slots(inner)
+			} else {
+				taskModeSlots(inner)
 			}
 		}
-		// 补齐块不改思考槽：inner[80] 仍是 thinkWire，header 档位不受影响。
+		return inner
+	}
+
+	// Mode=8 对话模型（gemini-4-carbon 三档）：一律纯普通 inner，不含任何任务槽位
+	// （inner[49]==nil 是 Chat/Task 拆分的核心断言）。
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-carbon-thinking-medium", "gemini-4-carbon-thinking"} {
+		mc := Models[name]
+		if mc.TaskMode {
+			t.Fatalf("%s must be chat mode (TaskMode=false), got %+v", name, mc)
+		}
+		inner := buildInner(mc)
+		if got := fmt.Sprint(inner[6]); got != "[0]" {
+			t.Errorf("%s inner[6]=%s want [0]", name, got)
+		}
+		if got := fmt.Sprint(inner[30]); got != "[4]" {
+			t.Errorf("%s inner[30]=%s want [4]", name, got)
+		}
+		for _, i := range []int{49, 83, 98} {
+			if inner[i] != nil {
+				t.Errorf("%s chat inner[%d]=%v want nil", name, i, inner[i])
+			}
+		}
+		if inner[68] != 1 || inner[91] != 0 {
+			t.Errorf("%s chat inner[68]=%v inner[91]=%v want 1/0", name, inner[68], inner[91])
+		}
+		// 补齐块不动思考槽：inner[80] 仍是 thinkWire。
 		if inner[80] != mc.thinkWire() || inner[79] != 8 {
 			t.Errorf("%s inner[79]=%v inner[80]=%v want 8/%d", name, inner[79], inner[80], mc.thinkWire())
 		}
+	}
+
+	// Mode=8 任务模型（gemini-4-carbon-task）：argonMode8Slots 按 PR #71 抓包逐槽核对。
+	carbonTask := Models["gemini-4-carbon-task"]
+	inner = buildInner(carbonTask)
+	if got := fmt.Sprint(inner[6]); got != "[1]" {
+		t.Errorf("carbon-task inner[6]=%s want [1]", got)
+	}
+	if got := fmt.Sprint(inner[30]); got != "[]" {
+		t.Errorf("carbon-task inner[30]=%s want []", got)
+	}
+	for i, want := range map[int]int{49: 40, 68: 2, 83: 1, 91: 1, 96: 1, 98: 1} {
+		if inner[i] != want {
+			t.Errorf("carbon-task inner[%d]=%v want %d", i, inner[i], want)
+		}
+	}
+	if inner[80] != carbonTask.thinkWire() || inner[79] != 8 {
+		t.Errorf("carbon-task inner[79]=%v inner[80]=%v want 8/%d", inner[79], inner[80], carbonTask.thinkWire())
 	}
 }
 
@@ -1067,7 +1109,8 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 }
 
 // 任务模式（Task Mode）槽位防回归：taskModeSlots 按浏览器 Task Mode 抓包逐槽核对；
-// 普通对话模型不触发、Mode=8（Carbon）仍只走 argonMode8Slots、两块不混用。
+// 普通对话模型（含 Mode=8 的 gemini-4-carbon*）不触发、Mode=8 任务模型
+// （gemini-4-carbon-task）只走 argonMode8Slots、两块不混用。
 //
 // 走真实生产路径：streamGenerateOnce（单轮）与 streamGenerateConv（多轮）都要验，
 // 把假 RoundTripper 钉进 stdlibClientCache + 代理池指向假出口（同 toolgate_test.go
@@ -1076,8 +1119,14 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 // 生产代码删了任务槽位测试照样假绿。
 func TestTaskModeSlots(t *testing.T) {
 	// Models 表项先钉死：表错了后面全是无效功。
+	carbonTask := Models["gemini-4-carbon-task"]
 	neonTask := Models["gemini-4-neon-task"]
 	hydrogenTask := Models["gemini-4-hydrogen-task"]
+	if carbonTask.HexID != hexArgon4 || carbonTask.Mode != 8 || !carbonTask.TaskMode ||
+		carbonTask.ThinkWire != thinkingExtended || carbonTask.Thinking ||
+		carbonTask.thinkWire() != thinkingExtended || carbonTask.Upstream != "4 Carbon" {
+		t.Fatalf("unexpected carbon-task entry: %+v", carbonTask)
+	}
 	if neonTask.HexID != hexNeon4 || neonTask.Mode != 3 || !neonTask.TaskMode ||
 		neonTask.thinkWire() != thinkingExtended || neonTask.Upstream != "4 Neon" {
 		t.Fatalf("unexpected neon-task entry: %+v", neonTask)
@@ -1086,12 +1135,17 @@ func TestTaskModeSlots(t *testing.T) {
 		hydrogenTask.thinkWire() != thinkingExtended || hydrogenTask.Upstream != "4 Hydrogen" {
 		t.Fatalf("unexpected hydrogen-task entry: %+v", hydrogenTask)
 	}
-	// 不注册 -task-thinking 变体。
-	if _, ok := Models["gemini-4-neon-task-thinking"]; ok {
-		t.Fatal("gemini-4-neon-task-thinking must not exist")
+	// 对话模式的 Carbon 三档一律 TaskMode=false。
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-carbon-thinking", "gemini-4-carbon-thinking-medium"} {
+		if mc := Models[name]; mc.TaskMode {
+			t.Fatalf("%s must be chat mode (TaskMode=false), got %+v", name, mc)
+		}
 	}
-	if _, ok := Models["gemini-4-hydrogen-task-thinking"]; ok {
-		t.Fatal("gemini-4-hydrogen-task-thinking must not exist")
+	// 不注册 -task-thinking 变体。
+	for _, name := range []string{"gemini-4-carbon-task-thinking", "gemini-4-neon-task-thinking", "gemini-4-hydrogen-task-thinking"} {
+		if _, ok := Models[name]; ok {
+			t.Fatalf("%s must not exist", name)
+		}
 	}
 
 	// taskModeSlots 块本身的槽位值按抓包逐槽直接断言（与走哪条路径无关的字面值）。
@@ -1239,11 +1293,20 @@ func TestTaskModeSlots(t *testing.T) {
 	}
 
 	taskWant := want{six: "[0]", th30: "[4 27 28 16 19 12]", i49: 40, i68: 1, i80: thinkingExtended, i83: 1, i91: 1, i96: 1, i98: 1}
+	carbonTaskWant := want{six: "[1]", th30: "[]", i49: 40, i68: 2, i80: thinkingExtended, i83: 1, i91: 1, i96: 1, i98: 1}
 	neonWant := want{six: "[0]", th30: "[4]", i49: nil, i68: 1, i80: thinkingNormal, i83: nil, i91: 0, i96: 0, i98: nil}
-	carbonWant := want{six: "[1]", th30: "[]", i49: 40, i68: 2, i80: thinkingNormal, i83: 1, i91: 1, i96: 1, i98: 1}
+	// Mode=8 对话模型：纯普通 inner，无任何任务槽位（inner[49]==nil 是拆分核心）。
+	carbonChatWant := want{six: "[0]", th30: "[4]", i49: nil, i68: 1, i80: thinkingNormal, i83: nil, i91: 0, i96: 0, i98: nil}
+	carbonHighChatWant := carbonChatWant
+	carbonHighChatWant.i80 = thinkingExtended
+	carbonHighChatWant.i96 = 1 // tw!=1 时 inner[96]=1（思考档指示，非任务槽位）
+	carbonMedChatWant := carbonChatWant
+	carbonMedChatWant.i80 = thinkingMedium
+	carbonMedChatWant.i96 = 1
 
-	// respondAs 设成上游对该模型的真实自报：neon-task 任务模式实测自报裸名
-	// "4 Neon"，carbon 收 "4 Carbon"，neon 普通档收 "4 Neon"。
+	// respondAs 设成上游对该模型的真实自报：任务模式实测自报裸名（carbon-task /
+	// neon-task 均被脱后缀回落），carbon 对话档收 "4 Carbon"/"4 Carbon High"/
+	// "4 Carbon Medium"，neon 普通档收 "4 Neon"。
 	type tc struct {
 		name     string
 		respHex  string
@@ -1251,12 +1314,14 @@ func TestTaskModeSlots(t *testing.T) {
 		w        want
 	}
 	cases := []tc{
+		{"gemini-4-carbon-task", hexArgon4, "4 Carbon", carbonTaskWant},
 		{"gemini-4-neon-task", hexNeon4, "4 Neon", taskWant},
 		{"gemini-4-hydrogen-task", hexFlash38, "4 Hydrogen", taskWant},
-		// 普通对话模型（TaskMode=false）：任务槽位一律不落。
+		// 普通对话模型（TaskMode=false）：任务槽位一律不落，Mode=8 对话也发纯普通 inner。
+		{"gemini-4-carbon", hexArgon4, "4 Carbon", carbonChatWant},
+		{"gemini-4-carbon-thinking", hexArgon4, "4 Carbon High", carbonHighChatWant},
+		{"gemini-4-carbon-thinking-medium", hexArgon4, "4 Carbon Medium", carbonMedChatWant},
 		{"gemini-4-neon", hexNeon4, "4 Neon", neonWant},
-		// Mode=8 仍只走 argonMode8Slots（inner[68]=2，两块不混用）。
-		{"gemini-4-carbon", hexArgon4, "4 Carbon", carbonWant},
 	}
 
 	// ── 单轮：streamGenerateOnce ──
@@ -1275,6 +1340,133 @@ func TestTaskModeSlots(t *testing.T) {
 			t.Fatalf("conv %s err=%v", c.name, err)
 		}
 		assert("conv", c.name, waitInner("conv", c.name), c.w)
+	}
+}
+
+// TestCarbonChatNoTaskSlots 是「旧 Carbon Chat 路由误发任务槽位」缺陷的独立回归：
+// 拆分前（main 基线）streamGenerateOnce/streamGenerateConv 对 Mode=8 无条件调
+// argonMode8Slots，gemini-4-carbon 三个 Chat 档的真实请求载荷 inner[49]=40——
+// 那是网页端 Task 模式开关，Chat 请求不该携带。本测试只引用 main 已有的模型名、
+// 函数签名与测试辅助（不碰 gemini-4-carbon-task 表项及任何新增生产符号），拷到
+// main 基线可直接编译、并在 inner[49] 断言处精准 FAIL。
+func TestCarbonChatNoTaskSlots(t *testing.T) {
+	// 传输层见证与 TestTaskModeSlots 同一模式：拦截真实 f.req、解 inner 数组。
+	innerCh := make(chan []any, 8)
+	srvErr := make(chan error, 1)
+	var respondAs struct{ hex, name string }
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := func(status int, body string) *http.Response {
+			return &http.Response{
+				StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header:  http.Header{},
+				Body:    io.NopCloser(strings.NewReader(body)),
+				Request: req,
+			}
+		}
+		switch req.URL.Path {
+		case "/app":
+			return resp(200, `"SNlM0e":"tok-chat:1700000000000","cfb2h":"boq_x_20260101.01_p1"`), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			body, _ := io.ReadAll(req.Body)
+			_ = req.Body.Close()
+			vals, err := url.ParseQuery(string(body))
+			if err != nil {
+				srvErr <- fmt.Errorf("parse request body: %w", err)
+				return resp(400, ""), nil
+			}
+			var outer []any
+			if err := json.Unmarshal([]byte(vals.Get("f.req")), &outer); err != nil || len(outer) < 2 {
+				srvErr <- fmt.Errorf("f.req outer shape bad: %v", vals.Get("f.req"))
+				return resp(400, ""), nil
+			}
+			innerStr, _ := outer[1].(string)
+			var inner []any
+			if err := json.Unmarshal([]byte(innerStr), &inner); err != nil {
+				srvErr <- fmt.Errorf("inner JSON bad: %w", err)
+				return resp(400, ""), nil
+			}
+			if len(inner) != innerSlots {
+				srvErr <- fmt.Errorf("inner len=%d want %d", len(inner), innerSlots)
+				return resp(400, ""), nil
+			}
+			innerCh <- inner
+			// 回一条带内容帧 + 身份槽的响应让生产函数走成功分支。
+			fields := make([]any, 43)
+			fields[1] = []any{"c_chat1", "r_1"}
+			fields[4] = []any{[]any{"rc_x", []any{"carbon chat probe answer padding the frame past the 200-byte textsInLine gate"}}}
+			if respondAs.hex != "" {
+				fields[39] = respondAs.hex
+				fields[42] = respondAs.name
+			}
+			payload, _ := json.Marshal(fields)
+			row, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(payload), nil}})
+			return resp(200, ")]}'\n"+string(row)+"\n"), nil
+		}
+		t.Logf("未命中: %s %s", req.Method, req.URL.String())
+		return resp(404, ""), nil
+	})
+	fakeProxy := fakeUpstreamServer(t, rt)
+
+	seedXSRFAndRetry(t, 1)
+
+	waitInner := func(path, name string) []any {
+		t.Helper()
+		select {
+		case inner := <-innerCh:
+			return inner
+		case err := <-srvErr:
+			t.Fatalf("%s %s: fake upstream error: %v", path, name, err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s %s: no StreamGenerate request reached fake transport", path, name)
+		}
+		return nil
+	}
+
+	convOf := func(acct *CookieAccount) *convState {
+		return &convState{
+			cookie:    acct.Cookie,
+			sapisid:   extractSAPISID(acct.Cookie),
+			isLogin:   true,
+			accountID: acct.ID,
+			authuser:  acct.AuthUser,
+			proxyURL:  fakeProxy,
+		}
+	}
+
+	acct, ok := pickCookieAccount()
+	if !ok {
+		t.Fatal("池里没有号")
+	}
+
+	// Carbon 三个 Chat 档（main 既有表项、TaskMode=false）：真实请求载荷 inner[49]
+	// 必须是 nil——带 40 就是误发任务模式槽位。respName 用各档对话模式合法自报名，
+	// main 基线与拆分后代码都能过身份核验。
+	cases := []struct{ name, respName string }{
+		{"gemini-4-carbon", "4 Carbon"},
+		{"gemini-4-carbon-thinking", "4 Carbon High"},
+		{"gemini-4-carbon-thinking-medium", "4 Carbon Medium"},
+	}
+
+	// ── 单轮：streamGenerateOnce ──
+	for _, c := range cases {
+		respondAs.hex, respondAs.name = hexArgon4, c.respName
+		if _, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"}, Models[c.name], nil, nil, nil, nil, map[int64]bool{}); err != nil {
+			t.Fatalf("once %s err=%v", c.name, err)
+		}
+		if inner := waitInner("once", c.name); inner[49] != nil {
+			t.Errorf("once %s inner[49]=%v want nil (chat mode must not carry task-mode slot 40)", c.name, inner[49])
+		}
+	}
+
+	// ── 多轮：streamGenerateConv ──
+	for _, c := range cases {
+		respondAs.hex, respondAs.name = hexArgon4, c.respName
+		if _, err := streamGenerateConv(context.Background(), "hi", Models[c.name], convOf(acct), nil, nil); err != nil {
+			t.Fatalf("conv %s err=%v", c.name, err)
+		}
+		if inner := waitInner("conv", c.name); inner[49] != nil {
+			t.Errorf("conv %s inner[49]=%v want nil (chat mode must not carry task-mode slot 40)", c.name, inner[49])
+		}
 	}
 }
 
@@ -1336,8 +1528,8 @@ func TestNeonTaskModeIdentity(t *testing.T) {
 		t.Error("readModelCheckedBody(think=2 + 裸 4 Neon) must reject")
 	}
 
-	// 两个任务模型都要登录态。
-	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+	// 三个任务模型都要登录态。
+	for _, name := range []string{"gemini-4-carbon-task", "gemini-4-neon-task", "gemini-4-hydrogen-task"} {
 		if !modelNeedsLogin(Models[name]) {
 			t.Errorf("%s should require login", name)
 		}
@@ -1346,7 +1538,7 @@ func TestNeonTaskModeIdentity(t *testing.T) {
 		}
 	}
 	withPoolCookie(t)
-	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+	for _, name := range []string{"gemini-4-carbon-task", "gemini-4-neon-task", "gemini-4-hydrogen-task"} {
 		if _, ok := availableModels()[name]; !ok {
 			t.Errorf("%s should be available when pool cookie exists", name)
 		}
@@ -1372,9 +1564,61 @@ func TestNeonTaskModeIdentity(t *testing.T) {
 		{"gemini-4-hydrogen-task", "3.6 Flash", true},
 		{"gemini-4-hydrogen-task", "4 Neon", true},
 		{"gemini-4-hydrogen-task", "4 Carbon", true},
+		{"gemini-4-carbon-task", "4 Carbon", false},
+		{"gemini-4-carbon-task", "Gemini 4 Carbon", false},
+		{"gemini-4-carbon-task", "4 Carbon High", false},
+		{"gemini-4-carbon-task", "4 Argon", false},
+		{"gemini-4-carbon-task", "3.5 Flash-Lite", true},
+		{"gemini-4-carbon-task", "3.6 Flash", true},
+		{"gemini-4-carbon-task", "4 Neon", true},
+		{"gemini-4-carbon-task", "4 Hydrogen", true},
 	} {
 		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
 			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
+// gemini-4-carbon-task 身份核验：taskMode=true + hexArgon4 + think=2 时上游实测自报
+// 被脱后缀回落成裸名 "4 Carbon"（与 neon-task 同构）；裸名、"* High" 后缀、Argon 旧名
+// 都收，异族/Flash 降级一律拒。taskMode=false（对话模式）规则不受影响（已由
+// TestArgonCarbonIdentity 覆盖）。
+func TestCarbonTaskModeIdentity(t *testing.T) {
+	carbonTask := Models["gemini-4-carbon-task"]
+	header := buildModelHeader(carbonTask.HexID, carbonTask.Mode, carbonTask.thinkWire(), "uuid-x")
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{"4 Carbon", true},
+		{"Gemini 4 Carbon", true},
+		{"4 Carbon High", true},
+		{"Gemini 4 Carbon High", true},
+		{"4 Argon", true},
+		{"Gemini 4 Argon High", true},
+		{"4 Carbon Medium", false},
+		{"4 Neon", false},
+		{"4 Hydrogen", false},
+		{"3.5 Flash-Lite", false},
+		{"3.6 Flash", false},
+	}
+	for _, c := range cases {
+		for _, id := range []string{hexArgon4, hexFlashLite} {
+			frame := makeSyntheticArgonFrame(id, c.name, "ok")
+			var got []string
+			_, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), func(l string) error {
+				got = append(got, l)
+				return nil
+			}, time.Now(), 200, header, true)
+			if c.ok && (err != nil || len(got) == 0) {
+				t.Errorf("%q id=%s: want pass, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+				t.Errorf("%q id=%s: want mismatch and no output, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if _, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), nil, time.Now(), 200, header, true); (err == nil) != c.ok {
+				t.Errorf("%q id=%s non-stream: ok=%v err=%v", c.name, id, c.ok, err)
+			}
 		}
 	}
 }

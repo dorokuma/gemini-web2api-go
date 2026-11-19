@@ -42,7 +42,8 @@ const (
 	// 4 Neon：otAQ7b 清单里主 hex e6fa609c3fa255c0、短名 Neon、代号 Neon4p0、显示名
 	// "4 Neon"（desc "Deeper analysis"）。Mode=3 路由（mode 决定、hex 被忽略，同 Carbon 的
 	// 实测结论）。付费号专属；think=2/4 分别自报 "4 Neon High"/"4 Neon Medium"，均服务端
-	// 内部思考、不吐思考链。普通 inner 即可，不需要 argonMode8Slots（那套槽位仅 Mode=8）。
+	// 内部思考、不吐思考链。普通 inner 即可，不需要 argonMode8Slots（那套槽位仅
+	// Mode=8 + TaskMode 的 gemini-4-carbon-task）。
 	hexNeon4 = "e6fa609c3fa255c0"
 )
 
@@ -53,10 +54,16 @@ const (
 // —— 模型选择完全由 x-goog-ext-525001261-jspb header 决定，长度不影响。
 const innerSlots = 99
 
-// 4 Carbon（mode 8）：按浏览器 processSession 抓包补齐槽位（protobuf 字段 N == inner[N-1]，
-// 2026-11-09 实测）。不补的话付费号上请求会挂起没有回应。BotGuard 槽位 inner[3]/[4] 留空。
-// inner[96] 按抓包恒为 1：mode-8 请求服务端要求该槽为 1，与思考档位无关。
-// 仅 Mode==8 触发——4 Neon（Mode=3）实测用普通 inner 即 HTTP 200，不得对它补这些槽位。
+// 4 Carbon 任务模式（mc.TaskMode && Mode==8，即 gemini-4-carbon-task）：按浏览器
+// processSession 的 Task 模式抓包补齐槽位（protobuf 字段 N == inner[N-1]，2026-11-09 实测）。
+// 这是网页端「任务」（Task）模式开关对应的协议槽位（inner[49]=40 等），**不是** mode-8
+// 通用槽位：Mode=8 的普通对话实测走**纯普通 Chat inner**（不补这套槽位）即 HTTP 200，
+// 三档思考各自准确自报 "4 Carbon"/"4 Carbon High"/"4 Carbon Medium"（2026-11-19 两轮
+// 22 次探测）；补了这套槽位的 Mode=8 请求则是 Task 模式，think=2/4 自报被上游脱后缀回落
+// 成裸名 "4 Carbon"。不补任务槽位的话付费号上 Task 模式请求会挂起没有回应。
+// BotGuard 槽位 inner[3]/[4] 留空。inner[96] 按抓包恒为 1。
+// 仅 mc.TaskMode && Mode==8 时触发——Mode=8 对话模型与其它任务模型（Mode!=8 走
+// taskModeSlots）都不得对它补这些槽位。
 // 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用，两条路径发的 inner 必须一致。
 func argonMode8Slots(inner []interface{}) {
 	inner[6] = []interface{}{1}
@@ -72,7 +79,8 @@ func argonMode8Slots(inner []interface{}) {
 // taskModeSlots 是 Gemini Web 网页端「任务」（Task）模式实测抓包的槽位补齐
 // （protobuf 字段 N == inner[N-1]，槽位值取自浏览器 Task Mode 抓包）。
 // inner[49]=40 是任务模式开关（媒体工具的 inner[49] 取值 2/11/14/21 互不冲突）。
-// 仅 mc.TaskMode && Mode!=8 时调用——Mode=8（Carbon）走 argonMode8Slots，两块不得混用。
+// 仅 mc.TaskMode && Mode!=8 时调用——Mode==8 的任务模式（gemini-4-carbon-task）走
+// argonMode8Slots，两块不得混用。
 // 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用，两条路径发的 inner 必须一致。
 func taskModeSlots(inner []interface{}) {
 	inner[6] = []interface{}{0}
@@ -115,8 +123,9 @@ type ModelConfig struct {
 	// 推出的 1/2。用于 4 Carbon「中等」档（=thinkingMedium=4）。两者都不设 = 普通(1)。
 	ThinkWire int
 	// TaskMode 对应 Gemini Web 网页端「任务」（Task）模式开关：为 true 时按实测
-	// 抓包补 taskModeSlots 槽位（含 inner[49]=40）。与对话模式分离的独立模型
-	// （gemini-4-neon-task / gemini-4-hydrogen-task），Mode==8 不适用。
+	// 抓包补任务槽位（Mode==8 走 argonMode8Slots，Mode!=8 走 taskModeSlots，均含
+	// inner[49]=40）。与对话模式分离的独立模型（gemini-4-carbon-task /
+	// gemini-4-neon-task / gemini-4-hydrogen-task）。
 	TaskMode bool
 	// Tool 非 0 时填 inner[49]，让服务端换后端模型生成媒体产物（14=生图 Nano Banana
 	// / 21=音乐 Lyria）。产物不在 StreamGenerate 响应里，要再走 hNvQHb 拿下载链、
@@ -176,12 +185,21 @@ var Models = map[string]ModelConfig{
 	"gemini-4-hydrogen": {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", Desc: "4 Hydrogen (Everyday help, replaced 3.8 Flash on same slot); needs a signed-in Google account"},
 	// 4 Carbon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
 	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
+	// 对话模式走**纯普通 Chat inner**（不再补 argonMode8Slots）：实测 think=1/2/4 均
+	// HTTP 200、分别准确自报 "4 Carbon"/"4 Carbon High"/"4 Carbon Medium"；补了
+	// argonMode8Slots（inner[49]=40）的 Mode=8 请求实为网页端 Task 模式，由
+	// gemini-4-carbon-task 承接。
 	"gemini-4-carbon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Carbon", Desc: "4 Carbon (renamed 4 Argon, same slot); needs a signed-in PAID/Ultra Google account"},
 	// 4 Neon：Mode=3 路由（hexNeon4 注释）。上游实测 think=1/2/4 均 HTTP 200、自报
 	// "4 Neon"/"4 Neon High"/"4 Neon Medium"。付费号专属，gate 成要 cookie。
 	"gemini-4-neon": {HexID: hexNeon4, Mode: 3, Upstream: "4 Neon", Desc: "4 Neon (deeper analysis); needs a signed-in PAID/Ultra Google account"},
-	// 任务模式（Task Mode）：与对话模式分离的独立模型，走 taskModeSlots 槽位
-	// （含 inner[49]=40）。不注册 -task-thinking 变体，让下游插件天然以独立模型呈现。
+	// 任务模式（Task Mode）：与对话模式分离的独立模型，走任务槽位（Mode==8 走
+	// argonMode8Slots、其余走 taskModeSlots，均含 inner[49]=40）。不注册 -task-thinking
+	// 变体，让下游插件天然以独立模型呈现。
+	// gemini-4-carbon-task：hexArgon4 / Mode=8 + think=2 + argonMode8Slots。实测该组合是
+	// 网页端 Task 模式（think=2/4 自报均被脱后缀回落为裸名 "4 Carbon"），与 neon-task
+	// 同构；身份核验按 taskMode 放行裸名/High 名两套。ThinkWire=thinkingExtended 固定走高档线值。
+	"gemini-4-carbon-task": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingExtended, TaskMode: true, Upstream: "4 Carbon", Desc: "4 Carbon task mode (web Task switch; separate from chat mode); needs a signed-in PAID/Ultra Google account"},
 	// gemini-4-neon-task：hexNeon4 / Mode=3 + think=2 + inner[49]=40 时上游实测自报
 	// 裸名 "4 Neon"（而非对话模式 think=2 的 "4 Neon High"），argon.go 身份核验按
 	// taskMode 放行裸名/High 名两套。ThinkWire=thinkingExtended 固定走高档线值。
@@ -200,10 +218,12 @@ var Models = map[string]ModelConfig{
 	"gemini-3.7-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
 	"gemini-3.8-flash-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "3.8 Flash", Desc: "3.8 Flash at the Medium thinking tier; needs a signed-in Google account"},
 	// 4 Carbon + 扩展思考：Mode=8 + inner[80]=2（上游现在把这档叫 "High"）。
-	// 实测回报带思考链（走既有 [4][0][37][0][0] 路径，无需改抽取代码）→ reasoning_content。
+	// 对话模式实测自报 "4 Carbon High"（滚动期也收裸名 "4 Carbon"，见 argon.go）。
+	// Thinking=true 使 thinkWire()==2（高档线值）——ThinkWire 不设时靠它推档，必须保留。
 	"gemini-4-carbon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Carbon", Desc: "4 Carbon with extended thinking (High tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
-	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
-	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
+	// 中档：think 线值 4（高档是 2），对话模式实测自报 "4 Carbon Medium"。中档思考在
+	// 服务端内部完成、不吐思考链，所以不设 Thinking（不期望 reasoning_content），
+	// 登录门控靠 hexArgon4 + thinkWire。
 	"gemini-4-carbon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Carbon", Desc: "4 Carbon at the Medium thinking tier; needs a signed-in PAID/Ultra account"},
 	// 4 Neon + 思考档：Mode=3（选 Neon），高档 think 线值 2、自报 "4 Neon High"，中档
 	// thinkingMedium=4、自报 "4 Neon Medium"。实测三档都不吐思考链——思考在服务端内部
@@ -776,13 +796,16 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	if tw != thinkingNormal {
 		inner[96] = 1
 	}
-	if mc.Mode == 8 {
-		argonMode8Slots(inner)
-	}
-	// 任务模式槽位（非 Mode=8）：先于 Tool 写入，TaskMode 与 Tool 互斥
-	// （任务模型不设 Tool），若两者同设显式 Tool 仍优先。
-	if mc.TaskMode && mc.Mode != 8 {
-		taskModeSlots(inner)
+	// 任务模式槽位：仅 mc.TaskMode 触发——Mode==8（gemini-4-carbon-task）走
+	// argonMode8Slots，Mode!=8 走 taskModeSlots；对话模型（含 gemini-4-carbon*）
+	// 一律发纯普通 inner。先于 Tool 写入，TaskMode 与 Tool 互斥（任务模型不设 Tool），
+	// 若两者同设显式 Tool 仍优先。
+	if mc.TaskMode {
+		if mc.Mode == 8 {
+			argonMode8Slots(inner)
+		} else {
+			taskModeSlots(inner)
+		}
 	}
 	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
 	if mc.Tool > 0 {
@@ -1242,8 +1265,9 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	return doGeminiRequestStop(context.Background(), endpoint, body, headers, proxyURL, onLine, nil)
 }
 
-// doGeminiRequestStopMode 同 doGeminiRequestStop，另带 taskMode：hexNeon4 + 任务模式
-// 时上游自报裸名 "4 Neon"，身份核验的合法名集合跟对话模式不同（见 argon.go）。
+// doGeminiRequestStopMode 同 doGeminiRequestStop，另带 taskMode：任务模式下
+// hexNeon4 上游自报裸名 "4 Neon"、hexArgon4 上游自报被脱后缀成裸名 "4 Carbon"，
+// 身份核验的合法名集合跟对话模式不同（见 argon.go）。
 func doGeminiRequestStopMode(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error, stop *atomic.Bool, taskMode bool) (int, []byte, int64, []string, error) {
 	return doGeminiRequestStopInner(ctx, endpoint, body, headers, proxyURL, onLine, stop, taskMode)

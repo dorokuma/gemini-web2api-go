@@ -314,12 +314,14 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	if tw != thinkingNormal {
 		inner[96] = 1
 	}
-	if mc.Mode == 8 {
-		argonMode8Slots(inner)
-	}
-	// 任务模式槽位（非 Mode=8），与 streamGenerateOnce 同一补齐块。
-	if mc.TaskMode && mc.Mode != 8 {
-		taskModeSlots(inner)
+	// 任务模式槽位：仅 mc.TaskMode 触发，与 streamGenerateOnce 同一套路由——
+	// Mode==8 走 argonMode8Slots，Mode!=8 走 taskModeSlots；对话模型发纯普通 inner。
+	if mc.TaskMode {
+		if mc.Mode == 8 {
+			argonMode8Slots(inner)
+		} else {
+			taskModeSlots(inner)
+		}
 	}
 
 	innerJSON, _ := json.Marshal(inner)

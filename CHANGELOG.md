@@ -4,6 +4,32 @@
 
 ## Unreleased
 
+## 6.2.0
+
+### 变更
+
+- **4 Carbon 对话模式与任务模式彻底分离**（与 `gemini-4-neon` / `gemini-4-hydrogen`
+  两家族架构对称统一）：
+  - `gemini-4-carbon` / `gemini-4-carbon-thinking` / `gemini-4-carbon-thinking-medium`
+    改为纯普通对话模式（`TaskMode: false`）：不再对 `mc.Mode == 8` 默认补
+    `argonMode8Slots`（`inner[49]=40` 等），走纯普通 Chat inner。2026-11-19 两轮
+    22 次上游实测证实：纯普通 inner 的 Mode=8 请求 think=1/2/4 均 HTTP 200、分别
+    准确自报 `"4 Carbon"` / `"4 Carbon High"` / `"4 Carbon Medium"`（原补槽位请求
+    实为网页端 Task 模式，自报被脱后缀回落成裸名）。
+  - 新增 `gemini-4-carbon-task`：`hexArgon4` / `Mode=8` + `think=2` + `TaskMode`，
+    单轮与多轮路径统一按 `mc.TaskMode` 路由——`Mode==8` 任务模型走
+    `argonMode8Slots`，`Mode!=8` 继续走 `taskModeSlots`，两者不混用；不注册
+    `-task-thinking` 变体（与 `gemini-4-neon-task` / `gemini-4-hydrogen-task`
+    保持完全一致）。
+  - `argon.go` 身份核验：`argonDisplayNamesMode` 任务模式下对 `hexArgon4` 放行
+    裸名 `"4 Carbon"`、`"* High"` 后缀与 `"4 Argon"` 旧名（实测 Task 模式自报均被
+    脱后缀）；对话模式核验规则逐字不变。
+  - `modelNeedsLogin` / `strict_model` 降级判定覆盖 `gemini-4-carbon-task`
+    （同 hexArgon4 槽位，付费/Ultra 号专属；无 cookie 时不暴露）。
+  - **行为影响**：原先走补槽位 Mode=8 的 `gemini-4-carbon*` 请求实为 Task 模式；
+    需要原行为的客户端改用 `gemini-4-carbon-task`，对话模型现在获得真正的
+    Chat 模式（三档各自准确自报，`gemini-4-carbon-thinking` 回报 `"4 Carbon High"`）。
+
 ## 6.1.0
 
 ### 新增

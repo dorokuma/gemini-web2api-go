@@ -52,9 +52,10 @@ func TestArgonTimingProbe(t *testing.T) {
 	if os.Getenv("ARGON_PROBE_CATALOG_ONLY") == "1" {
 		return
 	}
-	// 与 streamGenerateOnce/streamGenerateConv 同一套拼法：innerSlots 定长 + Mode=8
-	// 走 argonMode8Slots 补齐槽位（含 inner[96]=1，与思考档无关）。inner[45] 由
-	// temporary_chat 开关决定，探针默认配置开着临时对话，保持 inner[45]=1 不变。
+	// 与 streamGenerateOnce/streamGenerateConv 同一套拼法：gemini-4-carbon 是对话模式
+	// （TaskMode=false），走**纯普通 Chat inner**（不补 argonMode8Slots，实测三档均
+	// HTTP 200 且准确自报）；inner[45] 由 temporary_chat 开关决定，探针默认配置开着
+	// 临时对话，保持 inner[45]=1 不变。任务槽位由 gemini-4-carbon-task 承接。
 	carbon := Models["gemini-4-carbon"]
 	inner := make([]any, innerSlots)
 	inner[0] = []any{"Explain how rain forms in 12 short numbered sentences. Begin directly with sentence 1.", 0, nil, nil, nil, nil, 0}
@@ -78,8 +79,12 @@ func TestArgonTimingProbe(t *testing.T) {
 	inner[80] = carbon.thinkWire()
 	inner[91] = 0
 	inner[96] = 0
-	if carbon.Mode == 8 {
-		argonMode8Slots(inner)
+	if carbon.TaskMode {
+		if carbon.Mode == 8 {
+			argonMode8Slots(inner)
+		} else {
+			taskModeSlots(inner)
+		}
 	}
 	ib, _ := json.Marshal(inner)
 	outer, _ := json.Marshal([]any{nil, string(ib)})
