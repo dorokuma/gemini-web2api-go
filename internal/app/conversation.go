@@ -317,6 +317,10 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	if mc.Mode == 8 {
 		argonMode8Slots(inner)
 	}
+	// 任务模式槽位（非 Mode=8），与 streamGenerateOnce 同一补齐块。
+	if mc.TaskMode && mc.Mode != 8 {
+		taskModeSlots(inner)
+	}
 
 	innerJSON, _ := json.Marshal(inner)
 	outerJSON, _ := json.Marshal([]interface{}{nil, string(innerJSON)})
@@ -384,7 +388,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		}
 		// 同 streamGenerateOnce：每轮先清上一轮现场，防帧数污染最后一轮。
 		lastDiag = upstreamDiagMeta{}
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil)
+		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil, mc.TaskMode)
 		if len(raw) > 0 {
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
 		}

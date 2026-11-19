@@ -1066,6 +1066,193 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 	}
 }
 
+// 任务模式（Task Mode）槽位防回归：taskModeSlots 按浏览器 Task Mode 抓包逐槽核对；
+// 普通对话模型不触发、Mode=8（Carbon）仍只走 argonMode8Slots、两块不混用。
+func TestTaskModeSlots(t *testing.T) {
+	neonTask := Models["gemini-4-neon-task"]
+	hydrogenTask := Models["gemini-4-hydrogen-task"]
+	if neonTask.HexID != hexNeon4 || neonTask.Mode != 3 || !neonTask.TaskMode ||
+		neonTask.thinkWire() != thinkingExtended || neonTask.Upstream != "4 Neon" {
+		t.Fatalf("unexpected neon-task entry: %+v", neonTask)
+	}
+	if hydrogenTask.HexID != hexFlash38 || hydrogenTask.Mode != 1 || !hydrogenTask.TaskMode ||
+		hydrogenTask.thinkWire() != thinkingExtended || hydrogenTask.Upstream != "4 Hydrogen" {
+		t.Fatalf("unexpected hydrogen-task entry: %+v", hydrogenTask)
+	}
+	// 不注册 -task-thinking 变体。
+	if _, ok := Models["gemini-4-neon-task-thinking"]; ok {
+		t.Fatal("gemini-4-neon-task-thinking must not exist")
+	}
+	if _, ok := Models["gemini-4-hydrogen-task-thinking"]; ok {
+		t.Fatal("gemini-4-hydrogen-task-thinking must not exist")
+	}
+
+	build := func(mc ModelConfig) []any {
+		inner := make([]any, innerSlots)
+		inner[6] = []any{0}
+		inner[30] = []any{4}
+		inner[68] = 1
+		inner[79] = mc.Mode
+		inner[80] = mc.thinkWire()
+		inner[91] = 0
+		inner[96] = 0
+		if tw := mc.thinkWire(); tw != thinkingNormal {
+			inner[96] = 1
+		}
+		if mc.Mode == 8 {
+			argonMode8Slots(inner)
+		}
+		if mc.TaskMode && mc.Mode != 8 {
+			taskModeSlots(inner)
+		}
+		if mc.Tool > 0 {
+			inner[49] = mc.Tool
+		}
+		return inner
+	}
+
+	// TaskMode=true：逐槽核对抓包值，inner[80] 保持 think 线值不被覆盖。
+	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+		inner := build(Models[name])
+		if got := fmt.Sprint(inner[6]); got != "[0]" {
+			t.Errorf("%s inner[6]=%s want [0]", name, got)
+		}
+		if got := fmt.Sprint(inner[30]); got != "[4 27 28 16 19 12]" {
+			t.Errorf("%s inner[30]=%s want [4 27 28 16 19 12]", name, got)
+		}
+		for i, want := range map[int]int{49: 40, 68: 1, 83: 1, 91: 1, 96: 1, 98: 1} {
+			if inner[i] != want {
+				t.Errorf("%s inner[%d]=%v want %d", name, i, inner[i], want)
+			}
+		}
+		if inner[80] != thinkingExtended {
+			t.Errorf("%s inner[80]=%v want %d（taskModeSlots 不得改思考槽）", name, inner[80], thinkingExtended)
+		}
+	}
+
+	// TaskMode=false 的普通对话模型：补齐槽位一律不落。
+	for _, name := range []string{"gemini-4-neon", "gemini-4-neon-thinking", "gemini-4-hydrogen"} {
+		inner := build(Models[name])
+		if inner[49] != nil || inner[83] != nil || inner[98] != nil {
+			t.Errorf("%s 非任务模型不应含任务槽位: [49]=%v [83]=%v [98]=%v", name, inner[49], inner[83], inner[98])
+		}
+	}
+
+	// Mode=8 仍只走 argonMode8Slots：inner[68]=2（任务模式为 1），两块不混用。
+	carbon := Models["gemini-4-carbon"]
+	inner := build(carbon)
+	if inner[68] != 2 || inner[49] != 40 {
+		t.Errorf("carbon inner[68]=%v inner[49]=%v want 2/40", inner[68], inner[49])
+	}
+	// TaskMode 与 Mode=8 同设（防御）：Mode=8 优先，不叠任务槽。
+	weird := ModelConfig{HexID: hexArgon4, Mode: 8, TaskMode: true}
+	inner = build(weird)
+	if inner[68] != 2 {
+		t.Errorf("Mode=8+TaskMode inner[68]=%v want 2（argonMode8Slots 优先）", inner[68])
+	}
+}
+
+// gemini-4-neon-task 身份核验：taskMode=true + hexNeon4 + think=2 收裸名 "4 Neon"
+// 与 "4 Neon High"（未来上游恢复后缀仍兼容），拒异族/错档自报；
+// taskMode=false（对话模式）同 hex + think=2 仍只认 High 名，绝不放宽。
+func TestNeonTaskModeIdentity(t *testing.T) {
+	neonTask := Models["gemini-4-neon-task"]
+	header := buildModelHeader(neonTask.HexID, neonTask.Mode, neonTask.thinkWire(), "uuid-x")
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{"4 Neon", true},
+		{"Gemini 4 Neon", true},
+		{"4 Neon High", true},
+		{"Gemini 4 Neon High", true},
+		{"4 Neon Medium", false},
+		{"4 Carbon", false},
+		{"4 Argon", false},
+		{"4 Hydrogen", false},
+		{"3.5 Flash-Lite", false},
+		{"3.6 Flash", false},
+	}
+	for _, c := range cases {
+		for _, id := range []string{hexNeon4, hexFlashLite} {
+			frame := makeSyntheticArgonFrame(id, c.name, "ok")
+			var got []string
+			_, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), func(l string) error {
+				got = append(got, l)
+				return nil
+			}, time.Now(), 200, header, true)
+			if c.ok && (err != nil || len(got) == 0) {
+				t.Errorf("%q id=%s: want pass, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+				t.Errorf("%q id=%s: want mismatch and no output, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if _, _, err := readModelCheckedBodyMode(bytes.NewReader(frame), nil, time.Now(), 200, header, true); (err == nil) != c.ok {
+				t.Errorf("%q id=%s non-stream: ok=%v err=%v", c.name, id, c.ok, err)
+			}
+		}
+	}
+
+	// taskMode=false + hexNeon4 + think=2：仍拒裸 "4 Neon"（对话模式规则不回归）。
+	neonHigh := Models["gemini-4-neon-thinking"]
+	highHeader := buildModelHeader(neonHigh.HexID, neonHigh.Mode, neonHigh.thinkWire(), "uuid-x")
+	bareFrame := makeSyntheticArgonFrame(hexNeon4, "4 Neon", "ok")
+	var got []string
+	_, _, err := readModelCheckedBodyMode(bytes.NewReader(bareFrame), func(l string) error {
+		got = append(got, l)
+		return nil
+	}, time.Now(), 200, highHeader, false)
+	if err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0 {
+		t.Errorf("taskMode=false think=2 + 裸 4 Neon: want mismatch and no output, err=%v lines=%d", err, len(got))
+	}
+	// 原入口 readModelCheckedBody（taskMode=false 薄封装）同样拒。
+	if _, _, err := readModelCheckedBody(bytes.NewReader(bareFrame), nil, time.Now(), 200, highHeader); err == nil {
+		t.Error("readModelCheckedBody(think=2 + 裸 4 Neon) must reject")
+	}
+
+	// 两个任务模型都要登录态。
+	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+		if !modelNeedsLogin(Models[name]) {
+			t.Errorf("%s should require login", name)
+		}
+		if _, ok := availableModels()[name]; ok {
+			t.Errorf("%s should not be available without cookie", name)
+		}
+	}
+	withPoolCookie(t)
+	for _, name := range []string{"gemini-4-neon-task", "gemini-4-hydrogen-task"} {
+		if _, ok := availableModels()[name]; !ok {
+			t.Errorf("%s should be available when pool cookie exists", name)
+		}
+	}
+
+	// strict_model：任务模型按登记的 Upstream 判降级——自报 "4 Neon"/"4 Hydrogen"
+	// 通过，掉到 Flash 族/异族正确识别为降级。
+	setStrictModel(t, true)
+	for _, c := range []struct {
+		model, reported string
+		want            bool
+	}{
+		{"gemini-4-neon-task", "4 Neon", false},
+		{"gemini-4-neon-task", "Gemini 4 Neon", false},
+		{"gemini-4-neon-task", "4 Neon High", false},
+		{"gemini-4-neon-task", "3.5 Flash-Lite", true},
+		{"gemini-4-neon-task", "3.6 Flash", true},
+		{"gemini-4-neon-task", "4 Carbon", true},
+		{"gemini-4-neon-task", "4 Hydrogen", true},
+		{"gemini-4-hydrogen-task", "4 Hydrogen", false},
+		{"gemini-4-hydrogen-task", "Gemini 4 Hydrogen", false},
+		{"gemini-4-hydrogen-task", "3.5 Flash-Lite", true},
+		{"gemini-4-hydrogen-task", "3.6 Flash", true},
+		{"gemini-4-hydrogen-task", "4 Neon", true},
+		{"gemini-4-hydrogen-task", "4 Carbon", true},
+	} {
+		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
+			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

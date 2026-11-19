@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+### 新增
+
+- **对话模式与任务模式分离（方案一）**：新增 `gemini-4-neon-task` 与
+  `gemini-4-hydrogen-task` 两个独立任务模式模型（对应 Gemini Web 网页端「任务」开关），
+  现有对话模式模型行为完全不变。
+  - `ModelConfig` 新增 `TaskMode` 字段；`taskModeSlots` 按浏览器 Task Mode 抓包
+    补齐槽位（`inner[6]=[0]`、`inner[30]=[4,27,28,16,19,12]`、`inner[49]=40`、
+    `inner[68]=1`、`inner[83]=1`、`inner[91]=1`、`inner[96]=1`、`inner[98]=1`），
+    单轮与多轮路径同用；`Mode==8`（Carbon）仍走 `argonMode8Slots`，两者互斥不混用。
+  - `gemini-4-neon-task`：`hexNeon4` / `Mode=3` + `think=2` + 任务槽位，上游实测自报
+    裸名 `"4 Neon"`；`argon.go` 身份核验新增 `taskMode` 参数，任务模式下放行
+    `"4 Neon"` / `"4 Neon High"` 两套名字，`taskMode=false` 时对话模式规则逐字不变
+    （`think=2` 仍只认 `"4 Neon High"`）。
+  - `gemini-4-hydrogen-task`：`hexFlash38` / `Mode=1` + `think=2` + 任务槽位，
+    `Upstream` 登记 `"4 Hydrogen"`，降级检测走 `strict_model`。
+  - `modelNeedsLogin` 覆盖 `TaskMode`：任务模式为账号功能，无 cookie 时两个新模型
+    均不暴露。
+
 ## 6.0.1
 
 ### 修复

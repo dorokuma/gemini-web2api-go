@@ -389,6 +389,8 @@ of which 3.6 Flash / 3.5 Flash-Lite / 3.1 Pro work with a free account and 3.8 F
 | `gemini-4-carbon-thinking-medium` | 4 Carbon at the Medium thinking tier (thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
 | `gemini-4-neon-thinking` | 4 Neon at the High thinking tier (upstream reports "4 Neon High"; thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
 | `gemini-4-neon-thinking-medium` | 4 Neon at the Medium thinking tier (upstream reports "4 Neon Medium"; thinks server-side, no `reasoning_content`); **needs a PAID/Ultra account cookie** |
+| `gemini-4-neon-task` | 4 Neon in task mode (the web "Task" switch, a separate model from chat mode); **needs a PAID/Ultra account cookie** |
+| `gemini-4-hydrogen-task` | 4 Hydrogen in task mode (the web "Task" switch, a separate model from chat mode); **needs a paid-account cookie** |
 | `gemini-image` | Image generation (Nano Banana); base64 output; **needs a cookie** |
 | `gemini-music` | Music (Lyria, ~30s); base64 output; **needs a cookie** |
 | `gemini-canvas` | Canvas: generates an interactive HTML document (returned inline as a ```html block); **needs a cookie** |
@@ -399,6 +401,8 @@ Without a cookie, `/v1/models` returns only the first two, and asking for `gemin
 With a valid cookie it really is Pro: six consecutive calls all had the backend report `3.1 Pro` itself.
 
 The `-thinking` variants are the web UI's "extended thinking" switch, orthogonal to the model, not extra models. The backend then reports a `High` suffix (e.g. `3.1 Pro High`; earlier upstream called it `Extended`). **Only effective when signed in**: anonymous requests have the switch silently ignored, so they aren't exposed without a cookie.
+
+The `-task` variants are the web "Task" mode as separate models, fully decoupled from chat mode: task mode uses its own protocol slots (`inner[49]=40`, etc.) rather than a thinking tier of the chat models. Both `gemini-4-neon-task` and `gemini-4-hydrogen-task` **require a signed-in cookie** (task mode is an account feature and isn't exposed without one).
 
 The old names `gemini-3.5-flash`, `gemini-3.5-flash-thinking`, `gemini-3.5-flash-thinking-lite`, `gemini-auto` and `gemini-flash-lite` were **removed** (they now return 400): the backend has no entries for them, and keeping them only suggested there were five distinct models to choose from.
 

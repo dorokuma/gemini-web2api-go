@@ -69,6 +69,22 @@ func argonMode8Slots(inner []interface{}) {
 	inner[98] = 1
 }
 
+// taskModeSlots 是 Gemini Web 网页端「任务」（Task）模式实测抓包的槽位补齐
+// （protobuf 字段 N == inner[N-1]，槽位值取自浏览器 Task Mode 抓包）。
+// inner[49]=40 是任务模式开关（媒体工具的 inner[49] 取值 2/11/14/21 互不冲突）。
+// 仅 mc.TaskMode && Mode!=8 时调用——Mode=8（Carbon）走 argonMode8Slots，两块不得混用。
+// 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用，两条路径发的 inner 必须一致。
+func taskModeSlots(inner []interface{}) {
+	inner[6] = []interface{}{0}
+	inner[30] = []interface{}{4, 27, 28, 16, 19, 12}
+	inner[49] = 40
+	inner[68] = 1
+	inner[83] = 1
+	inner[91] = 1
+	inner[96] = 1
+	inner[98] = 1
+}
+
 // inner[80] / 模型 header 下标 15 的取值：1=普通，2=扩展思考。
 //
 // **只在登录态生效**：匿名请求带上它服务端静默忽略，回报的仍是普通模型、思考链 0
@@ -98,6 +114,10 @@ type ModelConfig struct {
 	// ThinkWire >0 时直接作为思考档线值（header 下标15 / inner[80]），覆盖 Thinking
 	// 推出的 1/2。用于 4 Carbon「中等」档（=thinkingMedium=4）。两者都不设 = 普通(1)。
 	ThinkWire int
+	// TaskMode 对应 Gemini Web 网页端「任务」（Task）模式开关：为 true 时按实测
+	// 抓包补 taskModeSlots 槽位（含 inner[49]=40）。与对话模式分离的独立模型
+	// （gemini-4-neon-task / gemini-4-hydrogen-task），Mode==8 不适用。
+	TaskMode bool
 	// Tool 非 0 时填 inner[49]，让服务端换后端模型生成媒体产物（14=生图 Nano Banana
 	// / 21=音乐 Lyria）。产物不在 StreamGenerate 响应里，要再走 hNvQHb 拿下载链、
 	// 用下载 host 认的 cookie 子集下回原始字节，见 media.go。跟登录态绑定：匿名请求
@@ -160,6 +180,16 @@ var Models = map[string]ModelConfig{
 	// 4 Neon：Mode=3 路由（hexNeon4 注释）。上游实测 think=1/2/4 均 HTTP 200、自报
 	// "4 Neon"/"4 Neon High"/"4 Neon Medium"。付费号专属，gate 成要 cookie。
 	"gemini-4-neon": {HexID: hexNeon4, Mode: 3, Upstream: "4 Neon", Desc: "4 Neon (deeper analysis); needs a signed-in PAID/Ultra Google account"},
+	// 任务模式（Task Mode）：与对话模式分离的独立模型，走 taskModeSlots 槽位
+	// （含 inner[49]=40）。不注册 -task-thinking 变体，让下游插件天然以独立模型呈现。
+	// gemini-4-neon-task：hexNeon4 / Mode=3 + think=2 + inner[49]=40 时上游实测自报
+	// 裸名 "4 Neon"（而非对话模式 think=2 的 "4 Neon High"），argon.go 身份核验按
+	// taskMode 放行裸名/High 名两套。ThinkWire=thinkingExtended 固定走高档线值。
+	"gemini-4-neon-task": {HexID: hexNeon4, Mode: 3, ThinkWire: thinkingExtended, TaskMode: true, Upstream: "4 Neon", Desc: "4 Neon task mode (web Task switch; separate from chat mode); needs a signed-in PAID/Ultra Google account"},
+	// gemini-4-hydrogen-task：hexFlash38 / Mode=1 + think=2 + 任务模式槽位。
+	// hexFlash38 槽位不在 argon 强身份核验集合（非 hexArgon4/hexNeon4），降级检测靠
+	// strict_model（Upstream "4 Hydrogen"）。
+	"gemini-4-hydrogen-task": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingExtended, TaskMode: true, Upstream: "4 Hydrogen", Desc: "4 Hydrogen task mode (web Task switch; separate from chat mode); needs a signed-in Google account"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
@@ -205,11 +235,12 @@ func hasCookie() bool {
 // "Are you signed in?" 文本。是「没 cookie 时排除哪些模型」和「#20 匿名优先要不要
 // 占一个 cookie 账号」共用的单一判据。
 //
-// 按 HexID + Thinking + Tool 判，跟旧的按模型名（3.1-pro/3.8-flash/3.7-flash）判
-// 逐模型核对等价：那三个正名的 HexID 就是 hexPro31 / hexFlash38，其余登录模型都被
-// Thinking 或 Tool 覆盖。
+// 按 HexID + Thinking + ThinkWire + TaskMode + Tool 判，跟旧的按模型名
+// （3.1-pro/3.8-flash/3.7-flash）判逐模型核对等价：那三个正名的 HexID 就是
+// hexPro31 / hexFlash38，其余登录模型都被 Thinking / ThinkWire / Tool 覆盖。
+// TaskMode 本身必须登录（任务模式是账号功能），冗余列入不影响既有模型。
 func modelNeedsLogin(mc ModelConfig) bool {
-	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.HexID == hexNeon4 || mc.Thinking || mc.ThinkWire > 0 || mc.Tool > 0
+	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.HexID == hexNeon4 || mc.Thinking || mc.ThinkWire > 0 || mc.Tool > 0 || mc.TaskMode
 }
 
 // anonFirstEligible 判断「匿名优先」开关下这次请求能不能走匿名（不占 cookie 账号）：
@@ -748,6 +779,11 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	if mc.Mode == 8 {
 		argonMode8Slots(inner)
 	}
+	// 任务模式槽位（非 Mode=8）：先于 Tool 写入，TaskMode 与 Tool 互斥
+	// （任务模型不设 Tool），若两者同设显式 Tool 仍优先。
+	if mc.TaskMode && mc.Mode != 8 {
+		taskModeSlots(inner)
+	}
 	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
 	if mc.Tool > 0 {
 		inner[49] = mc.Tool
@@ -857,7 +893,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			wcReq.Cookie = cookieStr
 			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lh.cb)
 		} else {
-			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStop(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop)
+			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop, mc.TaskMode)
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
@@ -1206,6 +1242,13 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	return doGeminiRequestStop(context.Background(), endpoint, body, headers, proxyURL, onLine, nil)
 }
 
+// doGeminiRequestStopMode 同 doGeminiRequestStop，另带 taskMode：hexNeon4 + 任务模式
+// 时上游自报裸名 "4 Neon"，身份核验的合法名集合跟对话模式不同（见 argon.go）。
+func doGeminiRequestStopMode(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
+	onLine func(string) error, stop *atomic.Bool, taskMode bool) (int, []byte, int64, []string, error) {
+	return doGeminiRequestStopInner(ctx, endpoint, body, headers, proxyURL, onLine, stop, taskMode)
+}
+
 // sleepCtx 等 d；ctx 先结束就提前返回它的错误。
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -1313,8 +1356,14 @@ func (h heardReader) Read(p []byte) (int, error) {
 
 // doGeminiRequestStop 同 doGeminiRequest，stop 置位后提前结束读取（见 stopReader），
 // ctx 结束时中止连接和读取。整次请求不限时，上游沉默超过 stallLimit 才放弃（见 stallWatch）。
+// 签名保持原样（taskMode=false）：对话模式与既有探针/测试调用不变。
 func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error, stop *atomic.Bool) (int, []byte, int64, []string, error) {
+	return doGeminiRequestStopInner(ctx, endpoint, body, headers, proxyURL, onLine, stop, false)
+}
+
+func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
+	onLine func(string) error, stop *atomic.Bool, taskMode bool) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
 	watch := newStallWatch(ctx, stallLimit())
 	defer watch.done()
@@ -1335,7 +1384,7 @@ func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map
 			return 0, nil, 0, nil, watch.explain(err)
 		}
 		defer resp.Body.Close()
-		raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
+		raw, ttfb, err := readModelCheckedBodyMode(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"], taskMode)
 		if err != nil {
 			// raw 要原样回传：取消/超时/身份不符时已到达的首帧里可能带着 c_xxx，
 			// 上层 phantomCleanup 要靠它删幽灵会话，置 nil 这条残片就漏网了。
@@ -1359,7 +1408,7 @@ func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map
 		return 0, nil, 0, nil, watch.explain(err)
 	}
 	defer resp.Body.Close()
-	raw, ttfb, err := readModelCheckedBody(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"])
+	raw, ttfb, err := readModelCheckedBodyMode(stopReader{heardReader{resp.Body, watch}, stop}, onLine, sendAt, resp.StatusCode, headers["x-goog-ext-525001261-jspb"], taskMode)
 	if err != nil {
 		// 同代理分支：raw 里已到的 c_xxx 要留给 phantomCleanup。
 		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), watch.explain(err)

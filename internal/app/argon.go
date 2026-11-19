@@ -28,7 +28,19 @@ func (e *argonIdentityError) Error() string {
 // 不同），且各档名字不互通：档位被静默换掉同样算身份不符。
 // 两种槽位都附带 "Gemini " 前缀形态；按请求的档位只认对应名字。
 func argonDisplayNames(hexID string, think int) []string {
+	return argonDisplayNamesMode(hexID, think, false)
+}
+
+// argonDisplayNamesMode 同 argonDisplayNames，taskMode=true 时对 hexNeon4 放宽一档：
+// 任务模式（gemini-4-neon-task）发 hexNeon4 + think=2 + inner[49]=40，上游实测自报
+// 裸名 "4 Neon"（而非对话模式 think=2 的 "4 Neon High"）。裸名与未来可能恢复的
+// "4 Neon High" 后缀都收，其它模型/档位仍严格拦截。
+// taskMode=false 时逐字保留原规则——对话模式校验绝不放宽。
+func argonDisplayNamesMode(hexID string, think int, taskMode bool) []string {
 	if hexID == hexNeon4 {
+		if taskMode {
+			return []string{"4 Neon", "Gemini 4 Neon", "4 Neon High", "Gemini 4 Neon High"}
+		}
 		switch think {
 		case thinkingExtended:
 			return []string{"4 Neon High", "Gemini 4 Neon High"}
@@ -141,6 +153,12 @@ func validateArgonIdentity(raw []byte, hexID string, names []string) error {
 //
 // onLine 为 nil（非流式）时没有转发，照旧读完整段再校验。
 func readModelCheckedBody(r io.Reader, onLine func(string) error, start time.Time, status int, modelHeader string) ([]byte, int64, error) {
+	return readModelCheckedBodyMode(r, onLine, start, status, modelHeader, false)
+}
+
+// readModelCheckedBodyMode 同 readModelCheckedBody，另带 taskMode：gemini-4-neon-task
+// （hexNeon4 + 任务模式）上游自报裸名 "4 Neon"，合法名集合见 argonDisplayNamesMode。
+func readModelCheckedBodyMode(r io.Reader, onLine func(string) error, start time.Time, status int, modelHeader string, taskMode bool) ([]byte, int64, error) {
 	var h []any
 	hexID := ""
 	if json.Unmarshal([]byte(modelHeader), &h) == nil && len(h) > 4 {
@@ -149,7 +167,7 @@ func readModelCheckedBody(r io.Reader, onLine func(string) error, start time.Tim
 	if hexID != hexArgon4 && hexID != hexNeon4 {
 		return readBody(r, onLine, start)
 	}
-	names := argonDisplayNames(hexID, argonThinkFromHeader(h))
+	names := argonDisplayNamesMode(hexID, argonThinkFromHeader(h), taskMode)
 	if status != 200 || onLine == nil {
 		raw, ttfb, err := readBody(r, nil, start)
 		if err != nil || status != 200 {
