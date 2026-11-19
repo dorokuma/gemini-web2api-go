@@ -8,7 +8,7 @@
 
 ### 新增
 
-- **对话模式与任务模式分离（方案一）**：新增 `gemini-4-neon-task` 与
+- **对话模式与任务模式分离**：新增 `gemini-4-neon-task` 与
   `gemini-4-hydrogen-task` 两个独立任务模式模型（对应 Gemini Web 网页端「任务」开关），
   现有对话模式模型行为完全不变。
   - `ModelConfig` 新增 `TaskMode` 字段；`taskModeSlots` 按浏览器 Task Mode 抓包
