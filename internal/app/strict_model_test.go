@@ -155,6 +155,11 @@ func TestModelDowngraded(t *testing.T) {
 		{"gemini-4-neon-thinking", "4 Neon High", false},
 		{"gemini-4-neon-thinking-medium", "4 Neon Medium", false},
 		{"gemini-3.7-flash", "3.8 Flash", false},
+		// Neon 中档→高档是同槽升级：不报降级、不触发账号冷却（错档由 argon 身份核验拒）
+		{"gemini-4-neon-thinking-medium", "4 Neon High", false},
+		{"gemini-4-neon-thinking-medium", "Gemini 4 Neon High", false},
+		// 反向：请求高档收到中档自报仍算降级
+		{"gemini-4-neon-thinking", "4 Neon Medium", true},
 		// 2026-10-24 实测：无 Argon 权限的号请求 Argon，自报 3.5 Flash-Lite
 		{"gemini-4-carbon", "3.5 Flash-Lite", true},
 		{"gemini-4-neon", "4 Carbon", true},

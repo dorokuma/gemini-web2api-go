@@ -569,7 +569,9 @@ func TestNeonIdentityByThinkTier(t *testing.T) {
 		{"gemini-4-neon-thinking", "Gemini 4 Neon High", false},
 		{"gemini-4-neon-thinking-medium", "4 Neon Medium", false},
 		{"gemini-4-neon", "4 Neon High", false},
-		{"gemini-4-neon-thinking", "4 Neon", true}, // High 档收到裸名算降级（少后缀）
+		{"gemini-4-neon-thinking-medium", "4 Neon High", false}, // 中→高同槽升级不算降级（strict_model 不记冷却）
+		{"gemini-4-neon-thinking", "4 Neon Medium", true},       // 高→中仍算降级
+		{"gemini-4-neon-thinking", "4 Neon", true},              // High 档收到裸名算降级（少后缀）
 		{"gemini-4-neon", "4 Carbon", true},
 		{"gemini-4-neon", "4 Argon", true},
 		{"gemini-4-neon", "4 Hydrogen", true},
@@ -1067,3 +1069,44 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// strict_model 端到端：请求 Neon 中档、上游升成高档（自报 "4 Neon High"）时，
+// 身份核验按错档拒绝（Neon 三档名字不互通），但不得转成 ModelDowngradedError、
+// 也不得把账号写进 300 分钟降级冷却——那是同槽升级，不是降级。
+func TestNeonMediumUpgradedToHighNotDowngraded(t *testing.T) {
+	setStrictModel(t, true)
+	rtMu.Lock()
+	rtVal.StrictModelCooldownMin = 300
+	rtMu.Unlock()
+	resetDowngrades(t)
+	med := Models["gemini-4-neon-thinking-medium"]
+	header := buildModelHeader(med.HexID, med.Mode, med.thinkWire(), "uuid-x")
+	frame := makeSyntheticArgonFrame(hexNeon4, "4 Neon High", "ok")
+
+	// 与 streamGenerateOnce / streamGenerateConv 同一条链路：strictCheck 逐行判降级，
+	// 身份核验抛 argonIdentityError 后按 modelDowngraded 决定要不要转 ModelDowngradedError。
+	strictCheck := strictLineCheck(med, func() int64 { return 42 })
+	cb := func(line string) error {
+		if strictCheck != nil {
+			if err := strictCheck(line); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	_, _, err := readModelCheckedBody(bytes.NewReader(frame), cb, time.Now(), 200, header)
+	var aie *argonIdentityError
+	if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(med, aie.name) {
+		err = &ModelDowngradedError{Requested: med.Upstream, Reported: aie.name, AccountID: 42}
+	}
+	if err == nil {
+		t.Fatal("错档响应（中档请求收到 High 自报）应被身份核验拒绝")
+	}
+	var mde *ModelDowngradedError
+	if errors.As(err, &mde) {
+		t.Fatalf("中档→高档是同槽升级，不应转成 ModelDowngradedError: %v", err)
+	}
+	if cooling, _ := coolingAccounts(med); len(cooling) != 0 {
+		t.Fatalf("同槽升级不应写入降级冷却: %v", cooling)
+	}
+}

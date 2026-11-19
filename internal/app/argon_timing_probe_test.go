@@ -52,7 +52,11 @@ func TestArgonTimingProbe(t *testing.T) {
 	if os.Getenv("ARGON_PROBE_CATALOG_ONLY") == "1" {
 		return
 	}
-	inner := make([]any, 97)
+	// 与 streamGenerateOnce/streamGenerateConv 同一套拼法：innerSlots 定长 + Mode=8
+	// 走 argonMode8Slots 补齐槽位（含 inner[96]=1，与思考档无关）。inner[45] 由
+	// temporary_chat 开关决定，探针默认配置开着临时对话，保持 inner[45]=1 不变。
+	carbon := Models["gemini-4-carbon"]
+	inner := make([]any, innerSlots)
 	inner[0] = []any{"Explain how rain forms in 12 short numbered sentences. Begin directly with sentence 1.", 0, nil, nil, nil, nil, 0}
 	inner[1] = []any{"en"}
 	inner[2] = []any{"", "", "", nil, nil, nil, nil, nil, nil, ""}
@@ -70,15 +74,18 @@ func TestArgonTimingProbe(t *testing.T) {
 	inner[59] = uuid.NewString()
 	inner[61] = []any{}
 	inner[68] = 1
-	inner[79] = 8
-	inner[80] = 1
+	inner[79] = carbon.Mode
+	inner[80] = carbon.thinkWire()
 	inner[91] = 0
 	inner[96] = 0
+	if carbon.Mode == 8 {
+		argonMode8Slots(inner)
+	}
 	ib, _ := json.Marshal(inner)
 	outer, _ := json.Marshal([]any{nil, string(ib)})
 	form = url.Values{"f.req": {string(outer)}, "at": {string(tok[1])}}
-	headers = buildGeminiHeaders(cookie, extractSAPISID(cookie), "95a4c0abcba24364")
-	headers["x-goog-ext-525001261-jspb"] = buildModelHeader("95a4c0abcba24364", 8, 1, uuid.NewString())
+	headers = buildGeminiHeaders(cookie, extractSAPISID(cookie), hexArgon4)
+	headers["x-goog-ext-525001261-jspb"] = buildModelHeader(hexArgon4, carbon.Mode, carbon.thinkWire(), uuid.NewString())
 	headers["x-goog-ext-525005358-jspb"] = fmt.Sprintf(`["%s",1]`, inner[59])
 	endpoint = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?hl=en&rt=c&bl=" + url.QueryEscape(string(bl[1]))
 	start := time.Now()
@@ -124,8 +131,17 @@ func TestArgonTimingProbe(t *testing.T) {
 	}
 	actual := extractUpstreamModel(string(raw))
 	answer := extractResponseText(string(raw))
+	// 身份断言与运行时同槽白名单对齐：普通档 Carbon 收 "4 Argon"/"4 Carbon"（原位改名
+	// 滚动期两套都收），不再硬判名字含 "argon"。
+	names := argonDisplayNames(hexArgon4, carbon.thinkWire())
+	nameOK := false
+	for _, n := range names {
+		if actual == n {
+			nameOK = true
+		}
+	}
 	t.Logf("generation_status=%d mode=8 think=1 actual_model=%q answer_bytes=%d elapsed_ms=%d raw_bytes=%d", status, actual, len(answer), time.Since(start).Milliseconds(), len(raw))
-	if status != 200 || !strings.Contains(strings.ToLower(actual), "argon") || strings.TrimSpace(answer) == "" {
-		t.Fatal("Argon generation not verified")
+	if status != 200 || !nameOK || strings.TrimSpace(answer) == "" {
+		t.Fatalf("Carbon generation not verified: status=%d actual=%q want one of %v", status, actual, names)
 	}
 }

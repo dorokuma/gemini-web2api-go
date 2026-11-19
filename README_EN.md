@@ -93,8 +93,9 @@ The projects most often compared with this one are the Python [Sophomoresty/gemi
 - `gemini-3.6-flash` and `gemini-3.5-flash-lite` work anonymously, web search included
 - `gemini-3.1-pro` needs a cookie; every reply carries a reasoning chain
 - `gemini-3.8-flash`, `gemini-4-carbon` and `gemini-4-neon` need a cookie from a paid / Ultra account
-- Every model has a `-thinking` variant (extended thinking), available with a cookie
-  (`reasoning_content`)
+- Every model has a `-thinking` variant (extended thinking), available with a cookie;
+  whether a variant emits `reasoning_content` is per the model table below — the
+  `gemini-4-neon` tiers think only on the server side and never emit it
 - Every response records which model the backend **actually** used, so silent
   downgrades are visible
 
