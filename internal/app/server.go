@@ -296,7 +296,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty prompt"}})
 		return
@@ -628,7 +628,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"])
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty input"}})
 		return

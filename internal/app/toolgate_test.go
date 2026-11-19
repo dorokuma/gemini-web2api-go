@@ -897,7 +897,7 @@ func TestToolPromptTailDeclaresNoCallLimit(t *testing.T) {
 	msgs := []map[string]interface{}{
 		{"role": "user", "content": "list files then read README"},
 	}
-	_, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil)
+	_, pc := messagesToPrompt(msgs, toolsFixture("bash"), nil, false)
 	tail := pc.Tail
 	if tail == "" {
 		t.Fatal("带工具时末尾锚点不能为空")
