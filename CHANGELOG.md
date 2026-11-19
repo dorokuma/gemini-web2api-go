@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 6.0.1
+
 ### 修复
 
 - **工具调用提示词防幻觉**：`buildPromptParts` 末尾锚点原「do not output more than one
