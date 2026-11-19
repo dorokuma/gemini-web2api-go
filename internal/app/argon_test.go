@@ -37,28 +37,28 @@ func makeSyntheticArgonFrame(hexID string, modelName string, answer string) []by
 func TestArgonValidateIdentity(t *testing.T) {
 	// 1. Correct hex and name passes (including upstream's hexFlashLite placeholder slot with Argon name)
 	validFrame1 := makeSyntheticArgonFrame(hexArgon4, "4 Argon", "ARGON_OK")
-	if err := validateArgonIdentity(validFrame1, argonDisplayNames(thinkingNormal)); err != nil {
+	if err := validateArgonIdentity(validFrame1, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err != nil {
 		t.Fatalf("expected valid Argon frame to pass, got: %v", err)
 	}
 
 	validFrame2 := makeSyntheticArgonFrame(hexArgon4, "Gemini 4 Argon", "ARGON_OK")
-	if err := validateArgonIdentity(validFrame2, argonDisplayNames(thinkingNormal)); err != nil {
+	if err := validateArgonIdentity(validFrame2, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err != nil {
 		t.Fatalf("expected valid Gemini 4 Argon frame to pass, got: %v", err)
 	}
 
 	validPlaceholderHex := makeSyntheticArgonFrame(hexFlashLite, "4 Argon", "ARGON_OK")
-	if err := validateArgonIdentity(validPlaceholderHex, argonDisplayNames(thinkingNormal)); err != nil {
+	if err := validateArgonIdentity(validPlaceholderHex, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err != nil {
 		t.Fatalf("expected valid Argon frame with placeholder hex to pass, got: %v", err)
 	}
 
 	// 2. Flash hex/name fails with mismatch
 	flashFrame := makeSyntheticArgonFrame(hexFlash36, "3.6 Flash", "FLASH")
-	if err := validateArgonIdentity(flashFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+	if err := validateArgonIdentity(flashFrame, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
 		t.Fatalf("expected Argon model mismatch for Flash frame, got: %v", err)
 	}
 
 	downgradedLiteFrame := makeSyntheticArgonFrame(hexFlashLite, "3.5 Flash-Lite", "LITE")
-	if err := validateArgonIdentity(downgradedLiteFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+	if err := validateArgonIdentity(downgradedLiteFrame, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
 		t.Fatalf("expected Argon model mismatch for 3.5 Flash-Lite frame, got: %v", err)
 	}
 
@@ -67,13 +67,13 @@ func TestArgonValidateIdentity(t *testing.T) {
 	pBytes, _ := json.Marshal(emptyFields)
 	emptyFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(pBytes), nil}})
 	emptyFrame = append(emptyFrame, '\n')
-	if err := validateArgonIdentity(emptyFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+	if err := validateArgonIdentity(emptyFrame, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
 		t.Fatalf("expected Argon identity missing, got: %v", err)
 	}
 
 	// 4. Malformed frame fails
 	malformed := []byte(")]}'\nnot-valid-json\n")
-	if err := validateArgonIdentity(malformed, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+	if err := validateArgonIdentity(malformed, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
 		t.Fatalf("expected Argon identity missing for malformed JSON, got: %v", err)
 	}
 
@@ -83,13 +83,13 @@ func TestArgonValidateIdentity(t *testing.T) {
 	fBytes, _ := json.Marshal(forgedFields)
 	forgedFrame, _ := json.Marshal([][]any{{"wrb.fr", "rpc1", string(fBytes), nil}})
 	forgedFrame = append(forgedFrame, '\n')
-	if err := validateArgonIdentity(forgedFrame, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
+	if err := validateArgonIdentity(forgedFrame, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon identity missing") {
 		t.Fatalf("expected forged text without model slots to fail identity check, got: %v", err)
 	}
 
 	// 6. Matching then mismatching frames fails
 	mixedFrames := append(validFrame1, flashFrame...)
-	if err := validateArgonIdentity(mixedFrames, argonDisplayNames(thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
+	if err := validateArgonIdentity(mixedFrames, hexArgon4, argonDisplayNames(hexArgon4, thinkingNormal)); err == nil || !strings.Contains(err.Error(), "Argon model mismatch") {
 		t.Fatalf("expected matching then mismatching frames to fail, got: %v", err)
 	}
 }
@@ -228,34 +228,38 @@ func TestReadModelCheckedBody(t *testing.T) {
 }
 
 func TestArgonModelNeedsLoginAndAvailable(t *testing.T) {
-	mc, ok := Models["gemini-4-argon"]
-	if !ok {
-		t.Fatal("gemini-4-argon missing in Models map")
-	}
-	if !modelNeedsLogin(mc) {
-		t.Fatal("gemini-4-argon should require login")
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-neon"} {
+		mc, ok := Models[name]
+		if !ok {
+			t.Fatalf("%s missing in Models map", name)
+		}
+		if !modelNeedsLogin(mc) {
+			t.Fatalf("%s should require login", name)
+		}
+		// Without cookie: hidden
+		if _, ok := availableModels()[name]; ok {
+			t.Fatalf("%s should not be available without cookie", name)
+		}
 	}
 
-	// Without cookie: Argon hidden
-	if _, ok := availableModels()["gemini-4-argon"]; ok {
-		t.Fatal("gemini-4-argon should not be available without cookie")
-	}
-
-	// With cookie: Argon available
+	// With cookie: available
 	withPoolCookie(t)
-	if _, ok := availableModels()["gemini-4-argon"]; !ok {
-		t.Fatal("gemini-4-argon should be available when pool cookie exists")
+	for _, name := range []string{"gemini-4-carbon", "gemini-4-neon"} {
+		if _, ok := availableModels()[name]; !ok {
+			t.Fatalf("%s should be available when pool cookie exists", name)
+		}
 	}
 }
 
-// -thinking 版上游自报 "4 Argon High"：按请求 header 的思考位只认对应档位的名字，
-// 档位被静默换掉（要 High 回了普通档，或反过来）同样报身份不符。
+// -thinking 版上游自报 "4 Carbon High"（2026-11-13 起又回裸 "4 Carbon"，滚动期两套都收）：
+// 按请求 header 的思考位只认对应档位的名字，档位被静默换掉（要 High 回了普通档，或反过来）
+// 同样报身份不符。
 func TestArgonIdentityByThinkTier(t *testing.T) {
-	low := Models["gemini-4-argon"]
-	med := Models["gemini-4-argon-thinking-medium"]
-	high := Models["gemini-4-argon-thinking"]
+	low := Models["gemini-4-carbon"]
+	med := Models["gemini-4-carbon-thinking-medium"]
+	high := Models["gemini-4-carbon-thinking"]
 	if low.Thinking || !high.Thinking || high.HexID != hexArgon4 || high.Mode != 8 || med.ThinkWire != thinkingMedium {
-		t.Fatalf("unexpected Argon model table: low=%+v med=%+v high=%+v", low, med, high)
+		t.Fatalf("unexpected Carbon model table: low=%+v med=%+v high=%+v", low, med, high)
 	}
 	lowHeader := buildModelHeader(low.HexID, low.Mode, thinkingNormal, "uuid-x")
 	medHeader := buildModelHeader(med.HexID, med.Mode, thinkingMedium, "uuid-x")
@@ -266,13 +270,25 @@ func TestArgonIdentityByThinkTier(t *testing.T) {
 		ok           bool
 	}{
 		{lowHeader, "4 Argon", true},
+		{lowHeader, "4 Carbon", true},
 		{medHeader, "4 Argon", true},
 		{medHeader, "4 Argon Medium", true},
+		{medHeader, "4 Carbon", true},
+		{medHeader, "4 Carbon Medium", true},
 		{highHeader, "4 Argon High", true},
 		{highHeader, "Gemini 4 Argon High", true},
+		{highHeader, "4 Carbon High", true},
+		{highHeader, "Gemini 4 Carbon High", true},
+		// 2026-11-13 起 High 档自报脱后缀回裸 "4 Carbon"；放行。
+		{highHeader, "4 Carbon", true},
 		{lowHeader, "4 Argon High", false},
+		{lowHeader, "4 Carbon High", false},
 		{medHeader, "4 Argon High", false},
+		{medHeader, "4 Carbon High", false},
 		{highHeader, "4 Argon", false},
+		{highHeader, "4 Argon Medium", false},
+		{lowHeader, "4 Neon", false},
+		{highHeader, "4 Neon High", false},
 	}
 	for _, c := range cases {
 		frame := makeSyntheticArgonFrame(hexArgon4, c.name, "ok")
@@ -295,9 +311,9 @@ func TestArgonIdentityByThinkTier(t *testing.T) {
 
 func TestArgonIdentityWithStrictModel(t *testing.T) {
 	setStrictModel(t, true)
-	low := Models["gemini-4-argon"]
-	med := Models["gemini-4-argon-thinking-medium"]
-	high := Models["gemini-4-argon-thinking"]
+	low := Models["gemini-4-carbon"]
+	med := Models["gemini-4-carbon-thinking-medium"]
+	high := Models["gemini-4-carbon-thinking"]
 
 	type tc struct {
 		mc             ModelConfig
@@ -308,19 +324,34 @@ func TestArgonIdentityWithStrictModel(t *testing.T) {
 	cases := []tc{
 		{low, "4 Argon", true, false},
 		{low, "Gemini 4 Argon", true, false},
+		{low, "4 Carbon", true, false},
+		{low, "Gemini 4 Carbon", true, false},
 		{med, "4 Argon", true, false},
 		{med, "Gemini 4 Argon", true, false},
 		{med, "4 Argon Medium", true, false},
 		{med, "Gemini 4 Argon Medium", true, false},
+		{med, "4 Carbon", true, false},
+		{med, "4 Carbon Medium", true, false},
 		{high, "4 Argon High", true, false},
 		{high, "Gemini 4 Argon High", true, false},
-		// Tier mismatch within Argon: rejected by Argon identity check, NOT classified as model downgrade cooldown.
+		{high, "4 Carbon High", true, false},
+		{high, "Gemini 4 Carbon High", true, false},
+		{high, "4 Carbon", true, false},
+		// Tier mismatch within Argon/Carbon: rejected by identity check, NOT classified as model downgrade cooldown.
 		{low, "4 Argon High", false, false},
 		{low, "Gemini 4 Argon High", false, false},
+		{low, "4 Carbon High", false, false},
 		{med, "4 Argon High", false, false},
 		{med, "Gemini 4 Argon High", false, false},
+		{med, "4 Carbon High", false, false},
 		{high, "4 Argon", false, false},
 		{high, "Gemini 4 Argon", false, false},
+		{high, "4 Argon Medium", false, false},
+		{high, "4 Carbon Medium", false, false},
+		// Other model family: identity check rejects; under strict_model a true
+		// downgrade (different model self-report) becomes ModelDowngradedError.
+		{low, "4 Neon", false, true},
+		{low, "4 Neon High", false, true},
 		// Silent downgrade to another model family: rejected and converted to ModelDowngradedError under strict_model.
 		{low, "3.5 Flash-Lite", false, true},
 		{low, "Gemini 3.5 Flash-Lite", false, true},
@@ -434,15 +465,119 @@ func TestArgonCarbonIdentity(t *testing.T) {
 		model, reported string
 		want            bool
 	}{
-		{"gemini-4-argon", "4 Carbon", false},
-		{"gemini-4-argon", "4 Carbon High", false},
-		{"gemini-4-argon-thinking", "4 Carbon", false},
-		{"gemini-4-argon-thinking", "4 Carbon High", false},
 		{"gemini-4-carbon", "4 Argon", false},
+		{"gemini-4-carbon", "4 Argon High", false},
+		{"gemini-4-carbon-thinking", "4 Argon", false},
 		{"gemini-4-carbon-thinking", "4 Argon High", false},
 		{"gemini-4-carbon", "4 Carbon", false},
+		{"gemini-4-carbon", "4 Carbon High", false},
+		{"gemini-4-carbon-thinking", "4 Carbon High", false},
+		{"gemini-4-carbon-thinking-medium", "4 Carbon Medium", false},
 		{"gemini-4-carbon", "3.5 Flash-Lite", true},
 		{"gemini-4-carbon-thinking", "3.6 Flash", true},
+		{"gemini-4-carbon", "4 Neon", true},
+		{"gemini-4-carbon", "4 Hydrogen", true},
+	} {
+		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
+			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
+		}
+	}
+}
+
+// 4 Neon（hexNeon4 / Mode=3）：上游实测 think=1/2/4 自报 "4 Neon" / "4 Neon High" /
+// "4 Neon Medium"（高/中档**带后缀**，与 Carbon High 档脱后缀相反），三档都不吐思考链。
+// 身份核验必须：同一 hex 槽位只认对应档名的显示名、收 hexFlashLite 占位 hex、
+// Carbon/Flash 等异族或错档自报一律拒。
+func TestNeonIdentityByThinkTier(t *testing.T) {
+	low := Models["gemini-4-neon"]
+	med := Models["gemini-4-neon-thinking-medium"]
+	high := Models["gemini-4-neon-thinking"]
+	if low.HexID != hexNeon4 || low.Mode != 3 || low.Thinking || low.ThinkWire != 0 ||
+		med.HexID != hexNeon4 || med.Mode != 3 || med.ThinkWire != thinkingMedium || med.Thinking ||
+		high.HexID != hexNeon4 || high.Mode != 3 || !high.Thinking || high.thinkWire() != thinkingExtended {
+		t.Fatalf("unexpected Neon model table: low=%+v med=%+v high=%+v", low, med, high)
+	}
+	if !modelNeedsLogin(low) || !modelNeedsLogin(med) || !modelNeedsLogin(high) {
+		t.Fatal("neon models should require login (hexNeon4 slot)")
+	}
+
+	lowHeader := buildModelHeader(low.HexID, low.Mode, thinkingNormal, "uuid-x")
+	medHeader := buildModelHeader(med.HexID, med.Mode, thinkingMedium, "uuid-x")
+	highHeader := buildModelHeader(high.HexID, high.Mode, thinkingExtended, "uuid-x")
+	cases := []struct {
+		header, name string
+		ok           bool
+	}{
+		{lowHeader, "4 Neon", true},
+		{lowHeader, "Gemini 4 Neon", true},
+		{medHeader, "4 Neon Medium", true},
+		{medHeader, "Gemini 4 Neon Medium", true},
+		{highHeader, "4 Neon High", true},
+		{highHeader, "Gemini 4 Neon High", true},
+		// 档位被静默换掉同样算身份不符（Neon 三档名字不互通）。
+		{lowHeader, "4 Neon High", false},
+		{lowHeader, "4 Neon Medium", false},
+		{medHeader, "4 Neon", false},
+		{medHeader, "4 Neon High", false},
+		{highHeader, "4 Neon", false},
+		{highHeader, "4 Neon Medium", false},
+		// 异族自报一律拒。
+		{lowHeader, "4 Carbon", false},
+		{lowHeader, "4 Argon", false},
+		{medHeader, "4 Carbon Medium", false},
+		{highHeader, "4 Carbon High", false},
+		{lowHeader, "4 Hydrogen", false},
+		{lowHeader, "3.5 Flash-Lite", false},
+		{lowHeader, "3.6 Flash", false},
+	}
+	for _, c := range cases {
+		// 响应帧 hex 槽位允许 hexNeon4 本身或 hexFlashLite 占位。
+		for _, id := range []string{hexNeon4, hexFlashLite} {
+			frame := makeSyntheticArgonFrame(id, c.name, "ok")
+			var got []string
+			_, _, err := readModelCheckedBody(bytes.NewReader(frame), func(l string) error {
+				got = append(got, l)
+				return nil
+			}, time.Now(), 200, c.header)
+			if c.ok && (err != nil || len(got) == 0) {
+				t.Errorf("%q id=%s: want pass, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if !c.ok && (err == nil || !strings.Contains(err.Error(), "Argon model mismatch") || len(got) != 0) {
+				t.Errorf("%q id=%s: want mismatch and no output, err=%v lines=%d", c.name, id, err, len(got))
+			}
+			if _, _, err := readModelCheckedBody(bytes.NewReader(frame), nil, time.Now(), 200, c.header); (err == nil) != c.ok {
+				t.Errorf("%q id=%s non-stream: ok=%v err=%v", c.name, id, c.ok, err)
+			}
+		}
+	}
+
+	// 异族 hex（Carbon）就算名字是 Neon 也得拒：hex 槽与显示名都核对。
+	foreignHex := makeSyntheticArgonFrame(hexArgon4, "4 Neon", "ok")
+	if _, _, err := readModelCheckedBody(bytes.NewReader(foreignHex), nil, time.Now(), 200, lowHeader); err == nil {
+		t.Error("foreign hexArgon4 id with '4 Neon' name must be rejected for a neon header")
+	}
+
+	// strict_model 判降级：Neon 三档自报互认档位名（前缀规则），掉到异族/Flash 判降级。
+	setStrictModel(t, true)
+	for _, c := range []struct {
+		model, reported string
+		want            bool
+	}{
+		{"gemini-4-neon", "4 Neon", false},
+		{"gemini-4-neon", "Gemini 4 Neon", false},
+		{"gemini-4-neon-thinking", "4 Neon High", false},
+		{"gemini-4-neon-thinking", "Gemini 4 Neon High", false},
+		{"gemini-4-neon-thinking-medium", "4 Neon Medium", false},
+		{"gemini-4-neon", "4 Neon High", false},
+		{"gemini-4-neon-thinking-medium", "4 Neon High", false}, // 中→高同槽升级不算降级（strict_model 不记冷却）
+		{"gemini-4-neon-thinking", "4 Neon Medium", true},       // 高→中仍算降级
+		{"gemini-4-neon-thinking", "4 Neon", true},              // High 档收到裸名算降级（少后缀）
+		{"gemini-4-neon", "4 Carbon", true},
+		{"gemini-4-neon", "4 Argon", true},
+		{"gemini-4-neon", "4 Hydrogen", true},
+		{"gemini-4-neon", "3.5 Flash-Lite", true},
+		{"gemini-4-neon-thinking", "3.6 Flash", true},
+		{"gemini-4-neon-thinking-medium", "3.5 Flash-Lite", true},
 	} {
 		if got := modelDowngraded(Models[c.model], c.reported); got != c.want {
 			t.Errorf("modelDowngraded(%s, %q)=%v want %v", c.model, c.reported, got, c.want)
@@ -934,3 +1069,53 @@ func TestXSRFSelfHealPhantomCleanupAndSingleDelete(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// strict_model 端到端：请求 Neon 中档、上游升成高档（自报 "4 Neon High"）时，
+// 身份核验按错档拒绝（Neon 三档名字不互通），但不得转成 ModelDowngradedError、
+// 也不得把账号写进 300 分钟降级冷却——那是同槽升级，不是降级。
+func TestNeonMediumUpgradedToHighNotDowngraded(t *testing.T) {
+	setStrictModel(t, true)
+	rtMu.Lock()
+	rtVal.StrictModelCooldownMin = 300
+	rtMu.Unlock()
+	resetDowngrades(t)
+	med := Models["gemini-4-neon-thinking-medium"]
+	header := buildModelHeader(med.HexID, med.Mode, med.thinkWire(), "uuid-x")
+	frame := makeSyntheticArgonFrame(hexNeon4, "4 Neon High", "ok")
+
+	// 与 streamGenerateOnce / streamGenerateConv 同一条链路：strictCheck 逐行判降级，
+	// 身份核验抛 argonIdentityError 后按 modelDowngraded 决定要不要转 ModelDowngradedError。
+	strictCheck := strictLineCheck(med, func() int64 { return 42 })
+	cb := func(line string) error {
+		if strictCheck != nil {
+			if err := strictCheck(line); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	_, _, err := readModelCheckedBody(bytes.NewReader(frame), cb, time.Now(), 200, header)
+	var aie *argonIdentityError
+	if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(med, aie.name) {
+		err = &ModelDowngradedError{Requested: med.Upstream, Reported: aie.name, AccountID: 42}
+	}
+	if err == nil {
+		t.Fatal("错档响应（中档请求收到 High 自报）应被身份核验拒绝")
+	}
+	var mde *ModelDowngradedError
+	if errors.As(err, &mde) {
+		t.Fatalf("中档→高档是同槽升级，不应转成 ModelDowngradedError: %v", err)
+	}
+	// 真实链路把转换后的 err 交给 retryOnAnotherAccount（本请求账号 #42）：升级错档
+	// 不是 ModelDowngradedError，不换号、不进 exclude、不写 300 分钟冷却。
+	exclude := map[int64]bool{}
+	if retryOnAnotherAccount(&StreamResult{}, err, med, exclude) {
+		t.Fatal("同槽升级错档不应触发换号重试")
+	}
+	if len(exclude) != 0 {
+		t.Fatalf("同槽升级不应把账号加入排除表: %v", exclude)
+	}
+	if cooling, _ := coolingAccounts(med); len(cooling) != 0 {
+		t.Fatalf("同槽升级不应写入降级冷却: %v", cooling)
+	}
+}

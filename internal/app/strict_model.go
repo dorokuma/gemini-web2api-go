@@ -179,5 +179,12 @@ func modelDowngraded(mc ModelConfig, reported string) bool {
 	if want == "3.8 flash" && (got == "4 hydrogen" || strings.HasPrefix(got, "4 hydrogen ")) {
 		return false
 	}
+	// Neon 中档→高档是同槽升级：中档自报 "4 Neon Medium"，被服务端升成高档时报
+	// "4 Neon High"。前缀规则断在词边界会把它当成降级，但升级错档不该触发
+	// strict_model 的账号 300 分钟冷却——档位不符仍由 argon.go 的强身份核验拒绝
+	// （Neon 三档名字不互通），这里只豁免降级判定。
+	if want == "4 neon medium" && (got == "4 neon high" || strings.HasPrefix(got, "4 neon high ")) {
+		return false
+	}
 	return got != want && !strings.HasPrefix(got, want+" ")
 }

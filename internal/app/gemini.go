@@ -32,12 +32,18 @@ const (
 	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
 	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
 	hexFlash38 = "56fdd199312815e2" // 3.8 Flash（原记 3.7；Google 把这个 hex 原地升成 3.8，HAR 响应帧显示名已是 "3.8 Flash"）
-	// 4 Argon（#35）：otAQ7b 清单里主 hex 95a4c0abcba24364、短名 Argon、代号 Argon4p0、
-	// 显示名 "4 Argon"。付费/Ultra 号专属。实测**真正选中它靠的是 MODE=8（header 下标 14 /
-	// inner[79]），不是 hex**：借来的 Ultra 号上，hex=Argon 配 mode=1 回报 "3.8 Flash"（mode 1
-	// 那个模型），hex=3.8Flash 配 mode=8 反而回报 "4 Argon"——mode 决定、hex 被忽略。所以 Argon
-	// 条目的 Mode 必须填 8。仍按浏览器把 hex 配成 Argon 主 hex（最忠实、将来若改回认 hex 也不塌）。
+	// 4 Carbon（原 4 Argon，#35）：otAQ7b 清单里主 hex 95a4c0abcba24364、短名 Carbon、
+	// 代号 Carbon4p0、显示名 "4 Carbon"（2026-11 由 "4 Argon" 原位改名，hex/Mode 不变）。
+	// 付费/Ultra 号专属。实测**真正选中它靠的是 MODE=8（header 下标 14 / inner[79]），不是
+	// hex**：借来的 Ultra 号上，hex=Argon 配 mode=1 回报 "3.8 Flash"（mode 1 那个模型），
+	// hex=3.8Flash 配 mode=8 反而回报 "4 Argon"——mode 决定、hex 被忽略。所以 Carbon 条目的
+	// Mode 必须填 8。仍按浏览器把 hex 配成该槽位主 hex（最忠实、将来若改回认 hex 也不塌）。
 	hexArgon4 = "95a4c0abcba24364"
+	// 4 Neon：otAQ7b 清单里主 hex e6fa609c3fa255c0、短名 Neon、代号 Neon4p0、显示名
+	// "4 Neon"（desc "Deeper analysis"）。Mode=3 路由（mode 决定、hex 被忽略，同 Carbon 的
+	// 实测结论）。付费号专属；think=2/4 分别自报 "4 Neon High"/"4 Neon Medium"，均服务端
+	// 内部思考、不吐思考链。普通 inner 即可，不需要 argonMode8Slots（那套槽位仅 Mode=8）。
+	hexNeon4 = "e6fa609c3fa255c0"
 )
 
 // innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
@@ -47,9 +53,10 @@ const (
 // —— 模型选择完全由 x-goog-ext-525001261-jspb header 决定，长度不影响。
 const innerSlots = 99
 
-// 4 Argon（mode 8）：按浏览器 processSession 抓包补齐槽位（protobuf 字段 N == inner[N-1]，
+// 4 Carbon（mode 8）：按浏览器 processSession 抓包补齐槽位（protobuf 字段 N == inner[N-1]，
 // 2026-11-09 实测）。不补的话付费号上请求会挂起没有回应。BotGuard 槽位 inner[3]/[4] 留空。
 // inner[96] 按抓包恒为 1：mode-8 请求服务端要求该槽为 1，与思考档位无关。
+// 仅 Mode==8 触发——4 Neon（Mode=3）实测用普通 inner 即 HTTP 200，不得对它补这些槽位。
 // 单轮（streamGenerateOnce）与多轮（streamGenerateConv）共用，两条路径发的 inner 必须一致。
 func argonMode8Slots(inner []interface{}) {
 	inner[6] = []interface{}{1}
@@ -70,7 +77,7 @@ func argonMode8Slots(inner []interface{}) {
 const (
 	thinkingNormal   = 1
 	thinkingExtended = 2
-	// thinkingMedium 是 4 Argon 网页 UI「中等」思考档的线值（低=1 / 高=2 / 中=4）。
+	// thinkingMedium 是 4 Argon/Carbon 网页 UI「中等」思考档的线值（低=1 / 高=2 / 中=4）。
 	// 判据：2026-10-19 的 processSession 抓包里选中档时 think 槽（新协议字段 #81 =
 	// 老 inner[80]）发的就是 4；与 #37 自述一致。中档的思考在服务端内部完成、响应
 	// 不吐思考链，所以不映射 reasoning_content。
@@ -89,7 +96,7 @@ type ModelConfig struct {
 	// —— 三个模型都能开，不是某个专属模型。
 	Thinking bool
 	// ThinkWire >0 时直接作为思考档线值（header 下标15 / inner[80]），覆盖 Thinking
-	// 推出的 1/2。用于 4 Argon「中等」档（=thinkingMedium=4）。两者都不设 = 普通(1)。
+	// 推出的 1/2。用于 4 Carbon「中等」档（=thinkingMedium=4）。两者都不设 = 普通(1)。
 	ThinkWire int
 	// Tool 非 0 时填 inner[49]，让服务端换后端模型生成媒体产物（14=生图 Nano Banana
 	// / 21=音乐 Lyria）。产物不在 StreamGenerate 响应里，要再走 hNvQHb 拿下载链、
@@ -147,12 +154,12 @@ var Models = map[string]ModelConfig{
 	// "4 Hydrogen"。与 3.8 三条完全同 hex 同 Mode，仅对外名和登记的 Upstream 名不同。
 	// 仍 gate 成要 cookie（modelNeedsLogin 按 hexFlash38 覆盖）。
 	"gemini-4-hydrogen": {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", Desc: "4 Hydrogen (Everyday help, replaced 3.8 Flash on same slot); needs a signed-in Google account"},
-	// 4 Argon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
+	// 4 Carbon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
 	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
-	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Argon", Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
-	// 4 Carbon：Google 2026-11 起把同一槽位（hexArgon4 / Mode=8）的显示名原位改名
-	// "4 Argon" → "4 Carbon"。与 argon 三条完全同配，仅对外名和登记的 Upstream 名不同。
 	"gemini-4-carbon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Carbon", Desc: "4 Carbon (renamed 4 Argon, same slot); needs a signed-in PAID/Ultra Google account"},
+	// 4 Neon：Mode=3 路由（hexNeon4 注释）。上游实测 think=1/2/4 均 HTTP 200、自报
+	// "4 Neon"/"4 Neon High"/"4 Neon Medium"。付费号专属，gate 成要 cookie。
+	"gemini-4-neon": {HexID: hexNeon4, Mode: 3, Upstream: "4 Neon", Desc: "4 Neon (deeper analysis); needs a signed-in PAID/Ultra Google account"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
@@ -162,15 +169,17 @@ var Models = map[string]ModelConfig{
 	"gemini-3.8-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.7-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
 	"gemini-3.8-flash-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "3.8 Flash", Desc: "3.8 Flash at the Medium thinking tier; needs a signed-in Google account"},
-	// 4 Argon + 扩展思考：Mode=8（选 Argon）+ inner[80]=2（上游现在把这档叫 "High"）。
-	// 实测回报 "4 Argon High" 且带思考链（硬题 985 字符，走既有 [4][0][37][0][0] 路径，
-	// 无需改抽取代码）→ 映射成 reasoning_content。付费/Ultra 专属。
-	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Argon", Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
+	// 4 Carbon + 扩展思考：Mode=8 + inner[80]=2（上游现在把这档叫 "High"）。
+	// 实测回报带思考链（走既有 [4][0][37][0][0] 路径，无需改抽取代码）→ reasoning_content。
+	"gemini-4-carbon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Carbon", Desc: "4 Carbon with extended thinking (High tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
 	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
 	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
-	"gemini-4-argon-thinking-medium":  {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
-	"gemini-4-carbon-thinking":        {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Carbon", Desc: "4 Carbon with extended thinking (High tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
 	"gemini-4-carbon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Carbon", Desc: "4 Carbon at the Medium thinking tier; needs a signed-in PAID/Ultra account"},
+	// 4 Neon + 思考档：Mode=3（选 Neon），高档 think 线值 2、自报 "4 Neon High"，中档
+	// thinkingMedium=4、自报 "4 Neon Medium"。实测三档都不吐思考链——思考在服务端内部
+	// 完成，不设 Thinking、不期望 reasoning_content。
+	"gemini-4-neon-thinking":        {HexID: hexNeon4, Mode: 3, Thinking: true, Upstream: "4 Neon High", Desc: "4 Neon High thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-neon-thinking-medium": {HexID: hexNeon4, Mode: 3, ThinkWire: thinkingMedium, Upstream: "4 Neon Medium", Desc: "4 Neon Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
 	// 4 Hydrogen 思考档：与 3.8 Flash 同槽位（hexFlash38 / Mode=1），高档自报 "4 Hydrogen High"
 	// 并吐思考链，中档 think 线值 thinkingMedium、服务端内部思考不吐链。
 	"gemini-4-hydrogen-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", Desc: "4 Hydrogen with extended thinking (High tier); emits reasoning_content; needs a signed-in Google account"},
@@ -200,7 +209,7 @@ func hasCookie() bool {
 // 逐模型核对等价：那三个正名的 HexID 就是 hexPro31 / hexFlash38，其余登录模型都被
 // Thinking 或 Tool 覆盖。
 func modelNeedsLogin(mc ModelConfig) bool {
-	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.Thinking || mc.ThinkWire > 0 || mc.Tool > 0
+	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.HexID == hexNeon4 || mc.Thinking || mc.ThinkWire > 0 || mc.Tool > 0
 }
 
 // anonFirstEligible 判断「匿名优先」开关下这次请求能不能走匿名（不占 cookie 账号）：

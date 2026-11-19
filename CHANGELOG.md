@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+### 变更
+
+- **Gemini 4 Neon 模型接入、4 Argon 对外模型移除**：上游 `otAQ7b` 目录中 Neon 为
+  `hex e6fa609c3fa255c0` / `Mode=3`（实测 think=1/2/4 均 HTTP 200，自报
+  `"4 Neon"` / `"4 Neon High"` / `"4 Neon Medium"`，均服务端内部思考、不吐思考链）。
+  新增 `gemini-4-neon` / `gemini-4-neon-thinking` / `gemini-4-neon-thinking-medium` 三条
+  对外模型；原 `gemini-4-argon` / `-thinking` / `-thinking-medium` 三条移除（上游已把该
+  Mode=8 槽位原位改名为 4 Carbon，目录中 argon 不再出现）。`gemini-4-carbon*` 三条不动。
+  - `modelNeedsLogin` 纳入 `hexNeon4`（付费号专属，免费号静默降级）。
+  - 强身份核验（`argon.go`）按请求 hex 分槽：`hexNeon4` 三档只认对应档名
+    （`"4 Neon"` / `"4 Neon High"` / `"4 Neon Medium"`，高/中档带后缀，与 Carbon High 档
+    脱后缀不同）；响应帧 hex 槽仍接受请求 hex 或 `hexFlashLite` 占位，显示名严格核对。
+    `hexArgon4`（Carbon）既有核验不回归。
+  - `argonMode8Slots` 仅 `Mode==8`（Carbon）触发；Neon（Mode=3）用普通 inner。
+  - `strict_model`：`modelDowngraded` 对 `4 Neon*` 自报按前缀规则正常匹配，
+    收到 `4 Carbon` / `4 Hydrogen` / `3.5 Flash-Lite` 等异族自报准确判降级；
+    Argon↔Carbon 互认保留（同槽位两个名字互为合法自报）。
+
 ## 5.0.0
 
 ### 架构与发版规范
