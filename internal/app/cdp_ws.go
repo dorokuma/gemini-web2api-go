@@ -214,11 +214,15 @@ func (c *cdpConn) sendText(payload []byte) error {
 	return c.sendTextCtx(context.Background(), payload)
 }
 
-// sendTextCtx 同 sendText，但抢写权与写 deadline 都绑调用方 ctx：
+// sendTextCtx 同 sendText，但抢写权、写 deadline 与持权写入全程绑调用方 ctx：
 //   - 写权经容量 1 的 writeSem 获取，select 监听 ctx.Done()/closed——停机时
 //     排在阻塞写后面的 Call 不等 5s 写锁，ctx 一到立刻返回 ctx.Err()；
 //   - 写 deadline 取 min(now+cdpWriteTimeout, ctx.Deadline)：ctx 剩余的
-//     预算比 5s 短时按 ctx 算，绝不拿整条固定 5s 把停机预算拖穿。
+//     预算比 5s 短时按 ctx 算，绝不拿整条固定 5s 把停机预算拖穿；
+//   - 持写权写入期间 ctx 取消：AfterFunc 立刻 c.Close() 终态断连——写入
+//     中途被取消可能留下半帧/残帧，按 RFC 6455 该 WS 绝不能复用；同时
+//     阻塞的 conn.Write 被底层断连毫秒级唤醒，不带 deadline 的 ctx 也
+//     不等 5s 写超时。
 func (c *cdpConn) sendTextCtx(ctx context.Context, payload []byte) error {
 	select {
 	case c.writeSem <- struct{}{}:
@@ -233,13 +237,30 @@ func (c *cdpConn) sendTextCtx(ctx context.Context, payload []byte) error {
 		return errors.New("cdp ws: connection closed")
 	default:
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// 取消盯梢：写入中途被取消 = 可能已写出半帧，连接必须终态关闭，
+	// 绝不把残帧连接还给下一条消息。stop() 返回 false 说明取消已生效，
+	// 补一次幂等 Close 兜底（回调与我们可能赛跑）后优先报 ctx.Err()。
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	wd := time.Now().Add(cdpWriteTimeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(wd) {
 		wd = dl
 	}
 	_ = c.conn.SetWriteDeadline(wd)
-	defer c.conn.SetWriteDeadline(time.Time{})
-	return c.writeFrame(wsOpText, payload)
+	err := c.writeFrame(wsOpText, payload)
+	stopped := stop()
+	if !stopped {
+		_ = c.Close() // 取消已触发：确保终态断连（幂等兜底）
+		if err == nil || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	// 回调已确认停掉：不会迟到污染下一次写。
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 // sendPong 回一条 Pong。服务端 Ping 的载荷要原样带回。

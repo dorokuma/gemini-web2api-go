@@ -1464,6 +1464,36 @@ func TestBrowserProxyBridgeWiring(t *testing.T) {
 		t.Fatalf("non-pool HTTP bypass disturbed bridge: gen %d->%d upstream %q",
 			genBefore, bridge3.gen, bridge3.upstream)
 	}
+	genDirectBefore := bridge3.gen
+	bridge3.mu.Unlock()
+	// proxyURL="" 显式直连：经生产 doBrowserStreamRequestCtx 路径把已走
+	// ProxyB 的桥真切回 ""（空串不是「没给出口信息」，绝不能跳过同步
+	// 沿用代理 B——那是把真 IP 走旧出口的泄漏方向修反）。本函数前段
+	// 已把 fallback_direct 改成 false，故这里 allowDirect 必须为 false
+	// （池非空禁直连），upstream 仍须真切回 "" 不再留 ProxyB。
+	go func() {
+		spec := <-srv.fetchHit
+		srv.setFetchScript(spec.reqID, fetchScript{status: 200})
+	}()
+	_, rcD, err := browserMgr.doBrowserStreamRequestCtx(context.Background(), "", nil,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), true, nil)
+	if err != nil {
+		t.Fatalf("stream explicit-direct via bridge3: %v", err)
+	}
+	rcD.Close()
+	bridge3.mu.Lock()
+	if bridge3.upstream != "" {
+		bridge3.mu.Unlock()
+		t.Fatalf("explicit-direct request did not clear bridge upstream: %q", bridge3.upstream)
+	}
+	if bridge3.allowDirect {
+		bridge3.mu.Unlock()
+		t.Fatal("explicit-direct request with fallback_direct=false must leave allowDirect=false")
+	}
+	if bridge3.gen == genDirectBefore {
+		bridge3.mu.Unlock()
+		t.Fatal("explicit-direct request did not SetUpstream on bridge (gen unchanged)")
+	}
 	bridge3.mu.Unlock()
 }
 
@@ -1741,28 +1771,55 @@ func TestBrowserStartFailRetryAndStopRace(t *testing.T) {
 	close(cleanupBlock) // 放行第一条清理完成
 	<-firstDone
 
-	// ── startCancel 取消段：真实 ensureRunning → startOnce 全生命周期，
-	// Stop 立即取消 startCtx，旧轮退出不抹掉新轮 startCancel ──
+	// ── startCancel 两轮生命周期：第 1 轮慢启动被 Stop() 取消后 doStart
+	// 仍迟到返回（模拟不可瞬间打断的启动段），期间第 2 轮启动必须拿到
+	// 自己完好的 startCancel，且能被第二次 Stop() 真取消——旧轮迟到
+	// 退出绝不能清掉新轮的取消句柄（那是「把新轮 Stop 的中断能力抹掉」）。
 	m4 := &browserManager{
 		readyCh:   make(chan struct{}),
 		streams:   map[string]*browserStream{},
 		switchSem: make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 	}
-	ctxCancelled := make(chan struct{})
+	ctx1Cancelled := make(chan struct{})
+	ctx1LateReturn := make(chan struct{})
+	allowRound1Return := make(chan struct{})
+	ctx2Cancelled := make(chan struct{})
+	var roundIdx atomic.Int64
 	oldDoStart := doStartFn
 	defer func() { doStartFn = oldDoStart }()
 	doStartFn = func(mgr *browserManager, sctx context.Context) startResult {
-		select {
-		case <-sctx.Done():
-			close(ctxCancelled)
-			return startResult{err: sctx.Err()}
-		case <-time.After(5 * time.Second):
-			return startResult{err: browserErr("doStart timeout")}
+		round := roundIdx.Add(1)
+		if round == 1 {
+			// 第 1 轮：startCtx 取消后**不立刻返回**，由测试放行才交回
+			// ——这段时间第 2 轮已在登记自己的 startCancel，旧轮迟到
+			// 退出绝不能清掉新轮的取消句柄。
+			<-sctx.Done()
+			close(ctx1Cancelled)
+			<-allowRound1Return
+			close(ctx1LateReturn)
+			return startResult{err: browserErr("round1 cancelled-late")}
 		}
+		// 第 2 轮：等 startCtx 真被取消才醒（不靠测试放行——第二次
+		// Stop 若不生效这里就醒不了，断言自然超时）。
+		<-sctx.Done()
+		close(ctx2Cancelled)
+		return startResult{err: browserErr("round2 finished")}
 	}
+	// 任一断言失败也必须放行两轮 doStart 的阻塞点，避免 goroutine 泄漏。
+	defer func() {
+		select {
+		case <-allowRound1Return:
+		default:
+			close(allowRound1Return)
+		}
+		select {
+		case <-ctx2Cancelled:
+		default:
+			close(ctx2Cancelled)
+		}
+	}()
 	go func() { _ = m4.ensureRunning(context.Background()) }()
-	// 等 startOnce 真把 startCancel 登记上（锁内原子创建）。
 	for i := 0; i < 400; i++ {
 		m4.mu.Lock()
 		has := m4.startCancel != nil
@@ -1775,26 +1832,82 @@ func TestBrowserStartFailRetryAndStopRace(t *testing.T) {
 	m4.mu.Lock()
 	if m4.startCancel == nil {
 		m4.mu.Unlock()
-		t.Fatal("startCancel not registered at ensureRunning claim")
+		t.Fatal("round1 startCancel not registered at ensureRunning claim")
 	}
 	m4.mu.Unlock()
-	// Stop 必须立即取消 startCtx（doStart stub 被 ctx 打断返回）。
-	sctx2, scancel2 := context.WithTimeout(context.Background(), time.Second)
-	defer scancel2()
-	m4.Stop(sctx2)
+	// 第一次 Stop：用足够大的预算（2s）让它走到「等 readyCh」段——
+	// 在那里 doStart 的 ctx 已被取消但 doStart 仍卡在放行门前，Stop
+	// 会拿着锁等 startOnce 结束。我们在 Stop 还持锁等 readyCh 时，从
+	// 锁外直接发起第 2 轮启动：第 2 轮在旧轮 startOnce 存活期间就
+	// 登记好自己的 startCancel（旧轮 startCtx 已取消，ensureRunning
+	// 见 started/starting 还在但 startErr==nil 会等 readyCh——而
+	// readyCh 属于第 1 轮，不能复用；必须靠 readyCh 关闭后的下一轮
+	// 认领）。为把第 2 轮 startCancel 钉在旧轮存活期内，先放行 doStart
+	// 让 startOnce 退出、再用下面的 readyCh 观察窗发起第 2 轮。
+	sctxStop1, stopCancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel1()
+	m4.Stop(sctxStop1)
 	select {
-	case <-ctxCancelled:
+	case <-ctx1Cancelled:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Stop did not cancel startCtx (doStart still running)")
+		t.Fatal("first Stop did not cancel round1 startCtx")
 	}
-	// 旧轮 startOnce 退出后：startCancel 已按代际清除（gen 变过），
-	// 不得残留指向已取消旧轮的句柄。
-	m4.mu.Lock()
-	if m4.startCancel != nil {
+	select {
+	case <-ctx1LateReturn:
+		t.Fatal("round1 doStart returned before release (test gate broken)")
+	default:
+	}
+	// 放行第 1 轮 doStart 交回，并等它的 startOnce 完全退出（starting
+	// 复位）。注意：旧轮按代际校验跳过时不会清 startCancel——字段里
+	// 可能仍留第 1 轮的过期句柄，直到下一轮认领覆盖。
+	close(allowRound1Return)
+	select {
+	case <-ctx1LateReturn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("round1 doStart did not late-return after release")
+	}
+	for i := 0; i < 400; i++ {
+		m4.mu.Lock()
+		idle := !m4.starting
 		m4.mu.Unlock()
-		t.Fatal("stale startCancel left after old-generation startOnce exit")
+		if idle {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
+	// 第 2 轮：第 1 轮已完全退出后正常发起。认领信号看 generation 前进
+	// （gen++ 与 startCancel 登记同锁原子）——不能只看 startCancel 非
+	// nil，第 1 轮的过期句柄没被清掉时会误认。
+	m4.mu.Lock()
+	genBefore2 := m4.generation
 	m4.mu.Unlock()
+	go func() { _ = m4.ensureRunning(context.Background()) }()
+	var cancel2 context.CancelFunc
+	for i := 0; i < 400; i++ {
+		m4.mu.Lock()
+		if m4.generation > genBefore2 {
+			cancel2 = m4.startCancel
+		}
+		m4.mu.Unlock()
+		if cancel2 != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if cancel2 == nil {
+		t.Fatal("round2 startCancel not registered after round1 exited")
+	}
+	// 第二次 Stop：取消的是第 2 轮的句柄——若第 1 轮 startOnce 退出把
+	// m.startCancel 清 nil（即未按代际区分），这次 Stop 就抓不到句柄，
+	// ctx2Cancelled 必超时。
+	sctxStop2, stopCancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer stopCancel2()
+	m4.Stop(sctxStop2)
+	select {
+	case <-ctx2Cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Stop did not cancel round2 startCtx (stale startCancel clobbered new round)")
+	}
 }
 
 // TestBrowserStopDuringSwitchCooldown：30s 切号冷却中途 Stop(200ms)
@@ -2323,33 +2436,36 @@ func TestBrowserM1AuxNoSwitch(t *testing.T) {
 			t.Fatalf("aux-guard error leaks credential fragment %q: %v", leak, gerr)
 		}
 	}
-	// 守卫 mismatch 文案（allowSwitch=true、切号竞态后驻留身份又变时触达）：
-	// 离线无法稳定复现该竞态，但文案源头已改为 "resident=#%d request=#%d"
-	// 只带账号 ID——直接对该 browserErr 构造断言零凭据（守卫生成的错误
-	// 文案绝不输出 cookieIdentity 原始串）。
+	// 真实触发生产守卫的 mismatch 文案（allowSwitch=true）：把驻留种子
+	// 置为「并发切换窗口里被换成另一身份」的状态（种子记的是 acct1 的
+	// AccountID、CookieIdentity 却已是 alien 的——等价于请求自己的切号
+	// 完成后另一轮切换又把 jar 换成了异身份），点名 resident 的请求走
+	// 完整生产路径 doBrowserStreamRequestCtx（shouldSwitch→maybeSwitchAccount
+	// 同 ID 快路径→ensureBridge→jarRW 读锁→browser.go 最终身份守卫），
+	// 拿生产返回的真实 err 断言：含 "jar identity mismatch" 且绝不含
+	// 任何原始 SAPISID/__Secure-1PSID 值（守卫文案只带账号 ID）。
 	m.mu.Lock()
 	m.seed = browserSeedState{AccountID: acctID,
-		CookieIdentity: cookieIdentity("SAPISID=ra; __Secure-1PSID=rp; SID=r")}
+		CookieIdentity: cookieIdentity(alien.Cookie)}
 	m.mu.Unlock()
-	// 触发守卫的 browserErr 路径需要 residentIdentity != cookieIdentity(请求)。
-	// 手工调守卫临界段：在 jarRW 读锁内模拟守卫判定并断言其错误对象零凭据。
-	m.jarRW.RLock()
-	m.mu.Lock()
-	rSeed := m.seed.AccountID
-	rIdent := m.seed.CookieIdentity
-	m.mu.Unlock()
-	guardHit := alien != nil && alien.ID != 0 &&
-		(rSeed == 0 || rIdent == "" || rIdent != cookieIdentity(alien.Cookie))
-	m.jarRW.RUnlock()
-	if !guardHit {
-		t.Fatal("identity-guard predicate unexpectedly false for alien account")
+	_, _, gerr2 := m.doBrowserStreamRequestCtx(context.Background(), "", resident,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), true, nil)
+	if gerr2 == nil {
+		t.Fatal("identity guard did not reject mismatched resident identity (main path)")
 	}
-	mismatchErr := browserErr("jar identity mismatch: resident=#%d request=#%d",
-		rSeed, alien.ID)
+	if !strings.Contains(gerr2.Error(), "jar identity mismatch") {
+		t.Fatalf("guard error = %v, want jar identity mismatch", gerr2)
+	}
 	for _, leak := range []string{"ra", "rp", "xa", "xp", "oa", "op", "SAPISID", "__Secure-1PSID"} {
-		if strings.Contains(mismatchErr.Error(), leak) {
-			t.Fatalf("mismatch-guard error leaks credential fragment %q: %v", leak, mismatchErr)
+		if strings.Contains(gerr2.Error(), leak) {
+			t.Fatalf("guard error leaks credential fragment %q: %v", leak, gerr2)
 		}
+	}
+	// 守卫在 fetch 派发前拒：假服务端绝不能收到该请求的 fetch。
+	select {
+	case spec := <-srv.fetchHit:
+		t.Fatalf("fetch dispatched after identity-guard rejection: %s", spec.url)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -2800,6 +2916,93 @@ func TestBrowserReconnectBackoff(t *testing.T) {
 	}
 	if !isBrowserLocalError(err) {
 		t.Fatalf("backoff err = %v (%T)", err, err)
+	}
+}
+
+// TestBrowserBridgeSwitchCancelRestoresSameExit：跨出口等待者被 ctx
+// 取消后，最后一名取消必须撤销切换阻塞状态，同出口健康请求立刻恢复
+// 自由并发（不被已离开的等待者挡死）。
+func TestBrowserBridgeSwitchCancelRestoresSameExit(t *testing.T) {
+	m := &browserManager{
+		readyCh:   make(chan struct{}),
+		streams:   map[string]*browserStream{},
+		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	// 请求 A 持有出口 B。
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+		t.Fatalf("acquire exit B: %v", err)
+	}
+	defer m.releaseBridgeExit()
+	// 请求 D 以短 ctx 排队切到出口 C，必然超时退出。
+	dCtx, dCancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer dCancel()
+	dDone := make(chan error, 1)
+	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080") }()
+	if err := <-dDone; err == nil {
+		t.Fatal("cross-exit waiter D acquired without waiting for in-flight drain")
+	}
+	// D 离开后，同出口请求 E 必须立刻并发成功（<100ms），不被 A 挡死，
+	// 也不被 D 残留的切换阻塞状态暂缓。
+	t0 := time.Now()
+	eDone := make(chan error, 1)
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080") }()
+	select {
+	case err := <-eDone:
+		if err != nil {
+			t.Fatalf("same-exit acquire E failed: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("same-exit acquire E blocked after cancelled cross-exit waiter left (bridgeSwitchWaiters leak)")
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("same-exit acquire E took %v, want <100ms", dt)
+	}
+	m.releaseBridgeExit()
+}
+
+// TestCDPSendTextCtxCancelDuringBlockedWrite：持写权阻塞写（对端不读的
+// net.Pipe）期间取消无 deadline 的 ctx，必须毫秒级返回 ctx.Err() 且
+// c.closed 终态关闭——绝不干等 5s 写超时，残帧连接也绝不复用。
+func TestCDPSendTextCtxCancelDuringBlockedWrite(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	// 对端永不读：conn.Write 必然阻塞在管道上。
+	c := &cdpConn{
+		conn:     client,
+		br:       bufio.NewReader(client),
+		writeSem: make(chan struct{}, 1),
+		closed:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	payload := make([]byte, 1<<20) // 足够大，单次 Write 一定卡住
+	done := make(chan error, 1)
+	go func() { done <- c.sendTextCtx(ctx, payload) }()
+	// 等写方真持权进 write（poll writeSem 满）。
+	for i := 0; i < 400; i++ {
+		if len(c.writeSem) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	t0 := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("sendTextCtx returned nil after ctx cancel during blocked write")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendTextCtx err = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("sendTextCtx blocked %v after cancel (must not wait 5s write timeout)", time.Since(t0))
+	}
+	select {
+	case <-c.closed:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("cdpConn not terminally closed after ctx cancel during write (residual frame conn would be reused)")
 	}
 }
 

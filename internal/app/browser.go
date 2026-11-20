@@ -249,17 +249,19 @@ type browserManager struct {
 	jarRW sync.RWMutex
 
 	// 桥出口切换协调：共享桥同一时刻只有一个「在飞出口」。同出口请求
-	// 自由并发（acquireBridgeExit 计数+1 即走）；出口不同的请求在
-	// bridgeSwitching 下等桥在飞流归零——彻底消除「请求 A 刚
+	// 自由并发（acquireBridgeExit 计数+1 即走）；出口不同的请求登记
+	// bridgeSwitchWaiters 等桥在飞流归零——彻底消除「请求 A 刚
 	// SetUpstream(B) 还没 evaluate，并发请求 B 就 SetUpstream(C) 改走 C
-	// 并切断 A 的在飞隧道」的竞态。bridgeSwitching 为 true 时
+	// 并切断 A 的在飞隧道」的竞态。bridgeSwitchWaiters > 0 时
 	// acquireBridgeExit 等待、release 归零唤醒（与 mutex/cond 同款的
-	// 广播重查模型，不引 cond 是为了 ctx.Done 响应）。
-	bridgeMu        sync.Mutex
-	bridgeActiveURL string // 当前桥在飞请求的出口（"" = 直连）
-	bridgeInFlight  int    // 当前出口的在飞浏览器流数
-	bridgeSwitching bool   // 出口切换等待中：新 acquire 必须排队
-	bridgeWait      chan struct{}
+	// 广播重查模型，不引 cond 是为了 ctx.Done 响应）。计数器替代布尔：
+	// 等待方被 ctx 取消时逐个撤销登记，最后一名跨出口等待者取消后
+	// 广播唤醒被暂缓的同出口请求恢复自由并发。
+	bridgeMu            sync.Mutex
+	bridgeActiveURL     string // 当前桥在飞请求的出口（"" = 直连）
+	bridgeInFlight      int    // 当前出口的在飞浏览器流数
+	bridgeSwitchWaiters int    // 跨出口切换等待者计数：>0 时新 acquire 必须排队
+	bridgeWait          chan struct{}
 
 	// recreateTab 单飞：targetDestroyed 事件（自己 closeTarget 也会触发它）
 	// 与 Inspector.targetCrashed 可能同时到，单飞防连环重建。
@@ -471,12 +473,36 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 // acquireBridgeExit 为一条即将发出的浏览器流认领出口。
 //   - 无在飞流：直接原子切换桥到 url（同 URL 时 SetUpstream 是零成本 no-op），
 //     成为该出口的第一条在飞流；
-//   - 有在飞流且同出口：计数+1 自由并发；
-//   - 有在飞流但出口不同：置 bridgeSwitching 等待旧出口在飞归零，或
-//     ctx.Done() 放弃返回 ctx.Err()——绝不半路切出口切断别人的在飞隧道。
+//   - 有在飞流且同出口、且无跨出口等待者：计数+1 自由并发；
+//   - 有在飞流但出口不同（或同出口但有切换方在等）：登记
+//     bridgeSwitchWaiters 等旧出口在飞归零，或 ctx.Done() 放弃返回
+//     ctx.Err()——绝不半路切出口切断别人的在飞隧道。
+//
+// 等待登记用计数器不用布尔：跨出口等待者可能不止一条，其中一条被
+// ctx 取消必须只撤销自己的登记（registered 局部标记防重复扣减）；
+// 最后一名等待者离开时关闭并重建广播 channel，唤醒被暂缓的同出口
+// 请求——否则一名跨出口等待者的取消会把健康同出口请求永久挡死。
 func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) error {
 	m.bridgeMu.Lock()
+	registered := false
+	defer func() {
+		m.bridgeMu.Lock()
+		if registered {
+			m.bridgeSwitchWaiters--
+		}
+		// 最后一名跨出口等待者离开：广播唤醒被暂缓的同出口请求
+		// 重新竞争；仍有其他等待者时不动 bridgeWait，他们继续在
+		// 同一个 channel 上等。
+		if m.bridgeSwitchWaiters == 0 && m.bridgeWait != nil {
+			close(m.bridgeWait)
+			m.bridgeWait = nil
+		}
+		m.bridgeMu.Unlock()
+	}()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if m.bridgeInFlight == 0 {
 			syncBridgeUpstream(url)
 			m.bridgeActiveURL = url
@@ -484,13 +510,16 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		if !m.bridgeSwitching && m.bridgeActiveURL == url {
+		if m.bridgeSwitchWaiters == 0 && m.bridgeActiveURL == url {
 			m.bridgeInFlight++
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		// 出口不同（或同出口但有切换方在等）：排队等旧出口在飞归零。
-		m.bridgeSwitching = true
+		// 出口不同（或同出口但有切换方在等）：登记排队等旧出口在飞归零。
+		if !registered {
+			m.bridgeSwitchWaiters++
+			registered = true
+		}
 		if m.bridgeWait == nil {
 			m.bridgeWait = make(chan struct{})
 		}
@@ -512,12 +541,11 @@ func (m *browserManager) releaseBridgeExit() {
 	if m.bridgeInFlight > 0 {
 		m.bridgeInFlight--
 	}
-	if m.bridgeInFlight == 0 && m.bridgeSwitching {
+	if m.bridgeInFlight == 0 && m.bridgeSwitchWaiters > 0 {
 		if m.bridgeWait != nil {
 			close(m.bridgeWait)
 			m.bridgeWait = nil
 		}
-		m.bridgeSwitching = false
 	}
 	m.bridgeMu.Unlock()
 }
