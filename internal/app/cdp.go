@@ -178,11 +178,13 @@ func (c *cdpClient) Call(ctx context.Context, sessionID, method string, params i
 	}
 }
 
-// Close 礼貌地发 Close 帧（短 deadline，发不出就算了）再断连，
-// 唤醒所有 pending。先 conn.Close 再 failAll：conn 关死立刻唤醒所有
-// 阻塞读写，failAll 再唤醒 pending 调用方，两边都不会被拖住。
+// Close 直接断底层连接再唤醒所有 pending，**不发礼貌 Close 帧**：
+// sendClose 要排队抢 writeMu——若有一个阻塞中的 sendText 正持锁
+// （对端不收、5s 写超时未到），Close 自己就排在它后面被拖住，
+// 停机预算被白白吃掉。cdpConn.Close 立即 close(closed)+conn.Close，
+// 瞬间打断任何阻塞中的 sendText 与 writeMu 持有者，再 failAll 唤醒
+// pending 调用方——两端都不被拖。
 func (c *cdpClient) Close() {
-	c.conn.sendClose()
 	c.conn.Close()
 	c.failAll(errors.New("cdp: client closed"))
 }

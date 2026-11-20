@@ -67,6 +67,18 @@ func browserErr(format string, args ...interface{}) error {
 	return &browserLocalError{err: fmt.Errorf(format, args...)}
 }
 
+// errBrowserSkipAux 是辅助/管理入口（allowSwitch=false）的专用哨兵：
+// 「这条请求不该借驻留 jar，请回退纯 Go HTTP」。它**刻意不是**
+// browserLocalError——浏览器本身没有坏，只是辅助入口点名了非驻留号/
+// 驻留号不可用，绝不能把它归 browser_unavailable 回 502，也绝不能受
+// browser_fallback_http 开关控制（辅助入口无条件回退纯 Go HTTP）。
+var errBrowserSkipAux = errors.New("browser: resident jar not applicable for auxiliary entry")
+
+// isBrowserAuxSkip 判断错误是不是辅助入口哨兵。
+func isBrowserAuxSkip(err error) bool {
+	return errors.Is(err, errBrowserSkipAux)
+}
+
 // pageFetchErr 是页内 fetch 的上游网络错误（TypeError: Failed to fetch 等）。
 // 它经 handleBridgePush 的 kind:"error" 到达，不带 browserLocalError 包装：
 // 调用方拿到它跟拿到 Go 侧 client.Do 的网络错完全同义——计代理健康度、
@@ -199,6 +211,15 @@ type browserManager struct {
 	generation   uint64      // 每次实例重建/清场自增，迟到回调靠它认出旧实例
 	ready        atomic.Bool // running 态的只读快查（写仍在 mu 下）
 
+	// cleaning 是清场单飞标志：handleDeadLocked 认领清场时置位，期间
+	// ensureRunning 一律拒绝新代际、第二个并发 handleDeadLocked 直接放弃——
+	// 两条并发崩溃路径同时清场会把刚发布的新代际踩坏。
+	cleaning bool
+	// startCancel 取消本轮 doStart（stopImpl 开头立即调用）：冷启动中途的
+	// Stop 不再等 doStart 自然走完 15s+ 的 waitDevToolsPort/dial 超时，
+	// 也不会在 Stop 超时后留下没人回收的启动中 Chromium。
+	startCancel context.CancelFunc
+
 	// 崩溃自愈：时间戳退避门控（不 sleep 占锁，退避期内直接回错）
 	crashStreak int
 	stableSince time.Time // 上次崩溃后稳定运行起点，>60s 清零 crashStreak
@@ -277,6 +298,10 @@ func (m *browserManager) ensureRunning(ctx context.Context) error {
 		m.mu.Unlock()
 		return browserErr("browser is shut down")
 	}
+	if m.stopping || m.cleaning {
+		m.mu.Unlock()
+		return browserErr("browser stopping or cleaning")
+	}
 	if m.started && !m.starting && m.readyCh != nil {
 		// 启动已完成：校验活着
 		if m.startErr == nil {
@@ -285,13 +310,16 @@ func (m *browserManager) ensureRunning(ctx context.Context) error {
 				m.mu.Unlock()
 				return nil
 			}
-			// 死了：进崩溃自愈（记退避、清场、下次重建）
+			// 死了：进崩溃自愈（记退避、清场、下次重建）。handleDeadLocked
+			// 只在当前 client/proc 仍是这条死实例时才认领清场。
+			deadClient := m.client
+			deadGen := m.generation
 			m.mu.Unlock()
-			m.handleDeadLocked()
+			m.handleDeadLocked(deadClient, deadGen)
 			m.mu.Lock()
 			// handleDeadLocked 清理期间可能进来过 Stop/Shutdown：重新判终态，
 			// 不能拿着清场前的快照继续往启动分支走。
-			if m.shuttingDown || m.stopping {
+			if m.shuttingDown || m.stopping || m.cleaning {
 				m.mu.Unlock()
 				return browserErr("browser is shutting down")
 			}
@@ -335,15 +363,24 @@ func (m *browserManager) ensureRunning(ctx context.Context) error {
 	}
 }
 
-// handleDeadLocked 处理「实例活着的检查没过」：记一次 crash、锁内只提取
-// 要清理的旧实例引用并立刻复位（proc/client/session/target/started 置空、
-// generation+1），放锁后做真正清理（杀进程组、关 client/bridge、判死在
-// 飞流），清理完成回锁写 nextRetryAt——退避从「清理完」起算，不再把
-// 1.5s 杀进程时间白塞进退避窗口；只有未进 stopping/shuttingDown 且
-// 期间没换过代际时才写。
+// handleDeadLocked 处理「实例活着的检查没过」。**单飞清场**：只有
+// (m.client == expectedClient && m.generation == expectedGen) 且不在
+// stopping/shuttingDown/cleaning 的调用方才认领清场——两条并发崩溃路径
+// 同时清场会把对方刚发布的新代际踩坏，第二个调用方直接放弃返回。
+//
+// 认领后：锁内置 cleaning 单飞标志 + 代际+1 + 复位实例字段（proc/client/
+// session/target/started/bridge），放锁做真正清理（杀进程组、关 client/
+// bridge、判死在飞流），清理完成回锁写 nextRetryAt（退避从「清理完」起算）
+// 并复位 cleaning。期间 ensureRunning 拒绝新启动，杜绝清理半途又并行拉起
+// 一个 doStart。
 // 调用方不持锁。
-func (m *browserManager) handleDeadLocked() {
+func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen uint64) {
 	m.mu.Lock()
+	if m.client != expectedClient || m.generation != expectedGen ||
+		m.cleaning || m.stopping || m.shuttingDown {
+		m.mu.Unlock()
+		return // 已被别的路径认领/换过代际：不是我要清的场
+	}
 	if time.Since(m.stableSince) > 60*time.Second {
 		m.crashStreak = 0
 	}
@@ -361,7 +398,9 @@ func (m *browserManager) handleDeadLocked() {
 	client := m.client
 	bridge := m.bridge
 	gen := m.generation
-	// 清场复位：下一次 ensureRunning 重新拉起
+	// 清场复位：cleaning 单飞标志挡新启动，下一次 ensureRunning 等 cleaning
+	// 复位后重新拉起。
+	m.cleaning = true
 	m.proc = nil
 	m.client = nil
 	m.sessionID = ""
@@ -387,11 +426,12 @@ func (m *browserManager) handleDeadLocked() {
 	m.failAllStreams(browserErr("browser instance died; streams aborted"))
 
 	// 清理完回锁写退避：期间若已被 Stop/Shutdown 或换了新代际，
-	// 退避时间表不归这次清理管。
+	// 退避时间表不归这次清理管。cleaning 无条件复位放行下一轮启动。
 	m.mu.Lock()
 	if !m.stopping && !m.shuttingDown && m.generation == gen+1 {
 		m.nextRetryAt = time.Now().Add(wait)
 	}
+	m.cleaning = false
 	m.mu.Unlock()
 }
 
@@ -406,8 +446,14 @@ func (m *browserManager) handleDeadLocked() {
 //     重新拉起（彻底修掉失败永久锁死）；
 //   - 匹配且成功：把局部资源发布进 m.*，置 started/ready，关 ready。
 func (m *browserManager) startOnce(gen uint64, ready chan struct{}) {
-	res := m.doStart()
+	startCtx, startCancel := context.WithCancel(context.Background())
 	m.mu.Lock()
+	m.startCancel = startCancel
+	m.mu.Unlock()
+	res := m.doStart(startCtx)
+	startCancel()
+	m.mu.Lock()
+	m.startCancel = nil
 	if m.generation != gen || m.stopping || m.shuttingDown {
 		// 本轮已过时：就地回收局部成果，绝不写 m.*、绝不碰 m.readyCh。
 		m.mu.Unlock()
@@ -439,13 +485,15 @@ func (m *browserManager) startOnce(gen uint64, ready chan struct{}) {
 		}
 		m.nextRetryAt = time.Now().Add(browserCrashBackoffs[idx])
 	} else {
-		// 本轮成功：局部资源发布进 m.*。
+		// 本轮成功：局部资源发布进 m.*（含 doStart 局部恢复的 seed-state——
+		// doStart 全程不碰 m.seed，只有代际校验通过才统一发布）。
 		m.proc = res.proc
 		m.client = res.client
 		m.bridge = res.bridge
 		m.sessionID = res.sessionID
 		m.targetID = res.targetID
 		m.profileDir = res.profileDir
+		m.seed = res.seed
 		m.stableSince = time.Now()
 		m.started = true
 		m.starting = false
@@ -466,6 +514,7 @@ type startResult struct {
 	sessionID  string
 	targetID   string
 	profileDir string
+	seed       browserSeedState
 	err        error
 }
 
@@ -482,7 +531,7 @@ func (r *startResult) discard() {
 	}
 }
 
-func (m *browserManager) doStart() (res startResult) {
+func (m *browserManager) doStart(ctx context.Context) (res startResult) {
 	bin, err := discoverBrowserBinary(cfgBrowserPath())
 	if err != nil {
 		res.err = err
@@ -544,13 +593,13 @@ func (m *browserManager) doStart() (res startResult) {
 	// --remote-debugging-port=0 让它自己挑空闲端口，我们只认这个文件。
 	// 启动前必须删掉上一轮的残留：死端口文件会让这里连上一个没人听的地址。
 	_ = os.Remove(filepath.Join(absProfileDir, "DevToolsActivePort"))
-	wsURL, err := waitDevToolsPort(absProfileDir, proc, 15*time.Second)
+	wsURL, err := waitDevToolsPort(ctx, absProfileDir, proc, 15*time.Second)
 	if err != nil {
 		cleanup()
 		res.err = err
 		return res
 	}
-	conn, err := dialCDPWebsocket(context.Background(), wsURL)
+	conn, err := dialCDPWebsocket(ctx, wsURL)
 	if err != nil {
 		cleanup()
 		res.err = browserErr("cdp dial: %w", err)
@@ -568,7 +617,7 @@ func (m *browserManager) doStart() (res startResult) {
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
-	if err := client.callCDPWithTimeout(context.Background(), 15*time.Second, "",
+	if err := client.callCDPWithTimeout(ctx, 15*time.Second, "",
 		"Target.createTarget",
 		map[string]interface{}{"url": "https://gemini.google.com/app"}, &created); err != nil {
 		client.Close()
@@ -581,7 +630,7 @@ func (m *browserManager) doStart() (res startResult) {
 	var attached struct {
 		SessionID string `json:"sessionId"`
 	}
-	if err := client.callCDPWithTimeout(context.Background(), 10*time.Second, "",
+	if err := client.callCDPWithTimeout(ctx, 10*time.Second, "",
 		"Target.attachToTarget",
 		map[string]interface{}{"targetId": created.TargetID, "flatten": true},
 		&attached); err != nil {
@@ -593,22 +642,26 @@ func (m *browserManager) doStart() (res startResult) {
 	}
 	res.sessionID = attached.SessionID
 
-	if err := m.enablePageDomainFor(client, res.sessionID); err != nil {
+	if err := m.enablePageDomainFor(ctx, client, res.sessionID); err != nil {
 		client.Close()
 		res.client = nil
 		cleanup()
 		res.err = err
 		return res
 	}
-	if err := m.installBridgeFor(client, res.sessionID); err != nil {
+	if err := m.installBridgeFor(ctx, client, res.sessionID); err != nil {
 		client.Close()
 		res.client = nil
 		cleanup()
 		res.err = err
 		return res
 	}
-	if err := m.restoreSeedStateFrom(absProfileDir); err != nil {
+	// seed-state 恢复到本轮局部成果：不直接写 m.seed——代际校验没过
+	// （Stop/清场发生在启动中途）时绝不污染新代际的驻留状态。
+	if seed, err := readSeedState(absProfileDir); err != nil {
 		logf("[browser] seed-state 恢复失败（将按未播种处理）: %v", err)
+	} else {
+		res.seed = seed
 	}
 	return res
 }
@@ -880,10 +933,16 @@ func browserDetected() string {
 
 // waitDevToolsPort 等 Chromium 把 DevToolsActivePort 写进 profileDir。
 // 文件第一行是端口，第二行是 WS 路径（/devtools/browser/<uuid>）。
-func waitDevToolsPort(profileDir string, proc *browserProc, timeout time.Duration) (string, error) {
+// ctx 取消（stopImpl 打断冷启动）立即返回，不再睡满 timeout。
+func waitDevToolsPort(ctx context.Context, profileDir string, proc *browserProc, timeout time.Duration) (string, error) {
 	path := filepath.Join(profileDir, "DevToolsActivePort")
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", browserErr("startup cancelled: %w", ctx.Err())
+		default:
+		}
 		if !proc.Alive() {
 			return "", browserErr("browser exited during startup (check chromium install)")
 		}
@@ -896,7 +955,11 @@ func waitDevToolsPort(profileDir string, proc *browserProc, timeout time.Duratio
 				return "ws://127.0.0.1:" + port + wsPath, nil
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return "", browserErr("startup cancelled: %w", ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	return "", browserErr("DevToolsActivePort not written within %s", timeout)
 }
@@ -1048,18 +1111,18 @@ func (m *browserManager) enablePageDomain() error {
 	m.mu.Lock()
 	client, sess := m.client, m.sessionID
 	m.mu.Unlock()
-	return m.enablePageDomainFor(client, sess)
+	return m.enablePageDomainFor(context.Background(), client, sess)
 }
 
 // enablePageDomainFor 是 enablePageDomain 的显式参数版：doStart 用它对
 // 本轮局部 client/session 开 Page 域，不依赖 m.*。
-func (m *browserManager) enablePageDomainFor(client *cdpClient, sess string) error {
+func (m *browserManager) enablePageDomainFor(ctx context.Context, client *cdpClient, sess string) error {
 	if client == nil || sess == "" {
 		return browserErr("no page session for Page.enable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return client.Call(ctx, sess, "Page.enable", nil, nil)
+	return client.Call(cctx, sess, "Page.enable", nil, nil)
 }
 
 // installBridge 注入 window.__gwBridge：Runtime.addBinding("__gwPush") 让页面
@@ -1079,23 +1142,23 @@ func (m *browserManager) installBridge() error {
 	m.mu.Lock()
 	client, sess := m.client, m.sessionID
 	m.mu.Unlock()
-	return m.installBridgeFor(client, sess)
+	return m.installBridgeFor(context.Background(), client, sess)
 }
 
 // installBridgeFor 是 installBridge 的显式参数版：doStart / recreateTab
 // 用它对局部 client/session 注入桥，不依赖 m.*。
-func (m *browserManager) installBridgeFor(client *cdpClient, sess string) error {
+func (m *browserManager) installBridgeFor(ctx context.Context, client *cdpClient, sess string) error {
 	if client == nil || sess == "" {
 		return browserErr("no page session for bridge install")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	// addBinding 只对未来/现存 context 生效；页面加载中的旧 context 销毁后
 	// binding 随之消失，所以必须等页面就位（waitPageLoad）再注册——否则
 	// __gwPush 在加载完的 document 里是 undefined，push 全部被 JS 里的
 	// try/catch 静默吞掉，流永远等不到 headers（实测就是这么挂死的）。
-	m.waitPageLoad(ctx, client, sess)
-	if err := client.Call(ctx, sess, "Runtime.addBinding",
+	m.waitPageLoad(cctx, client, sess)
+	if err := client.Call(cctx, sess, "Runtime.addBinding",
 		map[string]interface{}{"name": "__gwPush"}, nil); err != nil {
 		return browserErr("addBinding: %w", err)
 	}
@@ -1163,11 +1226,11 @@ func (m *browserManager) installBridgeFor(client *cdpClient, sess string) error 
 	// 但当前页面的 document 可能已经在加载中（createTarget 带 url 就开了导航），
 	// 钩子的时序不保证赶得上这第一页——所以等 load 后再就地 evaluate 注入一次，
 	// 覆盖两种时序（重复注入幂等，window.__gwBridge 覆盖无副作用）。
-	if err := client.Call(ctx, sess, "Page.addScriptToEvaluateOnNewDocument",
+	if err := client.Call(cctx, sess, "Page.addScriptToEvaluateOnNewDocument",
 		map[string]interface{}{"source": src}, nil); err != nil {
 		return err
 	}
-	return client.Call(ctx, sess, "Runtime.evaluate",
+	return client.Call(cctx, sess, "Runtime.evaluate",
 		map[string]interface{}{"expression": src, "awaitPromise": false}, nil)
 }
 
@@ -1241,31 +1304,22 @@ func (m *browserManager) waitPageLoad(ctx context.Context, client *cdpClient, se
 
 // ─── Cookie 播种 / 反向同步 / 策略 M1 切号 ───────────────────────────────────
 
-func (m *browserManager) restoreSeedState() error {
-	m.mu.Lock()
-	dir := m.profileDir
-	m.mu.Unlock()
-	return m.restoreSeedStateFrom(dir)
-}
-
-// restoreSeedStateFrom 从指定 profile 目录恢复 seed-state（doStart 走它，
-// profileDir 是本轮局部变量，不依赖 m.*）。
-func (m *browserManager) restoreSeedStateFrom(dir string) error {
+// readSeedState 从指定 profile 目录读 seed-state 为**局部值**（doStart 用它，
+// 全程不碰 m.seed——只在 startOnce 代际校验通过后才统一发布，启动中途的
+// Stop/清场不会把旧驻留态写进新代际）。
+func readSeedState(dir string) (browserSeedState, error) {
+	var s browserSeedState
 	if dir == "" {
-		return nil
+		return s, nil
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "seed-state.json"))
 	if err != nil {
-		return nil // 没播种过，正常
+		return s, nil // 没播种过，正常
 	}
-	var s browserSeedState
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return err
+		return s, err
 	}
-	m.mu.Lock()
-	m.seed = s
-	m.mu.Unlock()
-	return nil
+	return s, nil
 }
 
 func (m *browserManager) persistSeedState() {
@@ -1501,17 +1555,20 @@ func (m *browserManager) maybeSwitchAccount(ctx context.Context, next *CookieAcc
 	return nil
 }
 
-// shouldSwitch 判断当前驻留号是不是必须换。**只认驻留号自身坏掉**：
+// shouldSwitch 忠实回答一个问题：**当前 jar 是否需要切号才能服务 next**。
+// 它只看 jar 的客观状态，不看调用方有没有切号权限：
+//   - 未播种（seed.AccountID == 0）；
 //   - 驻留号被停用/删除（accountByID 查不到或 status != enabled）；
-//   - 驻留号在 exclude（strict_model 冷却进入排除集合）。
+//   - 驻留号在 exclude（strict_model 冷却进入排除集合）；
+//   - next 点名的 Cookie 身份与驻留 jar 不同（同 cookieIdentity 的不同
+//     authuser 不算切号——共用同一 jar，/u/N 由请求路径区分）。
 //
-// 「请求点名别的号」不再触发切号：辅助/后台入口（Cookie 检测、视频额度、
-// 后台 XSRF 刷新、异步删会话）会用各自的账号调进来，让它们换号等于把
-// 正常驻留的主号偷换掉——那些入口拿到「驻留号还在」的结论后应自行决定
-// 跳过浏览器路径或复用驻留号，见调用方的 shouldSwitch 结果使用。
-//
-// 同 cookieIdentity 的不同 authuser 不算切号（共用 jar，见 maybeSwitchAccount）。
-func (m *browserManager) shouldSwitch(next *CookieAccount, allowSwitch bool, exclude map[int64]bool) (bool, string) {
+// allowSwitch 在这里**绝不参与**：true/false 拿到的是同一份事实。把
+// 「不许切」折成「不需切」是 R3 查出的串号根源——辅助入口点名非驻留号
+// 时会被假装的 need=false 放行，fetch 直接发进驻留 jar。正确的分工是：
+// shouldSwitch 报事实，调用方按 need && !allowSwitch 返回 errBrowserSkipAux
+// 回退纯 Go HTTP。
+func (m *browserManager) shouldSwitch(next *CookieAccount, exclude map[int64]bool) (bool, string) {
 	m.mu.Lock()
 	cur := m.seed.AccountID
 	curIdentity := m.seed.CookieIdentity
@@ -1526,18 +1583,38 @@ func (m *browserManager) shouldSwitch(next *CookieAccount, allowSwitch bool, exc
 	if exclude[cur] {
 		return true, "resident in strict_model cooldown"
 	}
-	// 辅助/管理入口（allowSwitch=false）：驻留号还活着时绝不切号，
-	// 防止遍历非驻留账号的入口把驻留主号偷换掉。
-	if !allowSwitch {
-		return false, ""
-	}
-	if next != nil && next.ID != cur && curIdentity != "" &&
-		curIdentity != cookieIdentity(next.Cookie) {
-		// 请求点名另一个身份的号时才换；同身份异 authuser 由
-		// maybeSwitchAccount 的同身份快路径处理。
+	if next != nil && next.ID != 0 && curIdentity != "" &&
+		cookieIdentity(next.Cookie) != "" && curIdentity != cookieIdentity(next.Cookie) {
+		// 请求点名另一个 Cookie 身份的号：jar 必须换（同身份异 authuser
+		// 由 maybeSwitchAccount 的同身份快路径处理，不算切号）。
 		return true, "request targets another account identity"
 	}
 	return false, ""
+}
+
+// auxJarBlocked 判断辅助入口（allowSwitch=false）能否安全使用当前驻留 jar：
+// 未播种、驻留号已不可用、或点名账号的 Cookie 身份与驻留不一致，一律
+// 返回 errBrowserSkipAux——辅助请求绝不借驻留 jar 发，也绝不包装成
+// browserLocalError 触发 502，由调用方无条件回退纯 Go HTTP。
+// 返回 nil 表示「驻留 jar 与请求身份一致 / 匿名请求」，可以安全使用。
+func (m *browserManager) auxJarBlocked(account *CookieAccount) error {
+	if account == nil {
+		return nil // 匿名请求 omitCredentials，不依赖 jar 身份
+	}
+	m.mu.Lock()
+	seedID := m.seed.AccountID
+	seedIdentity := m.seed.CookieIdentity
+	m.mu.Unlock()
+	if seedID == 0 {
+		return errBrowserSkipAux // 未播种：辅助入口不做首次播种（那是主请求的职责）
+	}
+	if acc := accountByID(seedID); acc == nil || acc.Status != "enabled" {
+		return errBrowserSkipAux // 驻留号已不可用：辅助入口不负责切号
+	}
+	if seedIdentity == "" || cookieIdentity(account.Cookie) != seedIdentity {
+		return errBrowserSkipAux // 非驻留身份：发进去就串号
+	}
+	return nil
 }
 
 // ─── 流式管道 ────────────────────────────────────────────────────────────────
@@ -1792,6 +1869,12 @@ func (m *browserManager) unregisterStream(s *browserStream) {
 }
 
 // failAllStreams 在浏览器层出大事故（Tab 崩、WS 断）时把所有在飞流判死。
+// 每条流同时做三件事：
+//   - pushHeaderErr：还在等 headers 的调用方毫秒级醒来；
+//   - fail：标记终态 + 唤醒 queue 等待方 + close(closed)；
+//   - pipeR.Close：headers 后已收 chunk、正阻塞在 pipeW.Write 的背压
+//     pumpToPipe 立刻被唤醒退出——不关它的话泵协程带着队列与缓冲
+//     一直挂到调用方自己 Close（可能永远不会来）。
 func (m *browserManager) failAllStreams(err error) {
 	m.streamRegMu.Lock()
 	list := make([]*browserStream, 0, len(m.streams))
@@ -1800,7 +1883,9 @@ func (m *browserManager) failAllStreams(err error) {
 	}
 	m.streamRegMu.Unlock()
 	for _, s := range list {
+		s.pushHeaderErr(err)
 		s.fail(err)
+		_ = s.pipeR.Close()
 	}
 }
 
@@ -1821,29 +1906,43 @@ func (m *browserManager) failAllStreams(err error) {
 func (m *browserManager) doBrowserStreamRequest(ctx context.Context,
 	account *CookieAccount, fetchURL, method string, headers map[string]string, body []byte,
 	allowSwitch bool, exclude map[int64]bool) (int, io.ReadCloser, error) {
+	return m.doBrowserStreamRequestCtx(ctx, "", account, fetchURL, method, headers, body, allowSwitch, exclude)
+}
+
+// doBrowserStreamRequestCtx 比 doBrowserStreamRequest 多收一个 proxyURL：
+// ensureRunning 刚完成的冷启动桥用的是首航保守出口（initialBridgeUpstream），
+// 本次请求真正选定的 proxyURL 必须在 fetch 派发前同步到桥——冷启动丢
+// proxyURL 会让第一发请求走错出口/被禁直连的桥拒掉。
+// proxyURL="" 时不动桥（调用方没给出口信息，维持首航/上次状态）。
+func (m *browserManager) doBrowserStreamRequestCtx(ctx context.Context, proxyURL string,
+	account *CookieAccount, fetchURL, method string, headers map[string]string, body []byte,
+	allowSwitch bool, exclude map[int64]bool) (int, io.ReadCloser, error) {
 
 	if err := m.ensureRunning(ctx); err != nil {
 		return 0, nil, err
 	}
 
 	m.mu.Lock()
-	if m.shuttingDown || m.stopping {
+	if m.shuttingDown || m.stopping || m.cleaning {
 		m.mu.Unlock()
 		return 0, nil, browserErr("browser is shutting down")
 	}
 	m.mu.Unlock()
 
 	// 策略 M1：有驻留号时优先用驻留号；要换号走 maybeSwitchAccount。
-	// allowSwitch=false（辅助/管理入口）：驻留号还活着时绝不切号，
-	// 辅助入口遍历非驻留账号不偷换驻留 jar。
+	// allowSwitch=false（辅助/管理入口）：jar 不能用 = errBrowserSkipAux
+	// 无条件回退纯 Go HTTP——绝不借用驻留 jar，也绝不报 502。
 	if account != nil {
-		need, reason := m.shouldSwitch(account, allowSwitch, exclude)
-		if need {
-			if !allowSwitch {
-				return 0, nil, browserErr("resident account unavailable (%s); auxiliary entry must not switch", reason)
-			}
-			if err := m.maybeSwitchAccount(ctx, account, reason); err != nil {
+		if !allowSwitch {
+			if err := m.auxJarBlocked(account); err != nil {
 				return 0, nil, err
+			}
+		} else {
+			need, reason := m.shouldSwitch(account, exclude)
+			if need {
+				if err := m.maybeSwitchAccount(ctx, account, reason); err != nil {
+					return 0, nil, err
+				}
 			}
 		}
 	}
@@ -1896,11 +1995,15 @@ func (m *browserManager) doBrowserStreamRequest(ctx context.Context,
 	// maybeSwitchAccount 的写锁（清种+播种）互斥。拿锁期间驻留身份
 	// 不可能被偷换——A 核完身份后，切号的写锁要等到 A 的 fetch 已经
 	// 派发进当前 jar 才放行，Cookie 与 Token 永不混配。
+	// 冷启动后首次走这里时 proxyURL 同步也在这把锁里做：bridge 已存在
+	// （ensureRunning 成功保证非 nil），仅在相对当前桥出口确实变更时
+	// 才 SetUpstream——不扰动已稳定的隧道。
 	m.jarRW.RLock()
 	m.mu.Lock()
 	client := m.client
 	sess := m.sessionID
 	residentSeed := m.seed.AccountID
+	residentIdentity := m.seed.CookieIdentity
 	m.mu.Unlock()
 	if client == nil {
 		m.jarRW.RUnlock()
@@ -1908,14 +2011,24 @@ func (m *browserManager) doBrowserStreamRequest(ctx context.Context,
 		s.fail(browserErr("cdp client gone"))
 		return 0, nil, s.fatalErr
 	}
-	// 主请求（allowSwitch）且点名了账号：驻留身份必须就是请求要的号。
-	// 辅助入口点名非驻留号时 shouldSwitch 已保证不切号——此时 fetch 若
-	// 直接发进驻留 jar 会串号，该路径本不该走浏览器（调用方负责回退）。
-	// 兜底再核一次：allowSwitch 且 account 点名了别的号但 jar 没换，拒绝发。
-	if allowSwitch && account != nil && account.ID != 0 && residentSeed != account.ID {
+	if proxyURL != "" {
+		syncBridgeUpstream(proxyURL)
+	}
+	// 最终身份守卫（无条件，不看 allowSwitch）：点名了账号的请求，其
+	// Cookie 身份必须与驻留 jar 一致才允许发——异身份无论主请求还是
+	// 辅助入口都绝不串进 jar。同 cookieIdentity 的不同 authuser（DB 里
+	// ID 不同但 Cookie 同串）合法共用 jar，/u/N 由请求路径区分。
+	if account != nil && account.ID != 0 &&
+		(residentSeed == 0 || residentIdentity == "" ||
+			residentIdentity != cookieIdentity(account.Cookie)) {
 		m.jarRW.RUnlock()
 		stopWatch()
-		s.fail(browserErr("resident account #%d != requested #%d (jar mismatch)", residentSeed, account.ID))
+		if !allowSwitch {
+			s.fail(errBrowserSkipAux)
+			return 0, nil, errBrowserSkipAux
+		}
+		s.fail(browserErr("jar identity mismatch: resident %q != request %q",
+			residentIdentity, cookieIdentity(account.Cookie)))
 		return 0, nil, s.fatalErr
 	}
 	errEval := client.Call(ctx, sess, "Runtime.evaluate",
@@ -1993,7 +2106,14 @@ func (sc *streamReadCloser) Close() error {
 func (m *browserManager) doBrowserFetch(ctx context.Context,
 	account *CookieAccount, fetchURL, method string, headers map[string]string, body []byte,
 	allowSwitch bool, exclude map[int64]bool) (int, []byte, error) {
-	status, rc, err := m.doBrowserStreamRequest(ctx, account, fetchURL, method, headers, body, allowSwitch, exclude)
+	return m.doBrowserFetchCtx(ctx, "", account, fetchURL, method, headers, body, allowSwitch, exclude)
+}
+
+// doBrowserFetchCtx 同 doBrowserFetch，额外收 proxyURL 供冷启动后同步桥出口。
+func (m *browserManager) doBrowserFetchCtx(ctx context.Context, proxyURL string,
+	account *CookieAccount, fetchURL, method string, headers map[string]string, body []byte,
+	allowSwitch bool, exclude map[int64]bool) (int, []byte, error) {
+	status, rc, err := m.doBrowserStreamRequestCtx(ctx, proxyURL, account, fetchURL, method, headers, body, allowSwitch, exclude)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -2012,6 +2132,13 @@ func (m *browserManager) doBrowserPost(ctx context.Context,
 	return m.doBrowserFetch(ctx, account, fetchURL, "POST", headers, body, allowSwitch, exclude)
 }
 
+// doBrowserPostCtx 同 doBrowserPost，额外收 proxyURL 供冷启动后同步桥出口。
+func (m *browserManager) doBrowserPostCtx(ctx context.Context, proxyURL string,
+	account *CookieAccount, fetchURL string, headers map[string]string, body []byte,
+	allowSwitch bool, exclude map[int64]bool) (int, []byte, error) {
+	return m.doBrowserFetchCtx(ctx, proxyURL, account, fetchURL, "POST", headers, body, allowSwitch, exclude)
+}
+
 // fetchAppTokensViaBrowser 用浏览器 fetch 拿 xsrfEntry。
 // 读 /app 的 WIZ_global_data；account.AuthUser>0 时在同 Tab 里 fetch /u/N/app。
 //
@@ -2020,28 +2147,32 @@ func (m *browserManager) doBrowserPost(ctx context.Context,
 // 20s 上限（页面 fetch 实测 1-3s），把冷却+抓页都控在预算内。
 func (m *browserManager) fetchAppTokensViaBrowser(ctx context.Context,
 	account *CookieAccount, allowSwitch bool, exclude map[int64]bool) (xsrfEntry, error) {
+	return m.fetchAppTokensViaBrowserCtx(ctx, "", account, allowSwitch, exclude)
+}
+
+// fetchAppTokensViaBrowserCtx 同 fetchAppTokensViaBrowser，额外收 proxyURL
+// 用于冷启动后的桥出口同步（见 doBrowserStreamRequestCtx）。
+func (m *browserManager) fetchAppTokensViaBrowserCtx(ctx context.Context, proxyURL string,
+	account *CookieAccount, allowSwitch bool, exclude map[int64]bool) (xsrfEntry, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	// 辅助入口（allowSwitch=false）先判 jar 适用性：未播种/驻留号不可用/
+	// 非驻留身份一律 errBrowserSkipAux，连 ensureRunning 都不做——辅助入口
+	// 既无权拉起浏览器，也无权借用别的号的 jar。
+	if account != nil && !allowSwitch {
+		if err := m.auxJarBlocked(account); err != nil {
+			return xsrfEntry{}, err
+		}
+	}
 	if err := m.ensureRunning(ctx); err != nil {
 		return xsrfEntry{}, err
-	}
-	if account != nil {
-		need, reason := m.shouldSwitch(account, allowSwitch, exclude)
-		if need {
-			if !allowSwitch {
-				return xsrfEntry{}, browserErr("resident account unavailable (%s); auxiliary entry must not switch", reason)
-			}
-			if err := m.maybeSwitchAccount(ctx, account, reason); err != nil {
-				return xsrfEntry{}, err
-			}
-		}
 	}
 	path := "/app"
 	if account != nil && account.AuthUser > 0 {
 		path = "/u/" + strconv.Itoa(account.AuthUser) + "/app"
 	}
 	// /app 页面必须 GET（POST 实测回 405），token 就在响应 HTML 的 WIZ_global_data。
-	status, body, err := m.doBrowserFetch(ctx, account,
+	status, body, err := m.doBrowserStreamRequestCtx(ctx, proxyURL, account,
 		"https://gemini.google.com"+path, "GET",
 		map[string]string{
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -2050,19 +2181,25 @@ func (m *browserManager) fetchAppTokensViaBrowser(ctx context.Context,
 	if err != nil {
 		return xsrfEntry{}, err
 	}
+	rc := body
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, 16<<20))
+	if err != nil {
+		return xsrfEntry{}, err
+	}
 	if status != 200 {
 		return xsrfEntry{}, newAppPageStatusError(status, "")
 	}
 	e := xsrfEntry{fetched: time.Now()}
-	if m := snlm0eRe.FindSubmatch(body); m != nil {
+	if m := snlm0eRe.FindSubmatch(data); m != nil {
 		e.token = string(m[1])
 	} else if account != nil {
 		return xsrfEntry{}, fmt.Errorf("no SNlM0e in page (cookie expired or not signed in)")
 	}
-	if p := pushIDRe.FindSubmatch(body); p != nil {
+	if p := pushIDRe.FindSubmatch(data); p != nil {
 		e.pushID = string(p[1])
 	}
-	if p := pctxRe.FindSubmatch(body); p != nil {
+	if p := pctxRe.FindSubmatch(data); p != nil {
 		e.pctx = string(p[1])
 	}
 	return e, nil
@@ -2086,6 +2223,19 @@ func (m *browserManager) Shutdown(ctx context.Context) {
 	m.stopImpl(ctx, true)
 }
 
+// stopRemaining 返回调用方 ctx 的剩余时间；ctx 无 deadline 时按默认
+// 停机总预算 2.5s 算。所有停机步骤严格共享这条预算，绝不各自再要一份。
+func stopRemaining(ctx context.Context) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		rem := time.Until(deadline)
+		if rem < 0 {
+			return 0
+		}
+		return rem
+	}
+	return 2500 * time.Millisecond
+}
+
 func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	m.mu.Lock()
 	if m.shuttingDown {
@@ -2095,6 +2245,13 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	m.stopping = true
 	if final {
 		m.shuttingDown = true
+	}
+	// 立即中断冷启动：doStart 全程绑 m.startCancel 派生的 startCtx
+	// （waitDevToolsPort/dialCDPWebsocket/waitPageLoad/installBridge 都在
+	// 监听它）。不取消的话，Stop 超时后启动协程还会把局部 proc 一路
+	// 推进到发布校验才回收——白白多占一个 Chromium 到自然超时。
+	if m.startCancel != nil {
+		m.startCancel()
 	}
 	// 立即打断正在冷却等待中的 maybeSwitchAccount：stopCh 一关，
 	// 30s 冷却毫秒级醒来释放 switchSem，不等自然睡完。
@@ -2109,8 +2266,8 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	default:
 		close(m.stopCh)
 	}
-	// 若启动协程正在跑，等它 readyCh 关闭（启动有自己 15s 内超时，
-	// doStart 各步也都有界；Stop 的 ctx 2.5s 超时就先回收快照）。
+	// 若启动协程正在跑，等它 readyCh 关闭（startCtx 已被取消，doStart
+	// 各步会快速收尾；Stop 的 ctx 到点就先回收快照，不等它自然走完）。
 	var waitReady chan struct{}
 	if m.starting && m.readyCh != nil {
 		waitReady = m.readyCh
@@ -2156,15 +2313,24 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	m.generation++
 	m.mu.Unlock()
 
+	// 回收链严格共享调用方剩余预算：Browser.close 封顶 min(remaining, 100ms)，
+	// killBrowserProcessGroup 拿实际剩余（不额外叠加固定 1800ms）。
 	// 1. CDP Browser.close：Chromium 会自己写回 cookie jar 再退。
 	if client != nil {
-		cctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		_ = client.Call(cctx, "", "Browser.close", nil, nil)
-		cancel()
+		grace := stopRemaining(ctx)
+		if grace > 100*time.Millisecond {
+			grace = 100 * time.Millisecond
+		}
+		if grace > 0 {
+			cctx, cancel := context.WithTimeout(context.Background(), grace)
+			_ = client.Call(cctx, "", "Browser.close", nil, nil)
+			cancel()
+		}
 	}
-	// 2. 进程组优雅 → 强杀
+	// 2. 进程组优雅 → 强杀（Windows 内部再拆优雅/强杀份额，见
+	//    browser_proc_windows.go；剩余为 0 也要把 /F 那一下发出去）。
 	if proc != nil {
-		killBrowserProcessGroup(proc.PID, proc.PGID, 1800*time.Millisecond)
+		killBrowserProcessGroup(proc.PID, proc.PGID, stopRemaining(ctx))
 	}
 	// 3. 本地资源
 	if client != nil {

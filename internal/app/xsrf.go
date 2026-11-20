@@ -131,6 +131,8 @@ func getXSRFSwitch(cookie string, authuser int, proxyURL string, allowSwitch boo
 }
 
 // cachedAppTokens 返回未过期的缓存项；过了 xsrfRefreshAfter 时顺带踢一次后台刷新。
+// 后台刷新是**辅助入口**：无论本次调用方 allowSwitch 是什么，一律固定传
+// false——绝不能让主请求的 true 透传进后台 goroutine 去偷换驻留 jar。
 func cachedAppTokens(key, cookie string, authuser int, proxyURL string, allowSwitch bool) (xsrfEntry, bool) {
 	xsrfMu.Lock()
 	defer xsrfMu.Unlock()
@@ -141,7 +143,7 @@ func cachedAppTokens(key, cookie string, authuser int, proxyURL string, allowSwi
 	if !e.refreshing && time.Since(e.fetched) >= xsrfRefreshAfter {
 		e.refreshing = true
 		xsrfCache[key] = e
-		go refreshAppTokens(key, cookie, authuser, proxyURL, allowSwitch)
+		go refreshAppTokens(key, cookie, authuser, proxyURL, false)
 	}
 	return e, true
 }
@@ -254,21 +256,25 @@ func fetchAppTokens(cookie string, authuser int, proxyURL string, allowSwitch bo
 	if shouldUseBrowserTransport() {
 		// 透传调用方真实 authuser：同 cookieIdentity 下 /u/N 的 token 不同，
 		// browserAccountFromHeaders 靠这个头精确匹配到对应 authuser 的记录。
-		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(map[string]string{
 			"Cookie":          cookie,
 			"X-Goog-AuthUser": strconv.Itoa(authuser),
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		e, err := browserMgr.fetchAppTokensViaBrowser(ctx, acct, allowSwitch, nil)
+		// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
+		// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
+		e, err := browserMgr.fetchAppTokensViaBrowserCtx(ctx, proxyURL, acct, allowSwitch, nil)
 		if err != nil {
-			// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
-			// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
-			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+			// 辅助入口哨兵：该用哪个 jar 与驻留不符——无条件回退纯 Go HTTP，
+			// 不看 browser_fallback_http，也不是浏览器坏了。
+			if isBrowserAuxSkip(err) {
+				logf("[xsrf] 辅助入口不适配驻留 jar，回退纯 Go HTTP")
+			} else if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+				// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
+				// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
 				return xsrfEntry{}, err
-			}
-			if isBrowserLocalError(err) {
+			} else if isBrowserLocalError(err) {
 				logf("[xsrf] 浏览器取 token 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
 			} else {
 				return xsrfEntry{}, err

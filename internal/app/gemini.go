@@ -1411,21 +1411,19 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 	// 常驻真实浏览器传输层：开着时一律走页内 fetch——浏览器的意义就是指纹一致，
 	// 有代理也照走（流量经 browserProxyBridge 的 CONNECT 隧道转给当前上游代理）。
 	if shouldUseBrowserTransport() {
-		// 全链路代理接线：本次 acquireSlot 选定的 proxyURL 同步给代理桥，
-		// fallback_direct=false + 代理池时桥绝不直连（真实 IP 不出桥）。
-		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(headers)
 		// 匿名多轮的会话载体 cookie 不在账号池里（acct==nil 但 headers 带
 		// Cookie）：这种「会话 cookie」绝不能经浏览器页内 fetch——JS fetch
 		// 禁止手工设置 Cookie 头，且 credentials:"omit" 也防它误带驻留
 		// 主号的登录态。非池会话载体跳过浏览器走纯 Go HTTP，仅登录态流量
 		// （池账号与匿名无 Cookie）走常驻浏览器。
+		// 判定先于桥操作：不走浏览器的请求严禁 syncBridgeUpstream 扰动桥。
 		skipBrowser := acct == nil && headers["Cookie"] != ""
 		var status int
 		var pr io.ReadCloser
 		var err error
 		if !skipBrowser {
-			status, pr, err = browserMgr.doBrowserStreamRequest(ctx, acct, endpoint, "POST", headers, []byte(body), true, nil)
+			status, pr, err = browserMgr.doBrowserStreamRequestCtx(ctx, proxyURL, acct, endpoint, "POST", headers, []byte(body), true, nil)
 		}
 		if skipBrowser {
 			// 会话载体走纯 Go HTTP：落到下方 stdlib/tls-client 分支。
@@ -1835,8 +1833,10 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 
 	// probe 是旁路探测，不回写 cookie 健康度：它的失败原因跟 cookie 无关。
 	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
+	// probe 取 token 是辅助入口（allowSwitch=false）：点名非驻留号时
+	// errBrowserSkipAux 无条件回退纯 Go HTTP，不切/不借驻留 jar。
 	cookieStr, sapisid := loadCookie()
-	if tok, e := getXSRF(cookieStr, 0, proxyURL); e == nil && tok != "" {
+	if tok, e := getXSRFSwitch(cookieStr, 0, proxyURL, false); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()
 	}
@@ -1852,28 +1852,34 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	acct := browserAccountFromHeaders(headers)
 	// 非池会话载体（acct==nil 但带 Cookie）不借浏览器 jar：页内 fetch 发不出
 	// 手工 Cookie 头也不该误带驻留主号登录态，probe 旁路探测走纯 Go HTTP。
+	// 判定先于桥操作：不走浏览器的探测严禁 syncBridgeUpstream 扰动桥。
 	skipBrowserProbe := acct == nil && headers["Cookie"] != ""
 	if shouldUseBrowserTransport() && !skipBrowserProbe {
 		// 浏览器传输模式：页内 fetch 探测，跟正式请求同一条链路。
-		syncBridgeUpstream(proxyURL)
+		// probe 是辅助入口（allowSwitch=false）。
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		status, b, e := browserMgr.doBrowserPost(ctx, acct, endpoint, headers, []byte(body), false, nil)
+		status, b, e := browserMgr.doBrowserPostCtx(ctx, proxyURL, acct, endpoint, headers, []byte(body), false, nil)
 		cancel()
 		if e != nil {
-			if isBrowserLocalError(e) {
+			if isBrowserAuxSkip(e) {
+				// 辅助入口不适配驻留 jar：无缝落到下方纯 Go HTTP 探测分支。
+			} else if isBrowserLocalError(e) {
 				res.Status = "network_error"
 				res.HTTPCode = 502
 				res.Diagnostic = "常驻浏览器不可用: " + e.Error() +
 					"。请安装 Chromium 或配置 browser_path；browser_fallback_http 开时才回退纯 Go HTTP"
 				return res
+			} else {
+				res.Status = "network_error"
+				res.Diagnostic = "网络层错误: " + e.Error()
+				return res
 			}
-			res.Status = "network_error"
-			res.Diagnostic = "网络层错误: " + e.Error()
-			return res
+		} else {
+			statusCode = status
+			raw = b
 		}
-		statusCode = status
-		raw = b
-	} else if proxyURL != "" {
+	}
+	if raw == nil && proxyURL != "" {
 		req, e := http.NewRequest("POST", endpoint, strings.NewReader(body))
 		if e != nil {
 			res.Status = "network_error"
@@ -1895,7 +1901,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 		statusCode = resp.StatusCode
 		locHeader = resp.Header.Get("Location")
 		raw, err = io.ReadAll(resp.Body)
-	} else {
+	} else if raw == nil {
 		req, e := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
 		if e != nil {
 			res.Status = "network_error"

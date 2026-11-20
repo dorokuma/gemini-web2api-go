@@ -83,9 +83,10 @@ func refreshBL(proxyURL string) {
 	// 浏览器传输模式：从常驻页面拿（页内 fetch /app 的 HTML 里有 cfb2h）。
 	// 匿名语义不变——这个值跟登录态无关，浏览器 jar 里登着谁也不影响。
 	if shouldUseBrowserTransport() {
-		syncBridgeUpstream(proxyURL)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		status, b, berr := browserMgr.doBrowserFetch(ctx, nil,
+		// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
+		// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
+		status, b, berr := browserMgr.doBrowserFetchCtx(ctx, proxyURL, nil,
 			"https://gemini.google.com/app", "GET",
 			map[string]string{
 				"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

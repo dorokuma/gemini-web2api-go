@@ -522,7 +522,7 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (
 	setAuthUserHeaders(headers, authuser)
 	delete(headers, "x-goog-ext-525001261-jspb")
 
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := uploadPostAux(endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -553,7 +553,7 @@ func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string, authuser in
 	headers := buildGeminiHeaders(cookie, sapisid, "")
 	setAuthUserHeaders(headers, authuser)
 	delete(headers, "x-goog-ext-525001261-jspb")
-	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	status, _, body, err := uploadPostAux(endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		logf("[autodel] 删会话 %s 失败: %v", cid, err)
 		return

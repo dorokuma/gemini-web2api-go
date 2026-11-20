@@ -85,39 +85,62 @@ func spawnBrowser(name string, args []string, env []string) (*browserProc, error
 }
 
 // killBrowserProcessGroup 用 taskkill 杀整棵树。/T = 树，/F = 强杀，/PID = 根。
-// 先不带 /F 试一次优雅退出（Chromium 收到窗口消息会自己清理），超时后再补 /F。
-// 两个 taskkill 都绑 ctx：外部命令可能被系统策略卡住，调用方的 gracefulTimeout
-// 不能被一个卡住的 taskkill 吃掉。
+//
+// 总预算 = gracefulTimeout，内部严格拆两份：
+//   - 优雅段 60%（taskkill /T + 轮询等退出）：Chromium 收到窗口消息会自己
+//     清理，实测多数情况几百毫秒就退；
+//   - 强杀预留 40% 且至少 500ms（taskkill /T /F）：进程没优雅退出时
+//     /F 那一发必须有充足时间真正执行完毕——总预算被优雅等待吃光、
+//     /F 拿到一个已过期 ctx 被 CommandContext 秒杀，等于强杀根本没发。
+//
+// 循环内探活用 pidAliveCtx 共享当前阶段剩余 ctx：每次独立 5s 的 tasklist
+// 会把总预算拖穿。所有 taskkill / tasklist 都绑 ctx，外部命令卡住不能
+// 拖死调用方。
 func killBrowserProcessGroup(pid, pgid int, gracefulTimeout time.Duration) {
 	if pid <= 0 {
 		return
 	}
-	// 同一总 deadline：graceful taskkill、等活、强杀 taskkill 共享这一条
-	// gracefulTimeout 预算，绝不各自叠加 5s+10s 超出总预算——停机编排
-	// 给整个回收链的时间是有限的，每一步都不能自己再要一份。
 	deadline := time.Now().Add(gracefulTimeout)
-	graceCtx, graceCancel := context.WithDeadline(context.Background(), deadline)
+	// 优雅段拿到总预算的 60%，强杀预留至少 500ms。
+	graceEnd := deadline.Add(-gracefulTimeout * 2 / 5)
+	if min := deadline.Add(-500 * time.Millisecond); graceEnd.After(min) {
+		graceEnd = min
+	}
+	graceCtx, graceCancel := context.WithDeadline(context.Background(), graceEnd)
 	defer graceCancel()
 	_ = exec.CommandContext(graceCtx, "taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
-	for time.Now().Before(deadline) {
-		if !pidAlive(pid) {
+	for time.Now().Before(graceEnd) {
+		if !pidAliveCtx(graceCtx, pid) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// 强杀段：独立的 deadline = 总截止，保证 /F 有预留时间真正跑完。
 	forceCtx, forceCancel := context.WithDeadline(context.Background(), deadline)
 	defer forceCancel()
 	_ = exec.CommandContext(forceCtx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
 }
 
+// pidAliveCtx 同 pidAlive，但 tasklist 调用的超时共享调用方 ctx 的剩余时间
+// （每次独立 5s 会把停机预算拖穿）。
+func pidAliveCtx(ctx context.Context, pid int) bool {
+	_, ok := tasklistImageNameCtx(ctx, pid)
+	return ok
+}
+
 // tasklistImageName 查 PID 现在对应的镜像名（CSV 第一列）。
 // 进程不存在时返回 ("", false)；查不动也返回 false——核不准宁可不杀。
 func tasklistImageName(pid int) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return tasklistImageNameCtx(ctx, pid)
+}
+
+// tasklistImageNameCtx 同 tasklistImageName，超时共享调用方 ctx。
+func tasklistImageNameCtx(ctx context.Context, pid int) (string, bool) {
 	if pid <= 0 {
 		return "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	out, err := exec.CommandContext(ctx, "tasklist",
 		"/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
 	if err != nil {
@@ -226,7 +249,6 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	if err != nil {
 		abs = profileDir
 	}
-	want := "--user-data-dir=" + abs
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command",
@@ -234,5 +256,8 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(out), want)
+	// 精确参数解析（browser_proc_cmdline.go）：argv[0] 校验镜像名 +
+	// --user-data-dir 值归一化后 EqualFold 精确相等——绝不子串匹配，
+	// "C:\data\p" 不能误命中 "C:\data\p-other"。
+	return windowsCmdlineIsOurBrowser(strings.TrimSpace(string(out)), abs)
 }

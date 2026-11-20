@@ -236,7 +236,7 @@ func listConversations(cookie, sapisid, xsrf, proxyURL string, n, authuser int) 
 	h := buildGeminiHeaders(cookie, sapisid, "")
 	setAuthUserHeaders(h, authuser)
 	delete(h, "x-goog-ext-525001261-jspb")
-	st, _, body, err := uploadPost(ep, h, []byte(form.Encode()), proxyURL)
+	st, _, body, err := uploadPostAux(ep, h, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return nil, err
 	}

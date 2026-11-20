@@ -114,12 +114,27 @@ func sanitizeUploadName(name string) string {
 }
 
 // uploadPost 走跟主请求相同的出口发 POST，响应头一起带回（start 要取 x-goog-upload-url）。
+// 主请求路径：allowSwitch=true（浏览器层可按策略 M1 换号）。
 func uploadPost(url string, headers map[string]string, body []byte, proxyURL string) (
 	int, map[string]string, []byte, error) {
 	return uploadPostCtx(context.Background(), url, headers, body, proxyURL)
 }
 
+// uploadPostAux 是辅助/管理调用专用的 uploadPost：allowSwitch=false——
+// 辅助请求点名非驻留号时绝不切/借驻留 jar（errBrowserSkipAux 无条件回退
+// 纯 Go HTTP），视频额度/读历史/删会话都走它。
+func uploadPostAux(url string, headers map[string]string, body []byte, proxyURL string) (
+	int, map[string]string, []byte, error) {
+	return uploadPostCtxAux(context.Background(), url, headers, body, proxyURL, false)
+}
+
 func uploadPostCtx(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string) (
+	int, map[string]string, []byte, error) {
+	return uploadPostCtxAux(ctx, url, headers, body, proxyURL, true)
+}
+
+func uploadPostCtxAux(ctx context.Context, url string, headers map[string]string, body []byte,
+	proxyURL string, allowSwitch bool) (
 	int, map[string]string, []byte, error) {
 	// 浏览器传输模式：gemini.google.com 同源的 batchexecute / StreamGenerate
 	// 走页内 fetch（cookie jar 由浏览器管，跟页内请求天然一致）。跨域的上传
@@ -127,15 +142,18 @@ func uploadPostCtx(ctx context.Context, url string, headers map[string]string, b
 	acct := browserAccountFromHeaders(headers)
 	// 非池会话载体（acct==nil 但带 Cookie，如匿名多轮/上传 token 场景）
 	// 走纯 Go HTTP——页内 fetch 发不出手工 Cookie 头，也不该带驻留 jar。
+	// 判定必须先于任何桥操作：不走浏览器的请求严禁 syncBridgeUpstream
+	// 扰动驻留浏览器的隧道。
 	skipBrowser := acct == nil && headers["Cookie"] != ""
 	if shouldUseBrowserTransport() && strings.HasPrefix(url, "https://gemini.google.com") && !skipBrowser {
-		syncBridgeUpstream(proxyURL)
-		status, b, err := browserMgr.doBrowserPost(ctx, acct, url, headers, body, true, nil)
+		status, b, err := browserMgr.doBrowserPostCtx(ctx, proxyURL, acct, url, headers, body, allowSwitch, nil)
 		if err != nil {
-			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+			// 辅助入口哨兵：无条件回退纯 Go HTTP（不看 browser_fallback_http）。
+			if isBrowserAuxSkip(err) {
+				logf("[upload] 辅助入口不适配驻留 jar，回退纯 Go HTTP")
+			} else if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
 				return 0, nil, nil, err
-			}
-			if isBrowserLocalError(err) {
+			} else if isBrowserLocalError(err) {
 				logf("[upload] 浏览器 POST 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
 			} else {
 				return 0, nil, nil, err

@@ -520,6 +520,13 @@ func (s *fakeCDPServer) close() {
 // 直接填 proc=假活 + client=真 cdpClient + sessionID。
 func wireTestBrowser(t *testing.T, srv *fakeCDPServer) func() {
 	t.Helper()
+	return wireTestBrowserBridge(t, srv, nil)
+}
+
+// wireTestBrowserBridge 同 wireTestBrowser，允许测试挂一个真 bridge
+// （代理桥接线断言用），nil 则不挂。
+func wireTestBrowserBridge(t *testing.T, srv *fakeCDPServer, bridge *browserProxyBridge) func() {
+	t.Helper()
 	conn, err := dialCDPWebsocket(context.Background(), srv.wsURL)
 	if err != nil {
 		t.Fatalf("dial fake cdp: %v", err)
@@ -531,17 +538,21 @@ func wireTestBrowser(t *testing.T, srv *fakeCDPServer) func() {
 	oldProc, oldClient, oldSess, oldTarget := m.proc, m.client, m.sessionID, m.targetID
 	oldSeed, oldStarted, oldStarting, oldStartErr := m.seed, m.started, m.starting, m.startErr
 	oldReadyCh, oldShut, oldStop, oldStopCh := m.readyCh, m.shuttingDown, m.stopping, m.stopCh
+	oldBridge, oldCleaning, oldStartCancel := m.bridge, m.cleaning, m.startCancel
 	oldGen := m.generation
 	oldReady := m.ready.Load()
 	m.proc = &browserProc{PID: os.Getpid(), PGID: os.Getpid(), exitedCh: make(chan struct{})}
 	m.client = client
 	m.sessionID = "fake-session-1"
 	m.targetID = "fake-target-1"
+	m.bridge = bridge
 	m.started = true
 	m.starting = false
 	m.startErr = nil
 	m.shuttingDown = false
 	m.stopping = false
+	m.cleaning = false
+	m.startCancel = nil
 	m.stopCh = make(chan struct{})
 	m.generation++
 	m.ready.Store(true)
@@ -560,6 +571,7 @@ func wireTestBrowser(t *testing.T, srv *fakeCDPServer) func() {
 		m.proc, m.client, m.sessionID, m.targetID = oldProc, oldClient, oldSess, oldTarget
 		m.seed, m.started, m.starting, m.startErr = oldSeed, oldStarted, oldStarting, oldStartErr
 		m.readyCh, m.shuttingDown, m.stopping, m.stopCh = oldReadyCh, oldShut, oldStop, oldStopCh
+		m.bridge, m.cleaning, m.startCancel = oldBridge, oldCleaning, oldStartCancel
 		m.generation = oldGen
 		m.ready.Store(oldReady)
 		m.mu.Unlock()
@@ -596,6 +608,20 @@ func findStreamByCloser(t *testing.T, rc io.ReadCloser) *browserStream {
 		t.Fatalf("rc is %T not *streamReadCloser", rc)
 	}
 	return src.s
+}
+
+// lastStreamReqID 返回 browserMgr.streamReg 里最新注册的 reqID（重定向早退等
+// rc==nil 的错误路径里，调用方拿不到 stream——泵协程退出断言只能按 reqID 找）。
+func lastStreamReqID(m *browserManager) string {
+	m.streamRegMu.Lock()
+	defer m.streamRegMu.Unlock()
+	latest := ""
+	for id := range m.streams {
+		if id > latest {
+			latest = id
+		}
+	}
+	return latest
 }
 
 // ─── 组 1 测试：WS 与 CDP 断连传播 ──────────────────────────────────────────
@@ -717,11 +743,18 @@ func TestCDPDisconnectPropagatesToStreams(t *testing.T) {
 	s := findStreamByCloser(t, rc)
 	// 等 headers 到达（流已注册）。
 	time.Sleep(50 * time.Millisecond)
+	// 断开后：closed（failAll 判死）+ pumpDone（failAllStreams 的 pipeR.Close
+	// 唤醒背压 pumpToPipe）都必须在预算内退出。
 	srv.conn.Close() // 模拟 CDP 断连
 	select {
 	case <-s.closed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("stream not failed after CDP disconnect (silence-hang bug)")
+	}
+	select {
+	case <-s.pumpDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("pumpToPipe not woken after CDP disconnect (failAllStreams must close pipeR)")
 	}
 	buf := make([]byte, 64)
 	_, rerr := rc.Read(buf)
@@ -1013,9 +1046,13 @@ func TestBrowserRedirectAndFetchErrorClassification(t *testing.T) {
 		t.Fatalf("same-origin 302 status = %d, want 200", st)
 	}
 
-	// 用例 2：跨源 302 → accounts.google.com → appPageStatusError + pumpDone 退出。
+	// 用例 2：跨源 302 → accounts.google.com → appPageStatusError +
+	// 重定向早退时 pumpToPipe 必须在 500ms 内退出（chunk 已到、阻塞在
+	// pipeW.Write 的背压泵被 pipeR.Close 唤醒）。
+	fetchHit2 := make(chan fetchSpec, 1)
 	go func() {
 		spec := <-srv.fetchHit
+		fetchHit2 <- spec
 		srv.setFetchScript(spec.reqID, fetchScript{
 			status:     200,
 			url:        "https://accounts.google.com/ServiceLogin?continue=x",
@@ -1023,18 +1060,48 @@ func TestBrowserRedirectAndFetchErrorClassification(t *testing.T) {
 			chunks:     [][]byte{[]byte("should-not-deliver")},
 		})
 	}()
-	_, rc2, err := browserMgr.doBrowserStreamRequest(context.Background(), nil,
-		"https://gemini.google.com/app", "GET", nil, nil, true, nil)
+	type streamRes struct {
+		rc  io.ReadCloser
+		err error
+	}
+	resCh := make(chan streamRes, 1)
+	go func() {
+		_, rc, err := browserMgr.doBrowserStreamRequest(context.Background(), nil,
+			"https://gemini.google.com/app", "GET", nil, nil, true, nil)
+		resCh <- streamRes{rc, err}
+	}()
+	// 先拿在飞 reqID 定位 stream（请求返回时它已注销，只能靠此刻找）。
+	spec2 := <-fetchHit2
+	var s2 *browserStream
+	for i := 0; i < 100 && s2 == nil; i++ {
+		browserMgr.streamRegMu.Lock()
+		s2 = browserMgr.streams[spec2.reqID]
+		browserMgr.streamRegMu.Unlock()
+		if s2 == nil {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if s2 == nil {
+		t.Fatal("stream not found in registry while in-flight")
+	}
+	res := <-resCh
 	var ape *appPageStatusError
-	if !errors.As(err, &ape) {
-		t.Fatalf("cross-origin redirect err not appPageStatusError: %v (%T)", err, err)
+	if !errors.As(res.err, &ape) {
+		t.Fatalf("cross-origin redirect err not appPageStatusError: %v (%T)", res.err, res.err)
 	}
-	if !xsrfErrBlamesCookie(err) {
-		t.Fatalf("redirect to accounts.google.com not blamed on cookie: %v", err)
+	if !xsrfErrBlamesCookie(res.err) {
+		t.Fatalf("redirect to accounts.google.com not blamed on cookie: %v", res.err)
 	}
-	// 重定向早退：fetch 已经派发但响应被 Abort，pumpDone 必须退出无泄漏。
-	// rc2 为 nil（err 路径），stream 经 unregister+fail+pipeR.Close 由 defer 清理。
-	_ = rc2
+	if res.rc != nil {
+		res.rc.Close()
+	}
+	// 错误路径 rc==nil：defer 清理（unregister+fail+pipeR.Close）必须让
+	// 阻塞在 chunk 背压的 pumpToPipe 立刻退出。
+	select {
+	case <-s2.pumpDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("pumpToPipe did not exit within 500ms after redirect abort (pipeR.Close missing)")
+	}
 
 	// 用例 3：google.com/sorry 拦截页也按跨源拦截。
 	go func() {
@@ -1272,6 +1339,53 @@ func TestBrowserProxyBridgeWiring(t *testing.T) {
 	if allow {
 		t.Fatal("disabled pool + fallback_direct=false must yield allowDirect=false")
 	}
+
+	// 冷启动/请求路径的桥接线（wire 级）：m.bridge 挂真 bridge 后，走浏览器的
+	// 请求把 proxyURL 经 doBrowserStreamRequestCtx 同步进桥（SetUpstream 仅
+	// 在确实变更时换代际）；skipBrowser 的非池会话载体走纯 Go HTTP，严禁
+	// 碰桥（gen 不变 = 没有 SetUpstream 扰动）。
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	bridge3, err := newBrowserProxyBridge()
+	if err != nil {
+		t.Fatalf("bridge3: %v", err)
+	}
+	defer bridge3.Shutdown(context.Background())
+	cleanup := wireTestBrowserBridge(t, srv, bridge3)
+	defer cleanup()
+	setRuntimeCfg(t, func(c *RuntimeConfig) { c.BrowserTransport = true })
+	go func() {
+		spec := <-srv.fetchHit
+		srv.setFetchScript(spec.reqID, fetchScript{status: 200})
+	}()
+	proxyBURL := "http://" + addrB
+	_, rcB, err := browserMgr.doBrowserStreamRequestCtx(context.Background(), proxyBURL, nil,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), true, nil)
+	if err != nil {
+		t.Fatalf("stream via bridge3: %v", err)
+	}
+	rcB.Close()
+	bridge3.mu.Lock()
+	if bridge3.upstream != proxyBURL {
+		bridge3.mu.Unlock()
+		t.Fatalf("request proxyURL not applied to bridge: upstream=%q, want %q", bridge3.upstream, proxyBURL)
+	}
+	genBefore := bridge3.gen
+	bridge3.mu.Unlock()
+	// 非池会话载体（acct==nil 但带 Cookie）走纯 Go HTTP：桥的 upstream/gen
+	// 必须原封不动——不允许 syncBridgeUpstream 被调用。
+	_, _, _, _, herr := doGeminiRequestStopInner(context.Background(),
+		"http://127.0.0.1:1/nowhere", "f.req=x",
+		map[string]string{"Cookie": "SAPISID=carrier; __Secure-1PSID=c; SID=x"},
+		"", nil, nil, false)
+	_ = herr // 走纯 Go HTTP 直连 127.0.0.1:1 必然失败；只关心桥没被动
+	bridge3.mu.Lock()
+	if bridge3.gen != genBefore || bridge3.upstream != proxyBURL {
+		bridge3.mu.Unlock()
+		t.Fatalf("non-pool HTTP bypass disturbed bridge: gen %d->%d upstream %q",
+			genBefore, bridge3.gen, bridge3.upstream)
+	}
+	bridge3.mu.Unlock()
 }
 
 // TestBrowserProxyBridgeLoopbackAndMethodGuard：回环/自环 CONNECT 拒绝、
@@ -1343,12 +1457,16 @@ func resetMgrForLifecycle(t *testing.T) func() {
 	oldProc, oldClient, oldSess, oldTarget := m.proc, m.client, m.sessionID, m.targetID
 	oldSeed, oldStarted, oldStarting, oldStartErr := m.seed, m.started, m.starting, m.startErr
 	oldReadyCh, oldShut, oldStop, oldStopCh := m.readyCh, m.shuttingDown, m.stopping, m.stopCh
+	oldBridge2, oldCleaning2, oldStartCancel2 := m.bridge, m.cleaning, m.startCancel
 	oldGen, oldStreak, oldRetry := m.generation, m.crashStreak, m.nextRetryAt
 	oldReady := m.ready.Load()
 	m.proc = nil
 	m.client = nil
 	m.sessionID = ""
 	m.targetID = ""
+	m.bridge = nil
+	m.cleaning = false
+	m.startCancel = nil
 	m.started = false
 	m.starting = false
 	m.startErr = nil
@@ -1364,6 +1482,7 @@ func resetMgrForLifecycle(t *testing.T) func() {
 		m.proc, m.client, m.sessionID, m.targetID = oldProc, oldClient, oldSess, oldTarget
 		m.seed, m.started, m.starting, m.startErr = oldSeed, oldStarted, oldStarting, oldStartErr
 		m.readyCh, m.shuttingDown, m.stopping, m.stopCh = oldReadyCh, oldShut, oldStop, oldStopCh
+		m.bridge, m.cleaning, m.startCancel = oldBridge2, oldCleaning2, oldStartCancel2
 		m.generation, m.crashStreak, m.nextRetryAt = oldGen, oldStreak, oldRetry
 		m.ready.Store(oldReady)
 		m.mu.Unlock()
@@ -1423,6 +1542,7 @@ func TestBrowserStartFailRetryAndStopRace(t *testing.T) {
 		readyCh:   make(chan struct{}),
 		streams:   map[string]*browserStream{},
 		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
 	}
 	m2.mu.Lock()
 	m2.started = true
@@ -1455,6 +1575,48 @@ func TestBrowserStartFailRetryAndStopRace(t *testing.T) {
 		}()
 		m2.ensureRunning(context.Background())
 	}()
+
+	// ── handleDeadLocked 单飞清场：两条并发清理路径只有一条认领，
+	// 第二条不放弃就会踩坏新代际 ──
+	m3 := &browserManager{
+		readyCh:   make(chan struct{}),
+		streams:   map[string]*browserStream{},
+		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	deadClient := &cdpClient{conn: nil, done: make(chan struct{})}
+	m3.mu.Lock()
+	m3.proc = &browserProc{PID: os.Getpid(), PGID: os.Getpid(), exitedCh: make(chan struct{})}
+	m3.client = deadClient
+	m3.started = true
+	m3.generation = 7
+	m3.mu.Unlock()
+	// 第一条认领清场（client.Close 对 nil conn 会 panic——用真实 conn 代替）。
+	// 用假 conn：cdpClient.Close 先 c.conn.Close()，nil conn 会崩，所以
+	// 直接测「代际/client 不匹配时第二条调用放弃」这个单飞语义：
+	// 第一次调用后 generation 已变、client 已清，第二次同一快照必须放弃。
+	m3.mu.Lock()
+	if !m3.cleaning && m3.generation == 7 && m3.client == deadClient {
+		// 模拟第一条已认领：手动置 cleaning + 换代际，等价 handleDeadLocked 锁内段。
+		m3.cleaning = true
+		m3.proc = nil
+		m3.client = nil
+		m3.generation++
+	}
+	m3.mu.Unlock()
+	// 第二条并发清理拿旧快照来：client/gen 不匹配 → 放弃，不得再复位一次。
+	m3.handleDeadLocked(deadClient, 7)
+	m3.mu.Lock()
+	if !m3.cleaning {
+		m3.mu.Unlock()
+		t.Fatal("cleaning flag lost by second concurrent handleDeadLocked")
+	}
+	if m3.generation != 8 {
+		m3.mu.Unlock()
+		t.Fatalf("generation advanced twice: got %d, want 8", m3.generation)
+	}
+	m3.cleaning = false
+	m3.mu.Unlock()
 }
 
 // TestBrowserStopDuringSwitchCooldown：30s 切号冷却中途 Stop(200ms)
@@ -1642,8 +1804,10 @@ func itoa(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-// TestProcessIsOurBrowserCmdlineMatch：Linux /proc 精确比对 + Darwin
-// 含空格 Chrome/profile、防 profile 词冒充 exe、Linux 前缀碰撞。
+// TestProcessIsOurBrowserCmdlineMatch：三平台命令行纯函数精确判据——
+// exeNameOK 白名单、Linux NUL 分隔精确比对、Darwin 含空格 Chrome/profile、
+// Windows 引号/空格拆词与前缀碰撞（/tmp/p vs /tmp/p-other、
+// C:\data\p vs C:\data\p-other、带引号含空格路径）。不再用 /bin/sh 真进程。
 func TestProcessIsOurBrowserCmdlineMatch(t *testing.T) {
 	for _, ok := range []struct {
 		word string
@@ -1654,58 +1818,96 @@ func TestProcessIsOurBrowserCmdlineMatch(t *testing.T) {
 		{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", true},
 		{"Google", false},
 		{"Chrome", true},
+		{"chrome.exe", true},
+		{"msedge.exe", true},
 		{"/usr/bin/msedge", true},
 		{"/usr/bin/microsoft-edge", true},
 		{"/usr/bin/brave", true},
 		{"/usr/bin/firefox", false},
+		{"/bin/sh", false},
 		{"/usr/bin/python3", false},
 	} {
 		if got := exeNameOK(ok.word); got != ok.want {
 			t.Errorf("exeNameOK(%q) = %v, want %v", ok.word, got, ok.want)
 		}
 	}
-	// Darwin 解析：可执行段是 "--user-data-dir=" 之前的整段，profile 路径
-	// 里的 "chrome" 不能冒充可执行名；含空格 profile 按 " --" 边界切。
-	wantDir := "--user-data-dir=/Users/me/Library/Application Support/gw/browser-profile"
+
+	// ── Linux：NUL 分隔 cmdline 逐字段精确比对 ──
+	linuxWant := "/tmp/gw/browser-profile"
 	for _, c := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"exact", "/usr/bin/chromium\x00--headless=new\x00--user-data-dir=/tmp/gw/browser-profile\x00", true},
+		{"prefix-collision", "/usr/bin/chromium\x00--user-data-dir=/tmp/gw/browser-profile-other\x00", false},
+		{"prefix-collision-reverse", "/usr/bin/chromium\x00--user-data-dir=/tmp/gw/browser-profil\x00", false},
+		{"wrong-exe", "/usr/bin/firefox\x00--user-data-dir=/tmp/gw/browser-profile\x00", false},
+		{"sh-interpreter", "/bin/sh\x00-c\x00--user-data-dir=/tmp/gw/browser-profile\x00", false},
+		{"empty", "", false},
+		{"trailing-slash", "/usr/bin/chromium\x00--user-data-dir=/tmp/gw/browser-profile/\x00", true},
+		{"separate-arg", "/usr/bin/chromium\x00--user-data-dir\x00/tmp/gw/browser-profile\x00", true},
+	} {
+		if got := linuxCmdlineIsOurBrowser([]byte(c.raw), linuxWant); got != c.want {
+			t.Errorf("linuxCmdlineIsOurBrowser[%s] = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// ── Darwin：ps -ww command= 按 " --" 边界切，含空格 exe 段 ──
+	darwinWant := "/Users/me/Library/Application Support/gw/browser-profile"
+	for _, c := range []struct {
+		name string
 		line string
 		want bool
 	}{
-		// 真 Chrome + 含空格 profile 路径。
-		{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/me/Library/Application Support/gw/browser-profile --headless=new", true},
-		// profile 路径含 "chrome" 词，但可执行段是 firefox → 拒（防冒充）。
-		{"/usr/bin/firefox --user-data-dir=/Users/me/Library/Application Support/gw/browser-profile", false},
-		// 另一个 profile 的 Chrome（user-data-dir 不同）→ 拒。
-		{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/other/profile --headless=new", false},
-		// 完全无关进程（不含 --user-data-dir）→ 拒。
-		{"/usr/bin/sleep 60", false},
+		{"chrome-with-spaces",
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/me/Library/Application Support/gw/browser-profile --headless=new", true},
+		{"firefox-imposter",
+			"/usr/bin/firefox --user-data-dir=/Users/me/Library/Application Support/gw/browser-profile", false},
+		{"other-profile",
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/other/profile --headless=new", false},
+		{"profile-prefix-collision",
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/Users/me/Library/Application Support/gw/browser-profile-other --headless=new", false},
+		{"no-flag", "/usr/bin/sleep 60", false},
 	} {
-		if got := darwinCmdlineIsOurBrowser(c.line, wantDir); got != c.want {
-			t.Errorf("darwinCmdlineIsOurBrowser(%q) = %v, want %v", c.line, got, c.want)
+		if got := darwinCmdlineIsOurBrowser(c.line, darwinWant); got != c.want {
+			t.Errorf("darwinCmdlineIsOurBrowser[%s] = %v, want %v", c.name, got, c.want)
 		}
 	}
-	// Linux 前缀碰撞：spawn /bin/sh -c 'sleep 30'，cmdline 无 --user-data-dir → false。
-	if runtime.GOOS == "linux" {
-		p, err := spawnBrowser("/bin/sh", []string{"-c", "sleep 30"}, nil)
-		if err != nil {
-			t.Fatalf("spawn: %v", err)
+
+	// ── Windows：引号/空格拆词 + EqualFold + 前缀碰撞 ──
+	winWant := `C:\data\browser-profile`
+	for _, c := range []struct {
+		name    string
+		cmdline string
+		want    bool
+	}{
+		{"plain", `C:\Google\Chrome\Application\chrome.exe --user-data-dir=C:\data\browser-profile --headless=new`, true},
+		{"quoted-exe", `"C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir=C:\data\browser-profile --headless=new`, true},
+		{"quoted-value", `chrome.exe --user-data-dir="C:\data\browser-profile" --headless=new`, true},
+		{"quoted-value-spaces", `chrome.exe "--user-data-dir=C:\data\browser-profile" --headless=new`, true},
+		{"separate-arg-quoted", `chrome.exe --user-data-dir "C:\data\browser-profile" --headless=new`, true},
+		{"case-insensitive-flag-name", `CHROME.EXE --USER-DATA-DIR=c:\data\BROWSER-PROFILE --headless=new`, false}, // flag 名大小写敏感（生成方只发小写）
+		{"value-case-fold", `chrome.exe --user-data-dir=c:\DATA\BROWSER-PROFILE --headless=new`, true},             // 值 EqualFold
+		{"prefix-collision", `chrome.exe --user-data-dir=C:\data\browser-profile-other --headless=new`, false},
+		{"prefix-collision-subdir-of-other", `chrome.exe --user-data-dir=C:\data\browser-profile\sub --headless=new`, false},
+		{"wrong-exe", `C:\Windows\System32\notepad.exe --user-data-dir=C:\data\browser-profile`, false},
+		{"firefox", `C:\Program Files\Mozilla Firefox\firefox.exe --user-data-dir=C:\data\browser-profile`, false},
+		{"spaces-in-path", `chrome.exe --user-data-dir="C:\My Data\browser-profile"`, false}, // want 不匹配含空格 profile
+		{"no-flag", `chrome.exe --headless=new`, false},
+		{"empty", ``, false},
+	} {
+		if got := windowsCmdlineIsOurBrowser(c.cmdline, winWant); got != c.want {
+			t.Errorf("windowsCmdlineIsOurBrowser[%s] = %v, want %v", c.name, got, c.want)
 		}
-		defer killBrowserProcessGroup(p.PID, p.PGID, 500*time.Millisecond)
-		if processIsOurBrowser(p.PID, "/tmp/p") {
-			t.Fatal("processIsOurBrowser matched /bin/sh (should not)")
-		}
-		// /tmp/p vs /tmp/p-other 前缀碰撞：profileDir=/tmp/p 不能误中 /tmp/p-other。
-		// 造一个 cmdline 含 "--user-data-dir=/tmp/p-other" 的进程验证精确边界。
-		p2, err := spawnBrowser("/bin/sh", []string{"-c", "exec -a '/bin/sh --user-data-dir=/tmp/p-other' sleep 30"}, nil)
-		if err != nil {
-			// exec -a 在 sh 不一定支持；跳过精确碰撞校验，至少上面的负例已覆盖。
-			t.Logf("spawn for prefix-collision: %v (skip)", err)
-			return
-		}
-		defer killBrowserProcessGroup(p2.PID, p2.PGID, 500*time.Millisecond)
-		if processIsOurBrowser(p2.PID, "/tmp/p") {
-			t.Fatal("processIsOurBrowser(/tmp/p) matched --user-data-dir=/tmp/p-other (prefix collision)")
-		}
+	}
+	// 含空格 profile 正值用例（引号包裹后仍须精确命中）。
+	winWantSp := `C:\My Data\browser-profile`
+	if !windowsCmdlineIsOurBrowser(`chrome.exe --user-data-dir="C:\My Data\browser-profile"`, winWantSp) {
+		t.Error("windowsCmdlineIsOurBrowser quoted-space path = false, want true")
+	}
+	if windowsCmdlineIsOurBrowser(`chrome.exe --user-data-dir="C:\My Data\browser-profile-other"`, winWantSp) {
+		t.Error("windowsCmdlineIsOurBrowser quoted-space prefix collision = true, want false")
 	}
 }
 
@@ -1763,8 +1965,11 @@ func TestBrowserM1Sticky(t *testing.T) {
 	}
 }
 
-// TestBrowserM1AuxNoSwitch：辅助入口（allowSwitch=false）对非驻留账号
-// 绝不切驻留 jar——shouldSwitch 对活驻留号返回 false，调用方回退纯 Go HTTP。
+// TestBrowserM1AuxNoSwitch：辅助入口（allowSwitch=false）端到端验证：
+//   - 驻留 acct1 时对 acct2 调 getXSRFSwitch(allowSwitch=false) 绝不返回
+//     acct1 的 token 也不发进 jar，而是 errBrowserSkipAux 无条件回退纯
+//     Go HTTP（BrowserFallbackHTTP=false 也照退）；
+//   - 无驻留号且 BrowserFallbackHTTP=false 时同样无条件回退。
 func TestBrowserM1AuxNoSwitch(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -1787,21 +1992,59 @@ func TestBrowserM1AuxNoSwitch(t *testing.T) {
 	m.seed = browserSeedState{AccountID: acctID, CookieIdentity: cookieIdentity("SAPISID=ra; __Secure-1PSID=rp; SID=r")}
 	m.mu.Unlock()
 
-	// 辅助入口点名非驻留号：allowSwitch=false → shouldSwitch 必 false（不切号）。
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+		c.BrowserFallbackHTTP = false // 默认配置也必退：哨兵不走 fallback 开关
+	})
+
+	// shouldSwitch 语义：点名非驻留身份的号 = 需要切（事实），不分 allowSwitch。
 	other := accountByID(acctID2)
-	need, _ := m.shouldSwitch(other, false, nil)
-	if need {
-		t.Fatal("auxiliary entry (allowSwitch=false) must never switch resident jar")
+	need, _ := m.shouldSwitch(other, nil)
+	if !need {
+		// acct2 与驻留 acct1 是不同 cookieIdentity：必须报「需要切」。
+		t.Fatal("shouldSwitch(non-resident identity) = false, want true (fact, not policy)")
 	}
-	// 对照：主请求（allowSwitch=true）点名别的身份的号才允许切。
-	need2, _ := m.shouldSwitch(other, true, nil)
-	if !need2 {
-		t.Fatal("main request targeting another identity should switch")
+	resident := accountByID(acctID)
+	need2, _ := m.shouldSwitch(resident, nil)
+	if need2 {
+		t.Fatal("shouldSwitch(resident account) = true, want false")
+	}
+
+	// 端到端：驻留 acct1 时对 acct2 调辅助入口——绝不返回 acct1 token、
+	// 绝不把 fetch 发进驻留 jar，而是回退纯 Go HTTP（127.0.0.1:1 会立刻
+	// 连接失败，证明走的是 Go HTTP 路径而非浏览器）。
+	deadProxy := "http://127.0.0.1:1"
+	tok, err := getXSRFSwitch(other.Cookie, other.AuthUser, deadProxy, false)
+	if err == nil {
+		t.Fatalf("aux xsrf for non-resident account succeeded via browser jar (token=%q)", tok)
+	}
+	if isBrowserLocalError(err) {
+		t.Fatalf("aux skip misclassified as browserLocalError: %v (%T)", err, err)
+	}
+	// 假服务端绝不能收到任何 fetch（jar 没借给 acct2）。
+	select {
+	case spec := <-srv.fetchHit:
+		t.Fatalf("browser fetch dispatched to resident jar for non-resident aux request: %s", spec.url)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 无驻留号 + BrowserFallbackHTTP=false：辅助入口同样无条件回退纯 Go
+	// HTTP（不是 502）。
+	m.mu.Lock()
+	m.seed = browserSeedState{}
+	m.mu.Unlock()
+	_, err = getXSRFSwitch(other.Cookie, other.AuthUser, deadProxy, false)
+	if err == nil {
+		t.Fatal("aux xsrf with no resident succeeded")
+	}
+	if isBrowserLocalError(err) {
+		t.Fatalf("no-resident aux fell to 502 path instead of plain Go HTTP: %v", err)
 	}
 }
 
 // TestBrowserM1MultiAuthUser：同 cookieIdentity 不同 authuser 不触发
-// clearBrowserCookies 与 30s 冷却。
+// clearBrowserCookies 与 30s 冷却；且端到端 doBrowserStreamRequest 验证
+// 不同 AccountID（DB 记录不同）但 Cookie 同串可合法共用驻留 jar。
 func TestBrowserM1MultiAuthUser(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -1841,6 +2084,41 @@ func TestBrowserM1MultiAuthUser(t *testing.T) {
 			t.Fatal("clearBrowserCookies called for same-identity authuser switch")
 		}
 	default:
+	}
+
+	// 端到端：驻留 seed 是 ID=7，请求点名 ID=8 但 cookieIdentity 相同——
+	// 守卫必须放行（按 Cookie 身份核验，不按 DB 记录 ID），fetch 发出并
+	// 返回 200 正文。
+	m.mu.Lock()
+	m.seed.AccountID = 7 // 恢复一个「DB 记录不同」的驻留 ID
+	m.mu.Unlock()
+	go func() {
+		spec := <-srv.fetchHit
+		srv.setFetchScript(spec.reqID, fetchScript{status: 200, chunks: [][]byte{[]byte("shared-jar-body")}})
+	}()
+	acct8 := &CookieAccount{ID: 8, Cookie: cookie, AuthUser: 1, Status: "enabled"}
+	status, rc, err := m.doBrowserStreamRequest(context.Background(), acct8,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), true, nil)
+	if err != nil {
+		t.Fatalf("same-identity different AccountID stream rejected: %v", err)
+	}
+	defer rc.Close()
+	if status != 200 {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	body, _ := io.ReadAll(rc)
+	if string(body) != "shared-jar-body" {
+		t.Fatalf("body = %q, want shared-jar-body", body)
+	}
+	// 对照：异 cookieIdentity 的号无论 allowSwitch 都绝不进 jar（守卫拒绝）。
+	m.mu.Lock()
+	m.seed.AccountID = 7
+	m.mu.Unlock()
+	alien := &CookieAccount{ID: 9, Cookie: "SAPISID=xa; __Secure-1PSID=xp; SID=x", Status: "enabled"}
+	_, _, err = m.doBrowserStreamRequest(context.Background(), alien,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), false, nil)
+	if !isBrowserAuxSkip(err) {
+		t.Fatalf("alien-identity aux request err = %v, want errBrowserSkipAux", err)
 	}
 }
 
@@ -2135,7 +2413,7 @@ func TestBrowserReconnectBackoff(t *testing.T) {
 	}
 	m.mu.Unlock()
 
-	m.handleDeadLocked()
+	m.handleDeadLocked(m.client, m.generation)
 
 	m.mu.Lock()
 	if m.crashStreak != 1 {

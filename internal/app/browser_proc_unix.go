@@ -237,17 +237,6 @@ func reclaimOrphanBrowser(profileDir string) {
 	_ = os.Remove(filepath.Join(profileDir, "DevToolsActivePort"))
 }
 
-// browserExeNames 是 processIsOurBrowser 认可的可执行名白名单（全小写基名
-// 子串匹配）。chromium / chrome / brave / msedge / microsoft-edge 都在我们
-// 的 spawn 候选名单里；Firefox 不在，天然排除。
-var browserExeNames = []string{
-	"chrom", // chromium / chrome / "Google Chrome" / "Chromium" 全覆盖
-	"msedge",
-	"microsoft-edge",
-	"microsoft edge",
-	"brave",
-}
-
 // processIsOurBrowser 精确核验 pid 当前是不是「我们这个 profile 的浏览器」。
 //
 // 两条件同时成立才返回 true：
@@ -269,29 +258,16 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	if err != nil {
 		abs = profileDir
 	}
-	want := "--user-data-dir=" + abs
 	if runtime.GOOS == "linux" {
 		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err != nil {
 			return false
 		}
-		parts := strings.Split(string(b), "\x00")
-		if len(parts) == 0 || parts[0] == "" {
-			return false
-		}
-		if !exeNameOK(parts[0]) {
-			return false
-		}
-		for _, a := range parts[1:] {
-			if a == want {
-				return true
-			}
-		}
-		return false
+		return linuxCmdlineIsOurBrowser(b, abs)
 	}
 	// darwin：ps -ww -o command= 给整条命令行。带空格的可执行路径
 	// （"Google Chrome.app/Contents/MacOS/Google Chrome"）按空格切词后
-	// 可执行段在 "--user-data-dir=" 之前的整段，不能再按词逐个碰运气——
+	// 可执行段在 "--user-data-dir" 之前的整段，不能再按词逐个碰运气——
 	// profile 路径本身可能含 "chrome"/"brave" 之类的词，误当可执行名
 	// 会放过一个根本不是浏览器的进程。
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-ww", "-o", "command=").Output()
@@ -302,46 +278,5 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	if line == "" {
 		return false
 	}
-	return darwinCmdlineIsOurBrowser(line, want)
-}
-
-// darwinCmdlineIsOurBrowser 是 Darwin 命令行的纯解析判据（可单测）：
-//   - 先定位 "--user-data-dir=" 首次出现之前的片段作为可执行路径段，
-//     校验它的基名含合法浏览器名；
-//   - 再按 " --" 边界切出每个选项，找恰好等于 want 的 --user-data-dir=<abs>
-//     ——profile 路径可含空格，按 " --" 而不是空格切词才不会把一个带
-//     空格的 profile 值切碎。
-func darwinCmdlineIsOurBrowser(line, want string) bool {
-	// 可执行路径段 = "--user-data-dir=" 之前的全部（含内部空格）。
-	idx := strings.Index(line, "--user-data-dir=")
-	if idx <= 0 {
-		return false
-	}
-	exeSeg := strings.TrimSpace(line[:idx])
-	if !exeNameOK(exeSeg) {
-		return false
-	}
-	// 参数段按 " --" 边界切，逐项精确比对 --user-data-dir=<abs>。
-	args := line[idx:]
-	for _, a := range strings.Split(args, " --") {
-		a = strings.TrimSpace(a)
-		if a == want {
-			return true
-		}
-	}
-	return false
-}
-
-// exeNameOK 校验一个「可能是可执行路径」的词：取基名小写后命中白名单。
-// "Google" 这类非路径词取基名后不匹配，天然被滤掉。
-func exeNameOK(word string) bool {
-	base := strings.ToLower(filepath.Base(word))
-	// 可执行名里可能带版本/后缀（chrome.exe 的 "chrome"），也认 ".app" 路径
-	// 切出的 "Google Chrome" 末词——白名单是子串匹配。
-	for _, ok := range browserExeNames {
-		if strings.Contains(base, ok) {
-			return true
-		}
-	}
-	return false
+	return darwinCmdlineIsOurBrowser(line, abs)
 }
