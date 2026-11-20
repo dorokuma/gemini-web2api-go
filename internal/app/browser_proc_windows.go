@@ -9,14 +9,19 @@ package app
 //   - taskkill /T 杀整棵进程树（等价于 Unix 的 kill -pgid）；
 //   - taskkill /F 强杀（等价于 SIGKILL）。
 //
-// 孤儿回收不靠 cmdline（Windows 下 wmic 已废弃、PowerShell 冷启动慢且依赖
-// 不一），改走更稳的路：browser-instance.json 里记的 PID 先跟 tasklist 对活，
-// 再靠「profile 目录的 SingletonLock 已被 Chromium 自己删除」作为存活的间接
-// 证据——这条在 Windows 上不如 Linux 的 /proc 硬，但 6 平台交叉编译零 CGO
-// 是硬约束，WMI / NtQueryInformationProcess 都不在标准库里。宁可放过一个
-// 极少数的 PID 复用（概率远低于 Unix，因为 PID 空间大得多），也不冒险杀错。
+// 孤儿回收的核验走 tasklist 的 CSV 输出（/FO CSV /NH）：文本模式的
+// "No tasks are running..." 是按 UI 语言本地化的——中文 Windows 输出
+// "信息: 没有运行的任务..."，英文串匹配不到会被误判成「进程还活着」
+// 然后把无辜 PID 的进程树杀掉。CSV 第一列永远是镜像名，语言无关；
+// 再比对镜像名属于 chrome/chromium/msedge/brave 才允许 taskkill，
+// 核不准宁可不杀。
+//
+// 所有 taskkill / tasklist 调用都经 exec.CommandContext 绑定剩余超时，
+// 绝不无界阻塞（外部命令卡住不能拖死调用方）。
 
 import (
+	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,16 +33,31 @@ import (
 	"time"
 )
 
-// browserProc 与 unix 版同形，PGID 字段仅为对称；Windows 杀树靠 taskkill /T。
+// browserProc 与 unix 版同形，exitedCh 同样是 reaper 的权威退出信号；
+// PGID 字段仅为对称（Windows 杀树靠 taskkill /T）。
 type browserProc struct {
-	Cmd  *exec.Cmd
-	PID  int
-	PGID int
+	Cmd      *exec.Cmd
+	PID      int
+	PGID     int
+	exitedCh chan struct{}
+}
+
+// Alive 非阻塞检查：exitedCh 关了就是真死了；否则再问 tasklist。
+func (p *browserProc) Alive() bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.exitedCh:
+		return false
+	default:
+	}
+	return pidAlive(p.PID)
 }
 
 // spawnBrowser 启动浏览器子进程。CREATE_NEW_PROCESS_GROUP 让它不继承我们的
 // 控制台 Ctrl+C 事件（否则我们收到 Ctrl+C 时浏览器也会被打断，Shutdown 就没机会
-// 做优雅关闭）。
+// 做优雅关闭）。reaper 协程 cmd.Wait() 回收：Windows 下不 Wait 一样留僵尸句柄。
 func spawnBrowser(name string, args []string, env []string) (*browserProc, error) {
 	cmd := exec.Command(name, args...)
 	if env != nil {
@@ -51,19 +71,30 @@ func spawnBrowser(name string, args []string, env []string) (*browserProc, error
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &browserProc{Cmd: cmd, PID: cmd.Process.Pid, PGID: cmd.Process.Pid}, nil
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	return &browserProc{
+		Cmd:      cmd,
+		PID:      cmd.Process.Pid,
+		PGID:     cmd.Process.Pid,
+		exitedCh: exited,
+	}, nil
 }
 
 // killBrowserProcessGroup 用 taskkill 杀整棵树。/T = 树，/F = 强杀，/PID = 根。
 // 先不带 /F 试一次优雅退出（Chromium 收到窗口消息会自己清理），超时后再补 /F。
-//
-// 严禁用 PowerShell Stop-Process -Recurse / WMI 这类更重的外部依赖：taskkill
-// 是 Windows 自带的唯一「按 PID 精确指树」工具。
+// 两个 taskkill 都绑 ctx：外部命令可能被系统策略卡住，调用方的 gracefulTimeout
+// 不能被一个卡住的 taskkill 吃掉。
 func killBrowserProcessGroup(pid, pgid int, gracefulTimeout time.Duration) {
 	if pid <= 0 {
 		return
 	}
-	_ = exec.Command("taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
+	gctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(gctx, "taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
 	deadline := time.Now().Add(gracefulTimeout)
 	for time.Now().Before(deadline) {
 		if !pidAlive(pid) {
@@ -71,20 +102,40 @@ func killBrowserProcessGroup(pid, pgid int, gracefulTimeout time.Duration) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+	fctx, fcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer fcancel()
+	_ = exec.CommandContext(fctx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
 }
 
-// pidAlive 用 tasklist 查 PID 是否还在（不依赖 /proc，标准库能跑）。
-func pidAlive(pid int) bool {
+// tasklistImageName 查 PID 现在对应的镜像名（CSV 第一列）。
+// 进程不存在时返回 ("", false)；查不动也返回 false——核不准宁可不杀。
+func tasklistImageName(pid int) (string, bool) {
 	if pid <= 0 {
-		return false
+		return "", false
 	}
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tasklist",
+		"/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
 	if err != nil {
-		return false
+		return "", false
 	}
-	// 活进程输出带镜像名，死了输出 "INFO: No tasks are running..."
-	return !strings.Contains(string(out), "No tasks")
+	r := csv.NewReader(strings.NewReader(string(out)))
+	rec, err := r.Read()
+	if err != nil || len(rec) < 2 {
+		return "", false
+	}
+	// CSV 第二列是 PID：对不上说明输出形态异常，宁信错不滥杀。
+	if strings.TrimSpace(rec[1]) != strconv.Itoa(pid) {
+		return "", false
+	}
+	return strings.TrimSpace(rec[0]), true
+}
+
+// pidAlive 用 tasklist CSV 查 PID 是否还在（语言无关，标准库能跑）。
+func pidAlive(pid int) bool {
+	_, ok := tasklistImageName(pid)
+	return ok
 }
 
 // browserInstanceFile 与 unix 版同形。
@@ -109,9 +160,11 @@ func clearBrowserInstance(profileDir string) {
 	_ = os.Remove(filepath.Join(profileDir, "browser-instance.json"))
 }
 
-// reclaimOrphanBrowser 见 unix 版注释。Windows 侧额外做一步防御：
-// 记录里的 Profile 跟当前 profileDir 不一致时直接跳过——说明这个 json 是
-// 别的 profile 目录的（或者被手改过），不能动它的 PID。
+// reclaimOrphanBrowser 见 unix 版注释。Windows 侧：
+//  1. 记录里的 Profile 跟当前 profileDir 不一致时直接跳过——说明这个 json
+//     是别的 profile 目录的（或者被手改过）；
+//  2. tasklist 查活 + 镜像名白名单双重核验，核不准宁可不杀；
+//  3. 核验不过但进程还活着时，Singleton* 一律不删（防双实例写坏 SQLite）。
 func reclaimOrphanBrowser(profileDir string) {
 	instPath := filepath.Join(profileDir, "browser-instance.json")
 	raw, err := os.ReadFile(instPath)
@@ -120,9 +173,15 @@ func reclaimOrphanBrowser(profileDir string) {
 		if json.Unmarshal(raw, &inst) == nil && inst.PID > 0 {
 			abs, _ := filepath.Abs(profileDir)
 			want, _ := filepath.Abs(inst.Profile)
-			if strings.EqualFold(abs, want) && processIsOurBrowser(inst.PID, profileDir) {
-				logf("[browser] 回收上轮遗留的浏览器进程树 pid=%d", inst.PID)
-				killBrowserProcessGroup(inst.PID, inst.PGID, 1500*time.Millisecond)
+			if strings.EqualFold(abs, want) {
+				if processIsOurBrowser(inst.PID, profileDir) {
+					logf("[browser] 回收上轮遗留的浏览器进程树 pid=%d", inst.PID)
+					killBrowserProcessGroup(inst.PID, inst.PGID, 1500*time.Millisecond)
+				} else if pidAlive(inst.PID) {
+					logf("[browser] browser-instance 的 pid=%d 活着但核验不过，"+
+						"不动 Singleton* 也不杀（防误伤 PID 复用）", inst.PID)
+					return
+				}
 			}
 		}
 	}
@@ -130,15 +189,29 @@ func reclaimOrphanBrowser(profileDir string) {
 		_ = os.Remove(filepath.Join(profileDir, name))
 	}
 	_ = os.Remove(instPath)
+	// 同 unix：上一轮的死端口文件留着只会误导 waitDevToolsPort。
+	_ = os.Remove(filepath.Join(profileDir, "DevToolsActivePort"))
 }
 
-// processIsOurBrowser 的 Windows 版：活进程 + 记录的 profile 一致即认为命中。
+// windowsBrowserImages 是允许 taskkill 的镜像名白名单（全小写、带 .exe）。
+var windowsBrowserImages = map[string]bool{
+	"chrome.exe":     true,
+	"chromium.exe":   true,
+	"msedge.exe":     true,
+	"brave.exe":      true,
+	"new_chrome.exe": true,
+}
+
+// processIsOurBrowser 的 Windows 版：活进程 + 镜像名命中浏览器白名单。
 //
 // Windows 没法像 Linux 那样零成本读 cmdline（WMI 重、NtQueryInformationProcess
-// 不在标准库），而 PID 复用概率远低于 Unix（PID 空间 2^22 且分配更稀疏），
-// 用「还活着 + 同一个 profile 记录」做判据已经是这个平台上稳态可做的最强
-// 校验；误杀场景只剩「浏览器死了、PID 恰好被分给另一个进程、且我们紧接着
-// 启动」——即便撞上，taskkill 只杀那一棵树，不会波及整组无名进程。
+// 不在标准库），所以核验到「这是台浏览器」为止——Profile 一致性已经在外层
+// reclaimOrphanBrowser 比过，两层叠加比只看 PID 强得多；镜像名对不上
+// （PID 复用给了别的程序）宁可不杀。
 func processIsOurBrowser(pid int, profileDir string) bool {
-	return pidAlive(pid)
+	image, ok := tasklistImageName(pid)
+	if !ok {
+		return false
+	}
+	return windowsBrowserImages[strings.ToLower(image)]
 }

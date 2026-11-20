@@ -37,8 +37,10 @@ const maxCDPFrameBytes = 32 << 20
 // cdpConn 是一条已握手的回环 WebSocket 连接。
 //
 // 读侧单 goroutine（readFrame 不加锁，只有读循环在调）；写侧任何 goroutine 可来，
-// 统一过 writeMu 抢锁写整帧，帧之间不会交错。Close 之后读侧立刻被打断——conn.Close
-// 会让阻塞中的 Read 返回错误，不需要另设 deadline。
+// 统一过 writeMu 抢锁写整帧，帧之间不会交错。写是有界动作：sendText/sendClose
+// 都设写 deadline，对端不收（渲染器卡死、TCP 窗口关死）时一次 Write 不能把
+// 调用方或关闭路径挂住。Close 先给短 deadline 发 Close 帧再立刻 conn.Close，
+// 强制唤醒所有阻塞读写与 pending 调用方。
 type cdpConn struct {
 	conn    net.Conn
 	br      *bufio.Reader
@@ -47,6 +49,14 @@ type cdpConn struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 }
+
+// cdpWriteTimeout 是单帧写超时：回环 DevTools 写帧通常 <1ms，5s 是对
+// 「对端彻底不收」的兜底——卡死宁可让这次调用报错，也不阻塞协程。
+const cdpWriteTimeout = 5 * time.Second
+
+// cdpCloseTimeout 是发 Close 帧的预算：礼貌帧发不出去就直接断，
+// 绝不让 Close() 自身被拖住。
+const cdpCloseTimeout = 300 * time.Millisecond
 
 // dialCDPWebsocket 向 wsURL（ws://127.0.0.1:port/devtools/... 形态）完成 HTTP Upgrade 握手。
 //
@@ -181,9 +191,12 @@ const (
 
 // sendText 发一条客户端→服务端的 Text 帧。客户端帧必须 Masked（RFC 6455 §5.3），
 // 服务端对 unmasked 客户端帧有权直接关连接，Chromium 就是这么做的。
+// 有界写：cdpWriteTimeout 内写不完就报错，不阻塞调用方。
 func (c *cdpConn) sendText(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.writeFrame(wsOpText, payload)
 }
 
@@ -191,13 +204,18 @@ func (c *cdpConn) sendText(payload []byte) error {
 func (c *cdpConn) sendPong(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.writeFrame(wsOpPong, payload)
 }
 
-// sendClose 发 Close 帧做礼貌关闭；不等对方回执（调用方通常随即 Close()）。
+// sendClose 发 Close 帧做礼貌关闭；短 deadline，发不出就算了——
+// 调用方随即 conn.Close，礼貌帧的价值只是让对端干净收尾。
 func (c *cdpConn) sendClose() {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpCloseTimeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	_ = c.writeFrame(wsOpClose, nil)
 }
 
@@ -336,6 +354,7 @@ func (c *cdpConn) readFrame() (op byte, fin bool, payload []byte, err error) {
 }
 
 // Close 立即打断阻塞中的读循环并释放连接。幂等。
+// conn.Close 强制唤醒所有阻塞读写；pending 调用方由 cdpClient.failAll 唤醒。
 func (c *cdpConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)

@@ -988,16 +988,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
-				// 浏览器模式下顺带让常驻页刷新一次 /app 上下文：页内 fetch /app
-				// 拿到的 HTML 里就是新 token（WIZ_global_data 随响应刷新）。
-				// 刷新失败不阻塞——getXSRF 的浏览器路径本身就会再取一次。
-				if shouldUseBrowserTransport() {
-					if a := browserAccountFromHeaders(geminiHeaders); a != nil {
-						rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
-						_ = browserMgr.reloadResidentPage(rctx, a)
-						rcancel()
-					}
-				}
+				// 浏览器模式下不要再先 reloadResidentPage 又 getXSRF——两者都
+				// 会页内 fetch /app 一次，连续抓两遍纯粹浪费一次上游往返。
+				// getXSRF 的浏览器路径本身就会重抓页面拿新 token。
 				if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
 					xsrfToken = tok // 同步给收尾：phantomCleanup 按闭包取当前值
 					body = buildBody(tok)
@@ -1416,6 +1409,9 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 	// 常驻真实浏览器传输层：开着时一律走页内 fetch——浏览器的意义就是指纹一致，
 	// 有代理也照走（流量经 browserProxyBridge 的 CONNECT 隧道转给当前上游代理）。
 	if shouldUseBrowserTransport() {
+		// 全链路代理接线：本次 acquireSlot 选定的 proxyURL 同步给代理桥，
+		// fallback_direct=false + 代理池时桥绝不直连（真实 IP 不出桥）。
+		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(headers)
 		status, pr, err := browserMgr.doBrowserStreamRequest(ctx, acct, endpoint, "POST", headers, []byte(body), nil)
 		if err != nil {
@@ -1840,6 +1836,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 
 	if shouldUseBrowserTransport() {
 		// 浏览器传输模式：页内 fetch 探测，跟正式请求同一条链路。
+		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(headers)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		status, b, e := browserMgr.doBrowserPost(ctx, acct, endpoint, headers, []byte(body), nil)

@@ -125,6 +125,7 @@ func uploadPostCtx(ctx context.Context, url string, headers map[string]string, b
 	// 走页内 fetch（cookie jar 由浏览器管，跟页内请求天然一致）。跨域的上传
 	// host（push.clients6.google.com）页内 fetch 也行，但 CORS 复杂，仍走 Go。
 	if shouldUseBrowserTransport() && strings.HasPrefix(url, "https://gemini.google.com") {
+		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(headers)
 		status, b, err := browserMgr.doBrowserPost(ctx, acct, url, headers, body, nil)
 		if err != nil {

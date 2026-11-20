@@ -244,7 +244,13 @@ func fetchAppTokens(cookie string, authuser int, proxyURL string) (xsrfEntry, er
 	// 浏览器传输模式：直接从常驻页面上下文拿（页内 fetch /app 的 HTML 里就有
 	// WIZ_global_data），绕开纯 Go HTTP 的另一次 GET /app。
 	if shouldUseBrowserTransport() {
-		acct := browserAccountFromHeaders(map[string]string{"Cookie": cookie})
+		// 透传调用方真实 authuser：同 cookieIdentity 下 /u/N 的 token 不同，
+		// browserAccountFromHeaders 靠这个头精确匹配到对应 authuser 的记录。
+		syncBridgeUpstream(proxyURL)
+		acct := browserAccountFromHeaders(map[string]string{
+			"Cookie":          cookie,
+			"X-Goog-AuthUser": strconv.Itoa(authuser),
+		})
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		e, err := browserMgr.fetchAppTokensViaBrowser(ctx, acct, nil)

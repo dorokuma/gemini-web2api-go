@@ -1150,10 +1150,20 @@ async function loadRtCfg() {
                              : '<span class="badge fail">未设 token</span>', 'compose 的 ADMIN_TOKEN'],
     ['API Key', d.api_key_locked ? '<span class="badge">部署锁定</span>'
                                  : '<span class="badge ok">面板可轮换</span>', 'compose 的 API_KEY'],
-    ['浏览器路径', d.browser_path ? escapeHtml(d.browser_path)
-        : (d.browser_detected ? escapeHtml(d.browser_detected) + ' <span class="badge muted">自动探测</span>'
-                              : '<span class="badge fail">未找到</span>'),
+    // browser_path 是配置值，browser_detected 是校验后的实际可用路径——
+    // 两者分开显示：配置了但不可执行/不存在时 browser_detected 为空，
+    // 显示「配置无效」而不是把坏路径伪装成「已找到」。
+    ['浏览器路径', d.browser_path
+        ? escapeHtml(d.browser_path) + (d.browser_detected
+            ? ' <span class="badge muted">已配置</span>'
+            : ' <span class="badge fail">路径无效</span>')
+        : (d.browser_detected
+            ? escapeHtml(d.browser_detected) + ' <span class="badge muted">自动探测</span>'
+            : '<span class="badge fail">未找到</span>'),
      '部署级只读：--browser-path / config.json browser_path / BROWSER_PATH'],
+    ['浏览器探测', d.browser_detected ? escapeHtml(d.browser_detected)
+        : '<span class="badge fail">不可用（请求将回 502 browser_unavailable）</span>',
+     '自动探测/配置校验后的实际可用浏览器路径'],
     ['浏览器 profile', d.browser_profile_dir ? escapeHtml(d.browser_profile_dir)
         : '<span class="badge muted">默认（&lt;db 目录&gt;/browser-profile）</span>',
      '部署级只读：--browser-profile-dir / config.json browser_profile_dir / BROWSER_PROFILE_DIR'],

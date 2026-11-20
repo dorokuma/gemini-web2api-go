@@ -163,15 +163,28 @@ func (c *cdpClient) Call(ctx context.Context, sessionID, method string, params i
 	}
 }
 
-// Close 礼貌地发 Close 帧再断连，唤醒所有 pending。
+// Close 礼貌地发 Close 帧（短 deadline，发不出就算了）再断连，
+// 唤醒所有 pending。先 conn.Close 再 failAll：conn 关死立刻唤醒所有
+// 阻塞读写，failAll 再唤醒 pending 调用方，两边都不会被拖住。
 func (c *cdpClient) Close() {
 	c.conn.sendClose()
-	c.failAll(errors.New("cdp: client closed"))
 	c.conn.Close()
+	c.failAll(errors.New("cdp: client closed"))
 }
 
 // Done 返回连接终态信号。
 func (c *cdpClient) Done() <-chan struct{} { return c.done }
+
+// Closed 报告连接是否已终态（断/关）：ensureRunning 的存活校验用它，
+// 避免每次拿一个僵尸 client 空转一轮才被发现。
+func (c *cdpClient) Closed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
 
 // readLoop 是唯一的读 goroutine：把帧派给 pending 或事件回调，
 // 任何读错误都走 failAll 收尾（保证等待方立刻拿到错而不是挂死）。
