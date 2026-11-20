@@ -150,11 +150,14 @@ func (b *browserProxyBridge) handleConnect(w http.ResponseWriter, r *http.Reques
 // checkTarget 严格校验 CONNECT 目标：
 //   - net.SplitHostPort 必须解析出非空 host 与合法端口（0-65535）；
 //   - host 不得含空白/控制字符/CR-LF（注入防御）；
-//   - 回环地址（127.0.0.0/8、::1、localhost）、未指定地址（0.0.0.0、::、
-//     ::ffff:0.0.0.0）与本桥监听端口一律拒绝，除非测试显式打开
-//     allowLoopback——CONNECT 0.0.0.0:<port> 会拨到本机该端口，和回环
-//     一样是 SSRF（IsUnspecified/IsLoopback 对 IPv4-mapped 形式经 To4
-//     等价比较，一并覆盖）。
+//   - host 含 '%'（IPv6 zone id，如 [::1%lo]）一律拒绝——zone id 使
+//     net.ParseIP 返回 nil 逃逸回环判定，但拨号时仍指向本机接口；
+//   - host 剥离尾点（"localhost." 是合法 FQDN 且解析回环，字面比较
+//     会漏放）后再判定：回环地址（127.0.0.0/8、::1、localhost）、
+//     未指定地址（0.0.0.0、::、::ffff:0.0.0.0）与本桥监听端口一律
+//     拒绝，除非测试显式打开 allowLoopback——CONNECT 0.0.0.0:<port>
+//     会拨到本机该端口，和回环一样是 SSRF（IsUnspecified/IsLoopback
+//     对 IPv4-mapped 形式经 To4 等价比较，一并覆盖）。
 func (b *browserProxyBridge) checkTarget(target string) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
@@ -180,6 +183,13 @@ func (b *browserProxyBridge) checkTarget(target string) error {
 		return fmt.Errorf("CONNECT target %q is the bridge itself (self-loop refused)", target)
 	}
 	h := strings.ToLower(strings.Trim(host, "[]"))
+	if strings.Contains(h, "%") {
+		return fmt.Errorf("CONNECT target %q carries IPv6 zone id (refused)", target)
+	}
+	h = strings.TrimRight(h, ".")
+	if h == "" {
+		return fmt.Errorf("bad CONNECT target %q: empty host", target)
+	}
 	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
 		return fmt.Errorf("CONNECT target %q is loopback (refused)", target)
 	}

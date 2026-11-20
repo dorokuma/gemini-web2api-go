@@ -3279,14 +3279,26 @@ func TestCDPSendWriteErrClosesConn(t *testing.T) {
 	}
 }
 
-// TestBrowserProxyCheckTargetRejectsUnspecified：R6 回归——CONNECT 目标
+// TestBrowserProxyCheckTargetRejectsUnspecified：R6/R7 回归——CONNECT 目标
 // 为未指定地址（0.0.0.0 / [::] / [::ffff:0.0.0.0]）时 checkTarget 必须
-// 拒绝：这些地址实际拨到本机端口，和回环一样是 SSRF。
+// 拒绝：这些地址实际拨到本机端口，和回环一样是 SSRF。R7 追加两类绕过：
+// 尾点回环域名（localhost. 会被 DNS 规范化回 localhost，ParseIP/
+// HasSuffix 字面比较漏放）与 IPv6 zone id（[::1%lo] 的 % 使 ParseIP
+// 返回 nil 而逃逸判定，拨号时 zone 仍指向本机接口）。
 func TestBrowserProxyCheckTargetRejectsUnspecified(t *testing.T) {
 	b := &browserProxyBridge{port: 19000} // allowLoopback=false（生产默认）
-	for _, target := range []string{"0.0.0.0:8000", "[::]:8000", "[::ffff:0.0.0.0]:8000"} {
+	for _, target := range []string{
+		// R6：未指定地址字面形态。
+		"0.0.0.0:8000", "[::]:8000", "[::ffff:0.0.0.0]:8000",
+		// R7：尾点回环域名——"localhost." 是合法 FQDN 且解析回环，
+		// 必须先剥离尾点再做 localhost/HasSuffix 判定。
+		"localhost.:8000", "LOCALHOST.:8000", "sub.localhost.:8000",
+		// R7：IPv6 zone id——host 含 '%' 时 net.ParseIP 返回 nil，
+		// 不拦截则绕过 loopback/unspecified 判定拨到本机接口。
+		"[::1%lo]:8000", "[::%lo]:8000", "[::ffff:127.0.0.1%lo]:8000", "[::ffff:0.0.0.0%lo]:8000",
+	} {
 		if err := b.checkTarget(target); err == nil {
-			t.Fatalf("checkTarget(%q) returned nil, want refused (unspecified addr reaches local ports = SSRF)", target)
+			t.Fatalf("checkTarget(%q) returned nil, want refused (unspecified/loopback bypass reaches local ports = SSRF)", target)
 		}
 	}
 }
