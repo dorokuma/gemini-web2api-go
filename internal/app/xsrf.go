@@ -260,27 +260,34 @@ func fetchAppTokens(cookie string, authuser int, proxyURL string, allowSwitch bo
 			"Cookie":          cookie,
 			"X-Goog-AuthUser": strconv.Itoa(authuser),
 		})
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
-		// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
-		e, err := browserMgr.fetchAppTokensViaBrowserCtx(ctx, proxyURL, acct, allowSwitch, nil)
-		if err != nil {
-			// 辅助入口哨兵：该用哪个 jar 与驻留不符——无条件回退纯 Go HTTP，
-			// 不看 browser_fallback_http，也不是浏览器坏了。
-			if isBrowserAuxSkip(err) {
-				logf("[xsrf] 辅助入口不适配驻留 jar，回退纯 Go HTTP")
-			} else if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
-				// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
-				// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
-				return xsrfEntry{}, err
-			} else if isBrowserLocalError(err) {
-				logf("[xsrf] 浏览器取 token 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+		// 带 Cookie 但反查不到 enabled 账号（status=disabled 的管理员检测、
+		// 未入池 Cookie）：绝不能把 acct=nil 传进浏览器当匿名处理——匿名
+		// /app 页拿不到 SNlM0e，上层会误报「登录态有效」且重置 authuser。
+		// 与 gemini.go / upload.go 的 skipBrowser 语义一致：带 Cookie 的
+		// 非池请求走纯 Go HTTP，用原 cookie 与 authuser 完成真实检测。
+		if !(cookie != "" && acct == nil) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
+			// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
+			e, err := browserMgr.fetchAppTokensViaBrowserCtx(ctx, proxyURL, acct, allowSwitch, nil)
+			if err != nil {
+				// 辅助入口哨兵：该用哪个 jar 与驻留不符——无条件回退纯 Go HTTP，
+				// 不看 browser_fallback_http，也不是浏览器坏了。
+				if isBrowserAuxSkip(err) {
+					logf("[xsrf] 辅助入口不适配驻留 jar，回退纯 Go HTTP")
+				} else if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+					// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
+					// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
+					return xsrfEntry{}, err
+				} else if isBrowserLocalError(err) {
+					logf("[xsrf] 浏览器取 token 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+				} else {
+					return xsrfEntry{}, err
+				}
 			} else {
-				return xsrfEntry{}, err
+				return e, nil
 			}
-		} else {
-			return e, nil
 		}
 	}
 	body, err := fetchAppPage(cookie, authuser, proxyURL)

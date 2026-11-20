@@ -110,22 +110,65 @@ func killBrowserProcessGroup(pid, pgid int, gracefulTimeout time.Duration) {
 	defer graceCancel()
 	_ = exec.CommandContext(graceCtx, "taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
 	for time.Now().Before(graceEnd) {
-		if !pidAliveCtx(graceCtx, pid) {
+		// 三态探活：仅 tasklist 成功执行且确认 PID 不在结果中才算
+		// procDead 提前退出；tasklist 超时/出错/ctx 过期一律 procUnknown——
+		// 探不准绝不能提前 return 跳强杀，必须落到 /F 阶段。
+		if probeProcState(graceCtx, pid) == procDead {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// 强杀段：独立的 deadline = 总截止，保证 /F 有预留时间真正跑完。
-	forceCtx, forceCancel := context.WithDeadline(context.Background(), deadline)
+	// 强杀段预算保底：即使前面等待/切号把剩余预算耗到 0、deadline 已过，
+	// /F 那一发也必须有独立保底短超时真正执行——拿已过期 ctx 进
+	// CommandContext 会让 taskkill 根本不启动，等于强杀从来没发。
+	forceRemain := time.Until(deadline)
+	if forceRemain < 500*time.Millisecond {
+		forceRemain = 500 * time.Millisecond
+	}
+	forceCtx, forceCancel := context.WithTimeout(context.Background(), forceRemain)
 	defer forceCancel()
 	_ = exec.CommandContext(forceCtx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
 }
 
+// procState 是 pidAliveCtx 的三态结果：仅「tasklist 成功执行且 PID 不在
+// 结果中」才返回 procDead；一切探不准（超时/出错/ctx 过期）都是
+// procUnknown——绝不把它当「死了」提前退出强杀路径。
+type procState int
+
+const (
+	procDead    procState = iota // 确认不在 tasklist 结果中
+	procAlive                    // 确认活着
+	procUnknown                  // 探不准（超时/出错/ctx 过期）
+)
+
+// probeProcState 同 pidAliveCtx 的三态版：区分「确认死」与「探不准」。
+func probeProcState(ctx context.Context, pid int) procState {
+	if pid <= 0 {
+		return procDead
+	}
+	out, err := exec.CommandContext(ctx, "tasklist",
+		"/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+	if err != nil {
+		// tasklist 超时/启动失败/非零退出：一律探不准，绝不提前退出强杀。
+		return procUnknown
+	}
+	r := csv.NewReader(strings.NewReader(string(out)))
+	rec, err := r.Read()
+	if err != nil || len(rec) < 2 {
+		// tasklist 成功执行但没查到该 PID 的行 = 进程确认不存在。
+		return procDead
+	}
+	if strings.TrimSpace(rec[1]) != strconv.Itoa(pid) {
+		return procDead
+	}
+	return procAlive
+}
+
 // pidAliveCtx 同 pidAlive，但 tasklist 调用的超时共享调用方 ctx 的剩余时间
-// （每次独立 5s 会把停机预算拖穿）。
+// （每次独立 5s 会把停机预算拖穿）。三态语义见 probeProcState：procUnknown
+// 一律当「可能活着」返回 true，绝不提前退出强杀。
 func pidAliveCtx(ctx context.Context, pid int) bool {
-	_, ok := tasklistImageNameCtx(ctx, pid)
-	return ok
+	return probeProcState(ctx, pid) != procDead
 }
 
 // tasklistImageName 查 PID 现在对应的镜像名（CSV 第一列）。

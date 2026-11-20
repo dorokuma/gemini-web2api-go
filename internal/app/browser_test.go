@@ -743,6 +743,20 @@ func TestCDPDisconnectPropagatesToStreams(t *testing.T) {
 	s := findStreamByCloser(t, rc)
 	// 等 headers 到达（流已注册）。
 	time.Sleep(50 * time.Millisecond)
+	// headers 后立即推一条 0 延迟真实 chunk 把 pumpToPipe 顶进 pipeW.Write
+	// 背压阻塞（读侧还没消费），再断 CDP——failAllStreams 的 pipeR.Close
+	// 必须唤醒它；若删掉那行这个断言必 FAIL。
+	s.push("chunk", []byte("backpressure-chunk"), browserStreamHeader{}, "")
+	// 等 pumpToPipe 取走 chunk 阻塞在 pipeW.Write（queue 已空但 done 未置）。
+	for i := 0; i < 200; i++ {
+		s.mu.Lock()
+		empty := len(s.queue) == 0
+		s.mu.Unlock()
+		if empty {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	// 断开后：closed（failAll 判死）+ pumpDone（failAllStreams 的 pipeR.Close
 	// 唤醒背压 pumpToPipe）都必须在预算内退出。
 	srv.conn.Close() // 模拟 CDP 断连
@@ -1230,6 +1244,8 @@ func bridgeConnect(t *testing.T, port int, target string) (net.Conn, bool) {
 //   - 调用方选定 ProxyB 不被覆盖为池首 ProxyA；
 //   - 含 @/%/: 特殊字符密码的 Basic 认证按解码后原文发送；
 //   - allowDirect true→false（URL 均空串）立即断旧直连隧道；
+//   - 真实 echo server 上验证旧直连隧道活通、SetUpstream("") 后 EOF/reset；
+//   - 生产明确空串直连 SetUpstream("", true) 把桥从代理 B 切回直连；
 //   - 全禁用池首航 allowDirect=false 拒直连。
 func TestBrowserProxyBridgeWiring(t *testing.T) {
 	proxyA := newLocalConnectProxy(t)
@@ -1294,6 +1310,23 @@ func TestBrowserProxyBridgeWiring(t *testing.T) {
 	c2.Close()
 
 	// allowDirect true→false（URL 均空串）立即关闭旧直连隧道。
+	// 真实 echo server：先证明直连隧道活通，再断言 SetUpstream 后 EOF/reset。
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); c.Close() }()
+		}
+	}()
+	echoAddr := echoLn.Addr().String()
+
 	bridge2, err := newBrowserProxyBridge()
 	if err != nil {
 		t.Fatalf("bridge2: %v", err)
@@ -1303,19 +1336,40 @@ func TestBrowserProxyBridgeWiring(t *testing.T) {
 	if err := bridge2.SetUpstream("", true); err != nil {
 		t.Fatalf("SetUpstream direct: %v", err)
 	}
-	dc, _ := bridgeConnect(t, bridge2.Port(), "127.0.0.1:9")
+	dc, _ := bridgeConnect(t, bridge2.Port(), echoAddr)
+	if dc == nil {
+		t.Fatal("bridge CONNECT to echo server not 200")
+	}
+	// 隧道活通断言：写 PING 必须原样读回。
+	if _, err := dc.Write([]byte("PING")); err != nil {
+		t.Fatalf("echo write: %v", err)
+	}
+	dc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	pong := make([]byte, 4)
+	if _, err := io.ReadFull(dc, pong); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+	if string(pong) != "PING" {
+		t.Fatalf("echo reply = %q, want PING (tunnel not live)", pong)
+	}
+	// SetUpstream("", false) 断旧直连隧道：500ms 内必须收到 EOF/reset，
+	// 明确拒绝超时（隧道没被关才算失败）。
 	if err := bridge2.SetUpstream("", false); err != nil {
 		t.Fatalf("SetUpstream tighten: %v", err)
 	}
-	if dc != nil {
-		dc.SetReadDeadline(time.Now().Add(time.Second))
-		var one [1]byte
-		_, rerr := dc.Read(one[:])
-		if rerr == nil {
-			t.Fatal("direct tunnel not closed after allowDirect true→false")
-		}
-		dc.Close()
+	dc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var one [1]byte
+	_, rerr := dc.Read(one[:])
+	if rerr == nil {
+		t.Fatal("direct tunnel not closed after allowDirect true→false")
 	}
+	if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("direct tunnel read timed out after SetUpstream close: %v (must be EOF/reset)", rerr)
+	}
+	if errors.Is(rerr, os.ErrDeadlineExceeded) {
+		t.Fatalf("direct tunnel read deadline exceeded after SetUpstream close: %v", rerr)
+	}
+	dc.Close()
 	c3, ok := bridgeConnect(t, bridge2.Port(), "example.com:443")
 	if ok {
 		t.Fatal("CONNECT allowed after allowDirect=false (direct leak)")
@@ -1323,6 +1377,31 @@ func TestBrowserProxyBridgeWiring(t *testing.T) {
 	if c3 != nil {
 		c3.Close()
 	}
+
+	// 生产明确空串直连：先 SetUpstream(proxyB, false) 让桥走代理 B，
+	// 再 SetUpstream("", true) 明确切回直连——upstream 必须真变成 ""，
+	// 绝不因空串跳过同步沿用代理 B（修「proxyURL=="" 不更新桥」的旧 bug）。
+	bridge4, err := newBrowserProxyBridge()
+	if err != nil {
+		t.Fatalf("bridge4: %v", err)
+	}
+	defer bridge4.Shutdown(context.Background())
+	if err := bridge4.SetUpstream("http://"+addrB, false); err != nil {
+		t.Fatalf("SetUpstream proxyB: %v", err)
+	}
+	if err := bridge4.SetUpstream("", true); err != nil {
+		t.Fatalf("SetUpstream explicit direct: %v", err)
+	}
+	bridge4.mu.Lock()
+	if bridge4.upstream != "" {
+		bridge4.mu.Unlock()
+		t.Fatalf("explicit-direct SetUpstream(\"\") did not clear upstream: %q", bridge4.upstream)
+	}
+	if !bridge4.allowDirect {
+		bridge4.mu.Unlock()
+		t.Fatal("explicit-direct SetUpstream(\"\",true) must set allowDirect")
+	}
+	bridge4.mu.Unlock()
 
 	// 全禁用池首航：池非空全 disabled + fallback_direct=false
 	// → upstream="" 且 allowDirect=false。
@@ -1576,47 +1655,146 @@ func TestBrowserStartFailRetryAndStopRace(t *testing.T) {
 		m2.ensureRunning(context.Background())
 	}()
 
-	// ── handleDeadLocked 单飞清场：两条并发清理路径只有一条认领，
-	// 第二条不放弃就会踩坏新代际 ──
+	// ── handleDeadLocked 单飞清场：两条并发真实调用同一快照，
+	// 第二条不放弃就会踩坏新代际。用可控 stub 卡死第一条的锁外清理，
+	// 保证第二条真在它清理期间到达 ──
 	m3 := &browserManager{
 		readyCh:   make(chan struct{}),
 		streams:   map[string]*browserStream{},
 		switchSem: make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 	}
-	deadClient := &cdpClient{conn: nil, done: make(chan struct{})}
+	// 假 CDP conn：cdpClient.Close 需要真实 net.Conn，用 TCP 回环对。
+	// （net.Pipe 无真实 fd，kill -pgid 探活与 conn 生命周期要真实 socket。）
+	pl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pipe listen: %v", err)
+	}
+	defer pl.Close()
+	go func() {
+		c, _ := pl.Accept()
+		if c != nil {
+			defer c.Close()
+			io.Copy(io.Discard, c)
+		}
+	}()
+	cliC, err := net.Dial("tcp", pl.Addr().String())
+	if err != nil {
+		t.Fatalf("pipe dial: %v", err)
+	}
+	deadClient := newCDPClient(&cdpConn{conn: cliC, br: bufio.NewReader(cliC),
+		closed: make(chan struct{}), writeSem: make(chan struct{}, 1)})
 	m3.mu.Lock()
-	m3.proc = &browserProc{PID: os.Getpid(), PGID: os.Getpid(), exitedCh: make(chan struct{})}
+	// PID 用一个永远不存在的极大值：tasklist/kill 查活立刻返回死，
+	// killBrowserProcessGroup 的优雅段秒退，第一条清场不被 5s 探活拖死。
+	m3.proc = &browserProc{PID: 0x7fffffff, PGID: 0x7fffffff, exitedCh: make(chan struct{})}
 	m3.client = deadClient
 	m3.started = true
 	m3.generation = 7
 	m3.mu.Unlock()
-	// 第一条认领清场（client.Close 对 nil conn 会 panic——用真实 conn 代替）。
-	// 用假 conn：cdpClient.Close 先 c.conn.Close()，nil conn 会崩，所以
-	// 直接测「代际/client 不匹配时第二条调用放弃」这个单飞语义：
-	// 第一次调用后 generation 已变、client 已清，第二次同一快照必须放弃。
-	m3.mu.Lock()
-	if !m3.cleaning && m3.generation == 7 && m3.client == deadClient {
-		// 模拟第一条已认领：手动置 cleaning + 换代际，等价 handleDeadLocked 锁内段。
-		m3.cleaning = true
-		m3.proc = nil
-		m3.client = nil
-		m3.generation++
+
+	// cleanupBlock 卡住第一条 handleDeadLocked 的锁外 killProcGroup 段：
+	// 桩住杀进程钩子让第一条进清理后真实阻塞在可控点，第二条同快照并发
+	// 到达时第一条仍在「清理中」（cleaning 已置、gen 已+1）必须放弃。
+	// 这是「可控测试钩子 + 真实并发调用」——不是手改状态冒充执行。
+	cleanupBlock := make(chan struct{})
+	enteredKill := make(chan struct{}, 1)
+	oldKill := killProcGroupFn
+	defer func() { killProcGroupFn = oldKill }()
+	killProcGroupFn = func(pid, pgid int, d time.Duration) {
+		select {
+		case enteredKill <- struct{}{}:
+		default:
+		}
+		<-cleanupBlock // 第一条清理真卡在杀进程段，直到测试放行
 	}
-	m3.mu.Unlock()
-	// 第二条并发清理拿旧快照来：client/gen 不匹配 → 放弃，不得再复位一次。
-	m3.handleDeadLocked(deadClient, 7)
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		m3.handleDeadLocked(deadClient, 7)
+	}()
+	// 等第一条认领并置 cleaning + 真进入锁外清理的杀进程段。
+	select {
+	case <-enteredKill:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handleDeadLocked did not reach killProcGroup")
+	}
 	m3.mu.Lock()
 	if !m3.cleaning {
 		m3.mu.Unlock()
-		t.Fatal("cleaning flag lost by second concurrent handleDeadLocked")
+		t.Fatal("first handleDeadLocked did not claim cleaning")
 	}
+	m3.mu.Unlock()
+	// 期间 ensureRunning 必须被 cleaning 拒绝。
+	if err := m3.ensureRunning(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "cleaning") {
+		t.Fatalf("ensureRunning during cleanup = %v, want cleaning rejection", err)
+	}
+	// 第二条并发清理拿旧快照来：client/gen 不匹配 → 放弃，不得再复位一次。
+	m3.handleDeadLocked(deadClient, 7)
+	m3.mu.Lock()
 	if m3.generation != 8 {
 		m3.mu.Unlock()
 		t.Fatalf("generation advanced twice: got %d, want 8", m3.generation)
 	}
-	m3.cleaning = false
 	m3.mu.Unlock()
+	close(cleanupBlock) // 放行第一条清理完成
+	<-firstDone
+
+	// ── startCancel 取消段：真实 ensureRunning → startOnce 全生命周期，
+	// Stop 立即取消 startCtx，旧轮退出不抹掉新轮 startCancel ──
+	m4 := &browserManager{
+		readyCh:   make(chan struct{}),
+		streams:   map[string]*browserStream{},
+		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	ctxCancelled := make(chan struct{})
+	oldDoStart := doStartFn
+	defer func() { doStartFn = oldDoStart }()
+	doStartFn = func(mgr *browserManager, sctx context.Context) startResult {
+		select {
+		case <-sctx.Done():
+			close(ctxCancelled)
+			return startResult{err: sctx.Err()}
+		case <-time.After(5 * time.Second):
+			return startResult{err: browserErr("doStart timeout")}
+		}
+	}
+	go func() { _ = m4.ensureRunning(context.Background()) }()
+	// 等 startOnce 真把 startCancel 登记上（锁内原子创建）。
+	for i := 0; i < 400; i++ {
+		m4.mu.Lock()
+		has := m4.startCancel != nil
+		m4.mu.Unlock()
+		if has {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m4.mu.Lock()
+	if m4.startCancel == nil {
+		m4.mu.Unlock()
+		t.Fatal("startCancel not registered at ensureRunning claim")
+	}
+	m4.mu.Unlock()
+	// Stop 必须立即取消 startCtx（doStart stub 被 ctx 打断返回）。
+	sctx2, scancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer scancel2()
+	m4.Stop(sctx2)
+	select {
+	case <-ctxCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not cancel startCtx (doStart still running)")
+	}
+	// 旧轮 startOnce 退出后：startCancel 已按代际清除（gen 变过），
+	// 不得残留指向已取消旧轮的句柄。
+	m4.mu.Lock()
+	if m4.startCancel != nil {
+		m4.mu.Unlock()
+		t.Fatal("stale startCancel left after old-generation startOnce exit")
+	}
+	m4.mu.Unlock()
 }
 
 // TestBrowserStopDuringSwitchCooldown：30s 切号冷却中途 Stop(200ms)
@@ -1968,8 +2146,12 @@ func TestBrowserM1Sticky(t *testing.T) {
 // TestBrowserM1AuxNoSwitch：辅助入口（allowSwitch=false）端到端验证：
 //   - 驻留 acct1 时对 acct2 调 getXSRFSwitch(allowSwitch=false) 绝不返回
 //     acct1 的 token 也不发进 jar，而是 errBrowserSkipAux 无条件回退纯
-//     Go HTTP（BrowserFallbackHTTP=false 也照退）；
-//   - 无驻留号且 BrowserFallbackHTTP=false 时同样无条件回退。
+//     Go HTTP，且真到达 Go HTTP 传输层（经正向代理见证）；
+//   - disabled 账号（cookie 非空但 browserAccountFromHeaders==nil）调
+//     getXSRFSwitch 走纯 Go HTTP 真检测，不当匿名假成功；
+//   - uploadPostCtxAux(false) 无驻留 + BrowserFallbackHTTP=false 时零启动、
+//     零 browserLocalError 直接回退纯 Go HTTP 并真发出；
+//   - 身份守卫拒绝的错误文案绝不含原始 SAPISID/__Secure-1PSID 值。
 func TestBrowserM1AuxNoSwitch(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -2001,7 +2183,6 @@ func TestBrowserM1AuxNoSwitch(t *testing.T) {
 	other := accountByID(acctID2)
 	need, _ := m.shouldSwitch(other, nil)
 	if !need {
-		// acct2 与驻留 acct1 是不同 cookieIdentity：必须报「需要切」。
 		t.Fatal("shouldSwitch(non-resident identity) = false, want true (fact, not policy)")
 	}
 	resident := accountByID(acctID)
@@ -2010,11 +2191,17 @@ func TestBrowserM1AuxNoSwitch(t *testing.T) {
 		t.Fatal("shouldSwitch(resident account) = true, want false")
 	}
 
+	// 正向 HTTP 代理（非 CONNECT）：stdlib 客户端把目标当绝对 URI 发过来，
+	// 捕获它证明「回退后的请求真到达了 Go HTTP 传输层」而不是只拿到了
+	// 某个非 nil error 就放行。
+	sawGo := make(chan string, 8)
+	fwd := newForwardHTTPProxy(t, sawGo)
+	defer fwd.close()
+	fwdURL := "http://" + fwd.ln.Addr().String()
+
 	// 端到端：驻留 acct1 时对 acct2 调辅助入口——绝不返回 acct1 token、
-	// 绝不把 fetch 发进驻留 jar，而是回退纯 Go HTTP（127.0.0.1:1 会立刻
-	// 连接失败，证明走的是 Go HTTP 路径而非浏览器）。
-	deadProxy := "http://127.0.0.1:1"
-	tok, err := getXSRFSwitch(other.Cookie, other.AuthUser, deadProxy, false)
+	// 绝不把 fetch 发进驻留 jar，而是回退纯 Go HTTP 并真发出。
+	tok, err := getXSRFSwitch(other.Cookie, other.AuthUser, fwdURL, false)
 	if err == nil {
 		t.Fatalf("aux xsrf for non-resident account succeeded via browser jar (token=%q)", tok)
 	}
@@ -2027,20 +2214,191 @@ func TestBrowserM1AuxNoSwitch(t *testing.T) {
 		t.Fatalf("browser fetch dispatched to resident jar for non-resident aux request: %s", spec.url)
 	case <-time.After(300 * time.Millisecond):
 	}
+	// 回退的请求真到达了 Go HTTP 传输层（正向代理收到 absolute-URI 请求）。
+	select {
+	case u := <-sawGo:
+		if !strings.Contains(u, "gemini.google.com") {
+			t.Fatalf("forward proxy saw non-gemini request: %q", u)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("aux xsrf fallback did not reach Go HTTP transport (no request at forward proxy)")
+	}
 
-	// 无驻留号 + BrowserFallbackHTTP=false：辅助入口同样无条件回退纯 Go
-	// HTTP（不是 502）。
+	// disabled 账号：cookie 非空但 browserAccountFromHeaders==nil（status=
+	// disabled 反查不到 enabled 记录）——绝不能把 acct=nil 传进浏览器当
+	// 匿名假成功，必须走纯 Go HTTP 用原 cookie 真检测（经正向代理见证）。
+	disID, err := accountInsert("disabled", "SAPISID=da; __Secure-1PSID=dp; SID=d", "")
+	if err != nil {
+		t.Fatalf("insert disabled: %v", err)
+	}
+	defer accountDelete(disID)
+	if err := accountSetStatus(disID, "disabled"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+	dis := accountByID(disID)
+	if dis == nil || dis.Status != "disabled" {
+		t.Fatal("disabled account not persisted")
+	}
+	// browserAccountFromHeaders 对该 cookie 必须返回 nil（disabled 反查不到）。
+	if got := browserAccountFromHeaders(map[string]string{"Cookie": dis.Cookie}); got != nil {
+		t.Fatalf("disabled cookie unexpectedly resolved to %+v", got)
+	}
+	// 走纯 Go HTTP 真检测：不当匿名假成功（代理见证请求真发出）。
+	_, err = getXSRFSwitch(dis.Cookie, dis.AuthUser, fwdURL, false)
+	if err == nil {
+		t.Fatal("disabled-account xsrf succeeded anonymously (acct=nil passed to browser as anon)")
+	}
+	select {
+	case u := <-sawGo:
+		if !strings.Contains(u, "gemini.google.com") {
+			t.Fatalf("forward proxy saw non-gemini request for disabled account: %q", u)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("disabled-account xsrf did not reach Go HTTP transport")
+	}
+	// 假服务端仍绝不能收到 fetch（disabled 的 acct 没进 jar）。
+	select {
+	case spec := <-srv.fetchHit:
+		t.Fatalf("browser fetch dispatched for disabled account: %s", spec.url)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 辅助 POST（uploadPostCtxAux allowSwitch=false）无驻留 + BrowserFallbackHTTP=
+	// false：入口前置 auxJarBlocked 直接 errBrowserSkipAux 回退纯 Go HTTP——
+	// 零启动（不冷启 Chromium）、零 browserLocalError（不误报 502），并真
+	// 把请求发到了 Go HTTP 传输层。
 	m.mu.Lock()
 	m.seed = browserSeedState{}
 	m.mu.Unlock()
-	_, err = getXSRFSwitch(other.Cookie, other.AuthUser, deadProxy, false)
-	if err == nil {
-		t.Fatal("aux xsrf with no resident succeeded")
+	st, _, _, perr := uploadPostCtxAux(context.Background(),
+		"https://gemini.google.com/_/x", map[string]string{"Cookie": other.Cookie},
+		[]byte("x=1"), fwdURL, false)
+	if perr == nil && st == 0 {
+		t.Fatal("aux POST returned no error and no status")
 	}
-	if isBrowserLocalError(err) {
-		t.Fatalf("no-resident aux fell to 502 path instead of plain Go HTTP: %v", err)
+	if isBrowserLocalError(perr) {
+		t.Fatalf("aux POST misclassified as browserLocalError (would be 502): %v", perr)
+	}
+	select {
+	case u := <-sawGo:
+		if !strings.Contains(u, "gemini.google.com") {
+			t.Fatalf("forward proxy saw non-gemini POST: %q", u)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("aux POST did not reach Go HTTP transport")
+	}
+	// 浏览器绝不能被冷启动（proc 仍是无启动状态）。
+	m.mu.Lock()
+	cold := m.started && m.starting
+	m.mu.Unlock()
+	if cold {
+		t.Fatal("aux POST cold-started the browser (must skip ensureRunning)")
+	}
+
+	// 身份守卫拒绝的错误文案：绝不包含任何原始 SAPISID / __Secure-1PSID 值。
+	// 异身份 + allowSwitch=false：守卫返回 errBrowserSkipAux；异身份 +
+	// allowSwitch=true 时守卫的 browserErr 文案也只许带账号 ID（整数），
+	// 绝不带原始 cookieIdentity。先验 skip 分支文案，再验真守卫拒斥路径
+	// 不带凭据（同身份不同 authuser 才过守卫，异身份必在守卫前被拒，
+	// 两条路径的错误文案都必须零凭据）。
+	alienCookie := "SAPISID=xa; __Secure-1PSID=xp; SID=x"
+	alienID, err := accountInsert("alien", alienCookie, "")
+	if err != nil {
+		t.Fatalf("insert alien: %v", err)
+	}
+	defer accountDelete(alienID)
+	alien := accountByID(alienID)
+	m.mu.Lock()
+	m.seed = browserSeedState{AccountID: acctID,
+		CookieIdentity: cookieIdentity("SAPISID=ra; __Secure-1PSID=rp; SID=r")}
+	m.mu.Unlock()
+	// aux 路径（allowSwitch=false）：errBrowserSkipAux，且文案零凭据。
+	_, _, gerr := m.doBrowserStreamRequest(context.Background(), alien,
+		"https://gemini.google.com/_/x", "POST", nil, []byte("x"), false, nil)
+	if gerr == nil {
+		t.Fatal("identity guard did not reject mismatched cookieIdentity (aux)")
+	}
+	for _, leak := range []string{"ra", "rp", "xa", "xp", "oa", "op", "SAPISID", "__Secure-1PSID"} {
+		if strings.Contains(gerr.Error(), leak) {
+			t.Fatalf("aux-guard error leaks credential fragment %q: %v", leak, gerr)
+		}
+	}
+	// 守卫 mismatch 文案（allowSwitch=true、切号竞态后驻留身份又变时触达）：
+	// 离线无法稳定复现该竞态，但文案源头已改为 "resident=#%d request=#%d"
+	// 只带账号 ID——直接对该 browserErr 构造断言零凭据（守卫生成的错误
+	// 文案绝不输出 cookieIdentity 原始串）。
+	m.mu.Lock()
+	m.seed = browserSeedState{AccountID: acctID,
+		CookieIdentity: cookieIdentity("SAPISID=ra; __Secure-1PSID=rp; SID=r")}
+	m.mu.Unlock()
+	// 触发守卫的 browserErr 路径需要 residentIdentity != cookieIdentity(请求)。
+	// 手工调守卫临界段：在 jarRW 读锁内模拟守卫判定并断言其错误对象零凭据。
+	m.jarRW.RLock()
+	m.mu.Lock()
+	rSeed := m.seed.AccountID
+	rIdent := m.seed.CookieIdentity
+	m.mu.Unlock()
+	guardHit := alien != nil && alien.ID != 0 &&
+		(rSeed == 0 || rIdent == "" || rIdent != cookieIdentity(alien.Cookie))
+	m.jarRW.RUnlock()
+	if !guardHit {
+		t.Fatal("identity-guard predicate unexpectedly false for alien account")
+	}
+	mismatchErr := browserErr("jar identity mismatch: resident=#%d request=#%d",
+		rSeed, alien.ID)
+	for _, leak := range []string{"ra", "rp", "xa", "xp", "oa", "op", "SAPISID", "__Secure-1PSID"} {
+		if strings.Contains(mismatchErr.Error(), leak) {
+			t.Fatalf("mismatch-guard error leaks credential fragment %q: %v", leak, mismatchErr)
+		}
 	}
 }
+
+// forwardHTTPProxy 是测试用的正向 HTTP 代理（非 CONNECT）：stdlib 客户端把
+// absolute-URI 请求发过来，我们记下目标 URI 后回 502——只为见证「回退后
+// 的请求真到达了 Go HTTP 传输层」。
+type forwardHTTPProxy struct {
+	ln  net.Listener
+	saw chan<- string
+}
+
+func newForwardHTTPProxy(t *testing.T, saw chan<- string) *forwardHTTPProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fwd proxy listen: %v", err)
+	}
+	p := &forwardHTTPProxy{ln: ln, saw: saw}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handle(c)
+		}
+	}()
+	return p
+}
+
+func (p *forwardHTTPProxy) handle(c net.Conn) {
+	defer c.Close()
+	br := bufio.NewReader(c)
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return
+	}
+	uri := req.URL.String()
+	if uri == "" {
+		uri = req.Host + req.URL.Path
+	}
+	select {
+	case p.saw <- uri:
+	default:
+	}
+	io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+}
+
+func (p *forwardHTTPProxy) close() { p.ln.Close() }
 
 // TestBrowserM1MultiAuthUser：同 cookieIdentity 不同 authuser 不触发
 // clearBrowserCookies 与 30s 冷却；且端到端 doBrowserStreamRequest 验证

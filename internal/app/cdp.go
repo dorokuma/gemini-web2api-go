@@ -151,7 +151,7 @@ func (c *cdpClient) Call(ctx context.Context, sessionID, method string, params i
 	c.pending[id] = ch
 	c.pendMu.Unlock()
 
-	if err := c.conn.sendText(payload); err != nil {
+	if err := c.conn.sendTextCtx(ctx, payload); err != nil {
 		c.pendMu.Lock()
 		delete(c.pending, id)
 		c.pendMu.Unlock()

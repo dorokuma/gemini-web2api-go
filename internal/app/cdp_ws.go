@@ -37,14 +37,18 @@ const maxCDPFrameBytes = 32 << 20
 // cdpConn 是一条已握手的回环 WebSocket 连接。
 //
 // 读侧单 goroutine（readFrame 不加锁，只有读循环在调）；写侧任何 goroutine 可来，
-// 统一过 writeMu 抢锁写整帧，帧之间不会交错。写是有界动作：sendText/sendClose
-// 都设写 deadline，对端不收（渲染器卡死、TCP 窗口关死）时一次 Write 不能把
-// 调用方或关闭路径挂住。Close 先给短 deadline 发 Close 帧再立刻 conn.Close，
-// 强制唤醒所有阻塞读写与 pending 调用方。
+// 统一过 writeSem（容量 1 信号量）抢写权写整帧，帧之间不会交错。用 chan 信号量
+// 不用 sync.Mutex：sendTextCtx 的抢写权必须能响应 ctx.Done()——停机时
+// syncCookiesBackForce(800ms) / Browser.close(100ms) 的 Call 若排在阻塞写后面，
+// Mutex 拿不到锁只能干等 5s 写超时，直接拖穿停机预算。
+// 写是有界动作：sendText/sendClose 都设写 deadline（取 min(5s, ctx 剩余)），
+// 对端不收（渲染器卡死、TCP 窗口关死）时一次 Write 不能把调用方或关闭路径挂住。
+// Close 先给短 deadline 发 Close 帧再立刻 conn.Close，强制唤醒所有阻塞读写与
+// pending 调用方。
 type cdpConn struct {
-	conn    net.Conn
-	br      *bufio.Reader
-	writeMu sync.Mutex
+	conn     net.Conn
+	br       *bufio.Reader
+	writeSem chan struct{}
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -90,6 +94,17 @@ func dialCDPWebsocket(ctx context.Context, wsURL string) (*cdpConn, error) {
 		return nil, err
 	}
 
+	// 握手期间 ctx 取消必须毫秒级打断握手 I/O：AfterFunc 一取消就关 conn，
+	// 正在阻塞的握手读/写立刻返回；同时把握手 deadline 收紧到
+	// min(10s, ctx 剩余)——startCtx 被 Stop 取消时绝不死等 10s。
+	// 握手成功后 stop() 解除盯梢（不真关 conn）。
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	handshakeDeadline := time.Now().Add(10 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(handshakeDeadline) {
+		handshakeDeadline = dl
+	}
+
 	// Sec-WebSocket-Key：16 字节随机数 base64。服务端回执必须等于
 	// base64(sha1(key + GUID))，GUID 是 RFC 6455 钉死的常量，算出来的 accept 是
 	// 定值——但 Chromium 不在乎，标准客户端也不该复用固定 key（缓存代理语义）。
@@ -113,7 +128,7 @@ func dialCDPWebsocket(ctx context.Context, wsURL string) (*cdpConn, error) {
 		"Sec-WebSocket-Key: " + key + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"\r\n"
-	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := conn.SetWriteDeadline(handshakeDeadline); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -125,7 +140,7 @@ func dialCDPWebsocket(ctx context.Context, wsURL string) (*cdpConn, error) {
 
 	// 读响应头。DevTools 回 "HTTP/1.1 101 ..."，之后跟若干行头、空行结束。
 	// 用 bufio 读并把 reader 留给后续帧解析——握手后可能紧跟的第一帧就在缓冲里。
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(handshakeDeadline)
 	br := bufio.NewReader(conn)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
@@ -158,7 +173,11 @@ func dialCDPWebsocket(ctx context.Context, wsURL string) (*cdpConn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("cdp ws handshake: bad Sec-WebSocket-Accept %q", gotAccept)
 	}
-	return &cdpConn{conn: conn, br: br, closed: make(chan struct{})}, nil
+	// 握手完成：解除 ctx→conn.Close 盯梢（defer stop() 也会调，幂等）。
+	stop()
+	c := &cdpConn{conn: conn, br: br, closed: make(chan struct{})}
+	c.writeSem = make(chan struct{}, 1)
+	return c, nil
 }
 
 // isLoopbackHost 收紧拨号目标：只放 IPv4/IPv6 回环与 localhost。
@@ -189,30 +208,48 @@ const (
 	wsOpPong         = 0xA
 )
 
-// sendText 发一条客户端→服务端的 Text 帧。客户端帧必须 Masked（RFC 6455 §5.3），
-// 服务端对 unmasked 客户端帧有权直接关连接，Chromium 就是这么做的。
-// 有界写：cdpWriteTimeout 内写不完就报错，不阻塞调用方。
+// sendText 发一条客户端→服务端的 Text 帧（不响应调用方 ctx）。
+// 保留给无 ctx 语义的旧路径；业务路径一律走 sendTextCtx。
 func (c *cdpConn) sendText(payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	return c.sendTextCtx(context.Background(), payload)
+}
+
+// sendTextCtx 同 sendText，但抢写权与写 deadline 都绑调用方 ctx：
+//   - 写权经容量 1 的 writeSem 获取，select 监听 ctx.Done()/closed——停机时
+//     排在阻塞写后面的 Call 不等 5s 写锁，ctx 一到立刻返回 ctx.Err()；
+//   - 写 deadline 取 min(now+cdpWriteTimeout, ctx.Deadline)：ctx 剩余的
+//     预算比 5s 短时按 ctx 算，绝不拿整条固定 5s 把停机预算拖穿。
+func (c *cdpConn) sendTextCtx(ctx context.Context, payload []byte) error {
+	select {
+	case c.writeSem <- struct{}{}:
+		defer func() { <-c.writeSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return errors.New("cdp ws: connection closed")
+	}
 	select {
 	case <-c.closed:
 		return errors.New("cdp ws: connection closed")
 	default:
 	}
-	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
+	wd := time.Now().Add(cdpWriteTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(wd) {
+		wd = dl
+	}
+	_ = c.conn.SetWriteDeadline(wd)
 	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.writeFrame(wsOpText, payload)
 }
 
 // sendPong 回一条 Pong。服务端 Ping 的载荷要原样带回。
+// 内部控制帧（读循环路径）：用 writeSem 非 ctx 语义，但同样经信号量拿权。
 func (c *cdpConn) sendPong(payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	select {
+	case c.writeSem <- struct{}{}:
+		defer func() { <-c.writeSem }()
 	case <-c.closed:
 		return errors.New("cdp ws: connection closed")
-	default:
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
 	defer c.conn.SetWriteDeadline(time.Time{})
@@ -221,9 +258,17 @@ func (c *cdpConn) sendPong(payload []byte) error {
 
 // sendClose 发 Close 帧做礼貌关闭；短 deadline，发不出就算了——
 // 调用方随即 conn.Close，礼貌帧的价值只是让对端干净收尾。
+// 拿不到写权（阻塞写持权中）直接放弃：conn.Close 随即强制唤醒它，
+// 不能让礼貌帧排在阻塞写后面拖住关闭路径。
 func (c *cdpConn) sendClose() {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	select {
+	case c.writeSem <- struct{}{}:
+		defer func() { <-c.writeSem }()
+	case <-c.closed:
+		return
+	case <-time.After(cdpCloseTimeout):
+		return
+	}
 	select {
 	case <-c.closed:
 		return
