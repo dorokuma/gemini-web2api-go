@@ -474,33 +474,33 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 //   - 无在飞流：直接原子切换桥到 url（同 URL 时 SetUpstream 是零成本 no-op），
 //     成为该出口的第一条在飞流；
 //   - 有在飞流且同出口、且无跨出口等待者：计数+1 自由并发；
-//   - 有在飞流但出口不同（或同出口但有切换方在等）：登记
-//     bridgeSwitchWaiters 等旧出口在飞归零，或 ctx.Done() 放弃返回
-//     ctx.Err()——绝不半路切出口切断别人的在飞隧道。
+//   - 有在飞流但出口不同：登记 bridgeSwitchWaiters 等旧出口在飞归零，
+//     或 ctx.Done() 放弃返回 ctx.Err()；有在飞流且同出口但有跨出口
+//     切换方在等：只暂缓等待、绝不登记计数——绝不半路切出口切断别人
+//     的在飞隧道。
 //
-// 等待登记用计数器不用布尔：跨出口等待者可能不止一条，其中一条被
-// ctx 取消必须只撤销自己的登记（registered 局部标记防重复扣减）；
-// 最后一名等待者离开时关闭并重建广播 channel，唤醒被暂缓的同出口
-// 请求——否则一名跨出口等待者的取消会把健康同出口请求永久挡死。
+// 锁纪律：bridgeMu 只在「检查状态→决策」的临界段持有，等待前显式
+// Unlock，每条返回路径要么先 Unlock 要么本就不持锁——不存在持锁
+// return 再经 defer 重入加锁的死锁结构。
+//
+// 等待登记用计数器不用布尔：bridgeSwitchWaiters 只登记真正的跨出口
+// 等待者（activeURL != url 或登记时无在飞），被暂缓的同出口请求不占
+// 名额。等待方被 ctx 取消只撤销自己的登记（registered 局部标记防
+// 重复扣减）；唤醒重查时发现 activeURL 已变成 url（曾登记的跨出口
+// 请求实际已同出口）也先撤销登记再走自由并发。最后一名登记等待者
+// 离开时关闭并重建广播 channel，唤醒被暂缓的同出口请求——否则一名
+// 跨出口等待者的取消会把健康同出口请求永久挡死。
 func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) error {
-	m.bridgeMu.Lock()
-	registered := false
-	defer func() {
-		m.bridgeMu.Lock()
-		if registered {
-			m.bridgeSwitchWaiters--
-		}
-		// 最后一名跨出口等待者离开：广播唤醒被暂缓的同出口请求
-		// 重新竞争；仍有其他等待者时不动 bridgeWait，他们继续在
-		// 同一个 channel 上等。
-		if m.bridgeSwitchWaiters == 0 && m.bridgeWait != nil {
-			close(m.bridgeWait)
-			m.bridgeWait = nil
-		}
-		m.bridgeMu.Unlock()
-	}()
+	registered := false // 本请求当前持有 bridgeSwitchWaiters 登记名额
 	for {
+		m.bridgeMu.Lock()
 		if err := ctx.Err(); err != nil {
+			// 入参已取消或等待中/唤醒后到期：持锁撤销登记后显式解锁
+			// 返回——不存在持锁 return 再经 defer 重入加锁的路径。
+			if registered {
+				m.bridgeWaiterLeaveLocked()
+			}
+			m.bridgeMu.Unlock()
 			return err
 		}
 		if m.bridgeInFlight == 0 {
@@ -510,13 +510,22 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		if m.bridgeSwitchWaiters == 0 && m.bridgeActiveURL == url {
+		if m.bridgeActiveURL == url && m.bridgeSwitchWaiters == 0 {
+			// 同出口且无跨出口切换方在等：自由并发。registered 必为
+			// false——唤醒重查命中本分支前已按下方退化路径撤销登记。
 			m.bridgeInFlight++
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		// 出口不同（或同出口但有切换方在等）：登记排队等旧出口在飞归零。
-		if !registered {
+		if m.bridgeActiveURL == url && registered {
+			// 退化：登记时跨出口，唤醒重查时在飞出口已变成 url——撤销
+			// 登记名额后应走自由并发；本轮先按暂缓处理，下轮重查即放行。
+			m.bridgeWaiterLeaveLocked()
+			registered = false
+		}
+		if m.bridgeActiveURL != url && !registered {
+			// 仅真正的跨出口等待者登记计数；被暂缓的同出口请求只占
+			// bridgeWait 等待名额，绝不占 bridgeSwitchWaiters 计数。
 			m.bridgeSwitchWaiters++
 			registered = true
 		}
@@ -527,10 +536,29 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 		m.bridgeMu.Unlock()
 		select {
 		case <-w:
-			m.bridgeMu.Lock()
+			// 广播唤醒，下轮持锁重查最新状态。
 		case <-ctx.Done():
-			return ctx.Err()
+			// 离开前持锁撤销登记：最后一名登记等待者走时同步广播
+			// 唤醒被暂缓的同出口请求。
+			m.bridgeMu.Lock()
+			if registered {
+				m.bridgeWaiterLeaveLocked()
+			}
+			err := ctx.Err()
+			m.bridgeMu.Unlock()
+			return err
 		}
+	}
+}
+
+// bridgeWaiterLeaveLocked 撤销本请求的一份 bridgeSwitchWaiters 登记；
+// 计数归零时关闭并重建广播 channel 唤醒被暂缓的同出口请求。调用方
+// 必须持有 m.bridgeMu。
+func (m *browserManager) bridgeWaiterLeaveLocked() {
+	m.bridgeSwitchWaiters--
+	if m.bridgeSwitchWaiters == 0 && m.bridgeWait != nil {
+		close(m.bridgeWait)
+		m.bridgeWait = nil
 	}
 }
 

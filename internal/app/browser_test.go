@@ -2961,6 +2961,135 @@ func TestBrowserBridgeSwitchCancelRestoresSameExit(t *testing.T) {
 	m.releaseBridgeExit()
 }
 
+// TestBrowserBridgeAcquireCancelledCtxNoDeadlock：acquireBridgeExit 以已
+// 取消 ctx 调用必须立刻返回 context.Canceled（<100ms）——绝不因持锁
+// return 后 defer 重入 bridgeMu 而同协程自死锁。空闲态与占用态各验
+// 一次：占用态用后台协程包裹断言「不阻塞」，否则死锁会挂住测试进程。
+func TestBrowserBridgeAcquireCancelledCtxNoDeadlock(t *testing.T) {
+	newMgr := func() *browserManager {
+		return &browserManager{
+			readyCh:   make(chan struct{}),
+			streams:   map[string]*browserStream{},
+			switchSem: make(chan struct{}, 1),
+			stopCh:    make(chan struct{}),
+		}
+	}
+
+	// 空闲态：无在飞流，已取消 ctx 仍必须立即返回 Canceled。
+	m := newMgr()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	t0 := time.Now()
+	if err := m.acquireBridgeExit(ctx, "http://proxy-b:8080"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("idle cancelled acquire err = %v, want context.Canceled", err)
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("idle cancelled acquire took %v, want <100ms", dt)
+	}
+
+	// 占用态：请求 A 持有出口 B，已取消 ctx 的跨出口请求 D 必须立刻
+	// 返回而不是重入 bridgeMu 死锁。
+	m = newMgr()
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+		t.Fatalf("acquire exit B: %v", err)
+	}
+	defer m.releaseBridgeExit()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	dDone := make(chan error, 1)
+	t0 = time.Now()
+	go func() { dDone <- m.acquireBridgeExit(ctx2, "http://proxy-c:8080") }()
+	select {
+	case err := <-dDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("busy cancelled acquire err = %v, want context.Canceled", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("busy cancelled acquire blocked >100ms (bridgeMu re-entry deadlock)")
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("busy cancelled acquire took %v, want <100ms", dt)
+	}
+}
+
+// TestBrowserBridgeSameExitStalledDuringSwitchUnblocked：跨出口等待者 D
+// 排队期间，同出口请求 E 被暂缓但绝不登记 bridgeSwitchWaiters；D 被
+// ctx 取消后计数必须归零并广播，E 立刻并发获取出口 B（无需等 A 释
+// 放）——不被已离开的等待者挡死。
+func TestBrowserBridgeSameExitStalledDuringSwitchUnblocked(t *testing.T) {
+	m := &browserManager{
+		readyCh:   make(chan struct{}),
+		streams:   map[string]*browserStream{},
+		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	// 请求 A 持有出口 B。
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+		t.Fatalf("acquire exit B: %v", err)
+	}
+	defer m.releaseBridgeExit()
+
+	// 请求 D 排队切到出口 C（ctx 可手动取消），确认其进入等待。
+	dCtx, dCancel := context.WithCancel(context.Background())
+	defer dCancel()
+	dDone := make(chan error, 1)
+	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080") }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.bridgeMu.Lock()
+		waiters := m.bridgeSwitchWaiters
+		m.bridgeMu.Unlock()
+		if waiters == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cross-exit waiter D not registered, bridgeSwitchWaiters = %d", waiters)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 同出口请求 E 申请出口 B：D 在等时 E 必须被暂缓（不立刻返回），
+	// 且不占 bridgeSwitchWaiters 名额。
+	eDone := make(chan error, 1)
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080") }()
+	select {
+	case err := <-eDone:
+		t.Fatalf("same-exit E returned early with %v while cross-exit waiter pending (should be stalled)", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	m.bridgeMu.Lock()
+	waiters := m.bridgeSwitchWaiters
+	m.bridgeMu.Unlock()
+	if waiters != 1 {
+		t.Fatalf("stalled same-exit E registered as switch waiter, bridgeSwitchWaiters = %d, want 1", waiters)
+	}
+
+	// 取消 D 的 ctx：D 撤销最后一份登记，广播唤醒 E；E 必须在 <100ms
+	// 内拿到出口 B（在 A 未释放时即可并发），D 返回 Canceled。
+	t0 := time.Now()
+	dCancel()
+	select {
+	case err := <-eDone:
+		if err != nil {
+			t.Fatalf("same-exit acquire E failed: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("same-exit acquire E blocked after cancelled cross-exit waiter left (bridgeSwitchWaiters leak)")
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("same-exit acquire E took %v, want <100ms", dt)
+	}
+	select {
+	case err := <-dDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cross-exit waiter D err = %v, want context.Canceled", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("cancelled cross-exit waiter D did not return within 100ms")
+	}
+	m.releaseBridgeExit()
+}
+
 // TestCDPSendTextCtxCancelDuringBlockedWrite：持写权阻塞写（对端不读的
 // net.Pipe）期间取消无 deadline 的 ctx，必须毫秒级返回 ctx.Err() 且
 // c.closed 终态关闭——绝不干等 5s 写超时，残帧连接也绝不复用。
