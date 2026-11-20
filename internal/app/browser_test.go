@@ -3215,4 +3215,80 @@ func TestCDPSendTextCtxCancelDuringBlockedWrite(t *testing.T) {
 	}
 }
 
+// failAfterFirstWriteConn 最小桩 net.Conn：第 1 次 Write（帧头）放行，
+// 第 2 次 Write（payload）返回 0 + ErrDeadlineExceeded，模拟「帧已写一半
+// 超时」的残帧场景；之后计数，便于断言连接关闭后不再进底层 Write。
+type failAfterFirstWriteConn struct {
+	net.Conn
+	writes atomic.Int32
+}
+
+func (c *failAfterFirstWriteConn) Write(p []byte) (int, error) {
+	if c.writes.Add(1) >= 2 {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return len(p), nil
+}
+
+func (c *failAfterFirstWriteConn) Close() error                     { return nil }
+func (c *failAfterFirstWriteConn) SetDeadline(time.Time) error      { return nil }
+func (c *failAfterFirstWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *failAfterFirstWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestCDPSendWriteErrClosesConn：R6 回归——sendTextCtx / sendPong 在非 ctx
+// 取消路径写帧失败（5s 写超时先于 AfterFunc 触发）时必须终态断连，
+// 绝不让残帧连接被下一条消息复用。
+func TestCDPSendWriteErrClosesConn(t *testing.T) {
+	newConn := func() (*cdpConn, *failAfterFirstWriteConn) {
+		stub := &failAfterFirstWriteConn{}
+		return &cdpConn{
+			conn:     stub,
+			br:       bufio.NewReader(stub),
+			writeSem: make(chan struct{}, 1),
+			closed:   make(chan struct{}),
+		}, stub
+	}
+
+	// sendTextCtx：写帧失败后返回错误 + closed 终态置位；再调直接报
+	// connection closed，不再进底层 Write（writes 停在 2）。
+	c, stub := newConn()
+	if err := c.sendTextCtx(context.Background(), []byte("payload")); err == nil {
+		t.Fatal("sendTextCtx returned nil on write failure, want error")
+	}
+	select {
+	case <-c.closed:
+	default:
+		t.Fatal("cdpConn not terminally closed after sendTextCtx write failure (residual frame conn would be reused)")
+	}
+	if err := c.sendTextCtx(context.Background(), []byte("x")); err == nil {
+		t.Fatal("sendTextCtx on closed conn returned nil, want connection closed error")
+	}
+	if got := stub.writes.Load(); got != 2 {
+		t.Fatalf("conn.Write called %d times after close, want 2 (closed conn must not reach Write)", got)
+	}
+
+	// sendPong：同样语义——写帧失败终态断连。
+	c2, _ := newConn()
+	if err := c2.sendPong([]byte("pong")); err == nil {
+		t.Fatal("sendPong returned nil on write failure, want error")
+	}
+	select {
+	case <-c2.closed:
+	default:
+		t.Fatal("cdpConn not terminally closed after sendPong write failure")
+	}
+}
+
+// TestBrowserProxyCheckTargetRejectsUnspecified：R6 回归——CONNECT 目标
+// 为未指定地址（0.0.0.0 / [::] / [::ffff:0.0.0.0]）时 checkTarget 必须
+// 拒绝：这些地址实际拨到本机端口，和回环一样是 SSRF。
+func TestBrowserProxyCheckTargetRejectsUnspecified(t *testing.T) {
+	b := &browserProxyBridge{port: 19000} // allowLoopback=false（生产默认）
+	for _, target := range []string{"0.0.0.0:8000", "[::]:8000", "[::ffff:0.0.0.0]:8000"} {
+		if err := b.checkTarget(target); err == nil {
+			t.Fatalf("checkTarget(%q) returned nil, want refused (unspecified addr reaches local ports = SSRF)", target)
+		}
+	}
+}
+
 var _ = syscall.Kill

@@ -222,7 +222,10 @@ func (c *cdpConn) sendText(payload []byte) error {
 //   - 持写权写入期间 ctx 取消：AfterFunc 立刻 c.Close() 终态断连——写入
 //     中途被取消可能留下半帧/残帧，按 RFC 6455 该 WS 绝不能复用；同时
 //     阻塞的 conn.Write 被底层断连毫秒级唤醒，不带 deadline 的 ctx 也
-//     不等 5s 写超时。
+//     不等 5s 写超时；
+//   - 非 ctx 取消的写帧失败（5s 写超时在 AfterFunc 触发前先行返回、TCP
+//     半断开等）同样可能留下半帧：终态断连且不复位 write deadline，
+//     绝不把残帧连接还给下一条消息。
 func (c *cdpConn) sendTextCtx(ctx context.Context, payload []byte) error {
 	select {
 	case c.writeSem <- struct{}{}:
@@ -258,13 +261,22 @@ func (c *cdpConn) sendTextCtx(ctx context.Context, payload []byte) error {
 		}
 		return err
 	}
-	// 回调已确认停掉：不会迟到污染下一次写。
+	if err != nil {
+		// 非 ctx 取消路径的写失败（写 deadline 略早于 AfterFunc 触发、
+		// 对端半断开等）：同样可能已写出半帧，终态断连；deadline 刻意
+		// 不复位——conn 已关，复位毫无意义还白送一次系统调用。
+		_ = c.Close()
+		return err
+	}
+	// 回调已确认停掉且整帧写成功：复位 deadline，连接可安全复用。
 	_ = c.conn.SetWriteDeadline(time.Time{})
-	return err
+	return nil
 }
 
 // sendPong 回一条 Pong。服务端 Ping 的载荷要原样带回。
 // 内部控制帧（读循环路径）：用 writeSem 非 ctx 语义，但同样经信号量拿权。
+// 写帧失败（超时/半断开）可能留下半帧：终态断连且不复位 deadline，
+// 残帧连接绝不复用——Pong 失败对上层等价于断线，由读错误走重连。
 func (c *cdpConn) sendPong(payload []byte) error {
 	select {
 	case c.writeSem <- struct{}{}:
@@ -273,8 +285,12 @@ func (c *cdpConn) sendPong(payload []byte) error {
 		return errors.New("cdp ws: connection closed")
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
-	defer c.conn.SetWriteDeadline(time.Time{})
-	return c.writeFrame(wsOpPong, payload)
+	if err := c.writeFrame(wsOpPong, payload); err != nil {
+		_ = c.Close()
+		return err
+	}
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return nil
 }
 
 // sendClose 发 Close 帧做礼貌关闭；短 deadline，发不出就算了——

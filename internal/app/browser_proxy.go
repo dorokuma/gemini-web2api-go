@@ -150,8 +150,11 @@ func (b *browserProxyBridge) handleConnect(w http.ResponseWriter, r *http.Reques
 // checkTarget 严格校验 CONNECT 目标：
 //   - net.SplitHostPort 必须解析出非空 host 与合法端口（0-65535）；
 //   - host 不得含空白/控制字符/CR-LF（注入防御）；
-//   - 回环地址（127.0.0.0/8、::1、localhost）与本桥监听端口一律拒绝，
-//     除非测试显式打开 allowLoopback。
+//   - 回环地址（127.0.0.0/8、::1、localhost）、未指定地址（0.0.0.0、::、
+//     ::ffff:0.0.0.0）与本桥监听端口一律拒绝，除非测试显式打开
+//     allowLoopback——CONNECT 0.0.0.0:<port> 会拨到本机该端口，和回环
+//     一样是 SSRF（IsUnspecified/IsLoopback 对 IPv4-mapped 形式经 To4
+//     等价比较，一并覆盖）。
 func (b *browserProxyBridge) checkTarget(target string) error {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
@@ -180,8 +183,8 @@ func (b *browserProxyBridge) checkTarget(target string) error {
 	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
 		return fmt.Errorf("CONNECT target %q is loopback (refused)", target)
 	}
-	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
-		return fmt.Errorf("CONNECT target %q is loopback (refused)", target)
+	if ip := net.ParseIP(h); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return fmt.Errorf("CONNECT target %q is loopback/unspecified (refused)", target)
 	}
 	return nil
 }
