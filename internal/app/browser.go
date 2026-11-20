@@ -504,24 +504,32 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 			return err
 		}
 		if m.bridgeInFlight == 0 {
+			// 跨出口等待者认领在飞归零的出口前必须先撤销自己的登记
+			// 名额——否则 bridgeSwitchWaiters 永久 +1，同出口自由并发
+			// 分支再也进不去。
+			if registered {
+				m.bridgeWaiterLeaveLocked()
+			}
 			syncBridgeUpstream(url)
 			m.bridgeActiveURL = url
 			m.bridgeInFlight = 1
 			m.bridgeMu.Unlock()
 			return nil
 		}
+		if m.bridgeActiveURL == url && registered {
+			// 退化：登记时跨出口，唤醒重查时在飞出口已变成 url——立即
+			// 撤销登记名额；若名额归零，本轮下一轮检查即命中下方同
+			// 出口自由并发分支直接返回，绝不掉入等待（那时 bridgeWait
+			// 已无人会关闭，等下去就是永久挂起）。
+			m.bridgeWaiterLeaveLocked()
+			registered = false
+		}
 		if m.bridgeActiveURL == url && m.bridgeSwitchWaiters == 0 {
 			// 同出口且无跨出口切换方在等：自由并发。registered 必为
-			// false——唤醒重查命中本分支前已按下方退化路径撤销登记。
+			// false——唤醒重查命中本分支前已按上方退化路径撤销登记。
 			m.bridgeInFlight++
 			m.bridgeMu.Unlock()
 			return nil
-		}
-		if m.bridgeActiveURL == url && registered {
-			// 退化：登记时跨出口，唤醒重查时在飞出口已变成 url——撤销
-			// 登记名额后应走自由并发；本轮先按暂缓处理，下轮重查即放行。
-			m.bridgeWaiterLeaveLocked()
-			registered = false
 		}
 		if m.bridgeActiveURL != url && !registered {
 			// 仅真正的跨出口等待者登记计数；被暂缓的同出口请求只占

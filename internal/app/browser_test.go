@@ -3090,6 +3090,86 @@ func TestBrowserBridgeSameExitStalledDuringSwitchUnblocked(t *testing.T) {
 	m.releaseBridgeExit()
 }
 
+// TestBrowserBridgeSwitchCompletionClearsWaitersAndAllowsSameExit：两个
+// 同目标跨出口等待者 D1/D2 被在飞释放广播唤醒后，D1 认领切换出口 C
+// 必须撤销自己登记名额，D2 在退化路径（activeURL 已是 C）撤销最后
+// 一份登记后必须当轮走同出口自由并发——绝不误入新建 bridgeWait 永久
+// 挂起；全部登记归零后新同出口请求 E 立刻自由并发。
+func TestBrowserBridgeSwitchCompletionClearsWaitersAndAllowsSameExit(t *testing.T) {
+	m := &browserManager{
+		readyCh:   make(chan struct{}),
+		streams:   map[string]*browserStream{},
+		switchSem: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	// 请求 A 持有出口 B。
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+		t.Fatalf("acquire exit B: %v", err)
+	}
+	defer m.releaseBridgeExit()
+	// 跨出口等待者 D1、D2 排队切到出口 C，确认两份登记。
+	d1Done := make(chan error, 1)
+	d2Done := make(chan error, 1)
+	go func() { d1Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
+	go func() { d2Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.bridgeMu.Lock()
+		waiters := m.bridgeSwitchWaiters
+		m.bridgeMu.Unlock()
+		if waiters == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cross-exit waiters not registered, bridgeSwitchWaiters = %d, want 2", waiters)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A 释放在飞唤醒 D1/D2：两者都必须在 <100ms 内拿到出口 C
+	//（D1 认领路径撤销登记；D2 退化路径撤销登记后当轮放行，不挂起），
+	// 且登记计数必须归零（无泄漏）。
+	t0 := time.Now()
+	m.releaseBridgeExit()
+	for i, ch := range []chan error{d1Done, d2Done} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("cross-exit waiter D%d failed: %v", i+1, err)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("cross-exit waiter D%d blocked >100ms after in-flight drain (hang on degenerate path)", i+1)
+		}
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("cross-exit waiters took %v, want <100ms", dt)
+	}
+	m.bridgeMu.Lock()
+	waiters := m.bridgeSwitchWaiters
+	m.bridgeMu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("bridgeSwitchWaiters = %d after switch completed, want 0 (count leak)", waiters)
+	}
+	// D1/D2 均未释放时新同出口请求 E 申请出口 C：登记已归零，必须
+	// 立刻自由并发。
+	t0 = time.Now()
+	eDone := make(chan error, 1)
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
+	select {
+	case err := <-eDone:
+		if err != nil {
+			t.Fatalf("same-exit acquire E failed: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("same-exit acquire E blocked >100ms (residual switch-waiter state)")
+	}
+	if dt := time.Since(t0); dt >= 100*time.Millisecond {
+		t.Fatalf("same-exit acquire E took %v, want <100ms", dt)
+	}
+	m.releaseBridgeExit()
+	m.releaseBridgeExit()
+	m.releaseBridgeExit()
+}
+
 // TestCDPSendTextCtxCancelDuringBlockedWrite：持写权阻塞写（对端不读的
 // net.Pipe）期间取消无 deadline 的 ctx，必须毫秒级返回 ctx.Err() 且
 // c.closed 终态关闭——绝不干等 5s 写超时，残帧连接也绝不复用。
