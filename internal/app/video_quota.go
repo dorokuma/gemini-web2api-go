@@ -93,7 +93,7 @@ func videoQuotaFor(a CookieAccount, now time.Time, lookback time.Duration) accou
 	sapisid := extractSAPISID(a.Cookie)
 	var xsrf string
 	err := viaSlot(a, func(proxyURL string) (err error) {
-		xsrf, err = getXSRF(a.Cookie, a.AuthUser, proxyURL)
+		xsrf, err = getXSRFSwitch(a.Cookie, a.AuthUser, proxyURL, false)
 		return err
 	})
 	if err != nil {

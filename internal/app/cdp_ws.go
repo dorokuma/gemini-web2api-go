@@ -195,6 +195,11 @@ const (
 func (c *cdpConn) sendText(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	select {
+	case <-c.closed:
+		return errors.New("cdp ws: connection closed")
+	default:
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
 	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.writeFrame(wsOpText, payload)
@@ -204,6 +209,11 @@ func (c *cdpConn) sendText(payload []byte) error {
 func (c *cdpConn) sendPong(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	select {
+	case <-c.closed:
+		return errors.New("cdp ws: connection closed")
+	default:
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpWriteTimeout))
 	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.writeFrame(wsOpPong, payload)
@@ -214,6 +224,11 @@ func (c *cdpConn) sendPong(payload []byte) error {
 func (c *cdpConn) sendClose() {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(cdpCloseTimeout))
 	defer c.conn.SetWriteDeadline(time.Time{})
 	_ = c.writeFrame(wsOpClose, nil)
@@ -353,8 +368,12 @@ func (c *cdpConn) readFrame() (op byte, fin bool, payload []byte, err error) {
 	return op, fin, payload, nil
 }
 
-// Close 立即打断阻塞中的读循环并释放连接。幂等。
-// conn.Close 强制唤醒所有阻塞读写；pending 调用方由 cdpClient.failAll 唤醒。
+// Close 立即打断阻塞中的读写循环并释放连接。幂等。
+// 顺序严格：先 close(closed) 置终态标记（新写直接被拒，不再进 writeMu
+// 排队），随即 conn.Close()——阻塞中的读与写（含持 writeMu 卡在
+// conn.Write 上的那一方）全部立刻被底层断连唤醒；pending 调用方由
+// cdpClient.failAll 唤醒。绝不先抢 writeMu 再关：写一个正在阻塞写的
+// 持锁者后面排队，Close 自己就被拖住了。
 func (c *cdpConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)

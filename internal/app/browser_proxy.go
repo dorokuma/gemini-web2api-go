@@ -42,7 +42,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -51,27 +50,29 @@ import (
 // browserProxyBridge 是 127.0.0.1 上按需监听的 HTTP CONNECT 转发器。
 // upstream 存当前要走的代理 URL（"" = 直连），SetUpstream 原子切换。
 type browserProxyBridge struct {
-	ln       net.Listener
-	port     int
-	upstream atomic.Value // string："" / http:// / https:// / socks5:// / socks5h://
-	// allowDirect=false 时 upstream="" 的请求一律拒绝：代理池 + fallback_direct=false
-	// 的语义就是「绝不直连」，桥的 upstream 还没被请求方同步到（比如启动竞态）
-	// 也不能静默退回直连把真实 IP 漏出去。
-	allowDirect atomic.Bool
-	server      *http.Server
+	ln   net.Listener
+	port int
 
-	// 活跃隧道跟踪：SetUpstream 换出口时要把旧出口的隧道关掉，否则 Chromium
-	// 的 CONNECT 复用会让新请求继续走旧出口（浏览器代理栈对同一 origin 的
-	// 隧道复用比 HTTP keep-alive 更粘）。
-	tunMu   sync.Mutex
-	tunnels map[net.Conn]struct{}
+	// 单一把 mu 保护全部可变状态 + 活跃隧道表：upstream 与 allowDirect 必须
+	// 作为同一个原子快照被读到——拆成两个独立 atomic 时，读侧可能拿到
+	// 「新 upstream="" 配旧 allowDirect=true」的撕裂组合，在
+	// fallback_direct=false 收紧的瞬间把真实 IP 漏成直连。
+	mu          sync.Mutex
+	upstream    string // "" / http:// / https:// / socks5:// / socks5h://
+	allowDirect bool   // false = upstream="" 一律拒（绝不直连漏 IP）
+	gen         uint64 // 出口代际：upstream 变更或 allowDirect 收紧时 +1
+	closed      bool
+	// tunnels 记全部在建与活跃隧道（upstreamConn → 建隧道的 clientConn）。
+	// 拨号前就登记在建项（conn=nil），拨号完成回填——SetUpstream/Close 只对
+	// 已建成的连接 close，对在建项的收口靠「建成后在 mu 下比对 gen/closed」：
+	// 代际已换或桥已关，立刻关掉刚建成的连接，绝不漏关。
+	tunnels map[net.Conn]net.Conn
+
+	server *http.Server
 
 	// allowLoopback 仅测试用：允许 CONNECT 回环目标。生产恒 false，
 	// 回环 + 自身端口一律拒绝（防自环 FD 耗尽与 /admin SSRF）。
 	allowLoopback bool
-
-	mu     sync.Mutex
-	closed bool
 }
 
 // newBrowserProxyBridge 起监听但**不**接请求——Chromium 真正连过来之前，
@@ -82,12 +83,11 @@ func newBrowserProxyBridge() (*browserProxyBridge, error) {
 		return nil, fmt.Errorf("browser proxy bridge listen: %w", err)
 	}
 	b := &browserProxyBridge{
-		ln:      ln,
-		port:    ln.Addr().(*net.TCPAddr).Port,
-		tunnels: map[net.Conn]struct{}{},
+		ln:          ln,
+		port:        ln.Addr().(*net.TCPAddr).Port,
+		tunnels:     map[net.Conn]net.Conn{},
+		allowDirect: true, // 未调用 SetUpstream 前默认允许直连，由首个请求方校正
 	}
-	b.upstream.Store("")
-	b.allowDirect.Store(true) // 未调用 SetUpstream 前默认允许直连，由首个请求方校正
 	b.server = &http.Server{Handler: http.HandlerFunc(b.handleConnect)}
 	go b.server.Serve(ln)
 	return b, nil
@@ -99,55 +99,37 @@ func (b *browserProxyBridge) Port() int { return b.port }
 // SetUpstream 原子换上游与直连许可。空 proxyURL 且 allowDirect=false 时
 // 全部 CONNECT 被拒（代理池锁定场景绝不直连）；allowDirect=true 时空串 = 直连。
 //
-// 出口 URL 实际变更时关掉旧出口的活跃隧道：Chromium 对同一 origin 的 CONNECT
-// 隧道复用很粘，不关它新请求会继续走旧出口，换代理等于没换。
+// 代际语义：upstream 实际变更 **或** allowDirect 从 true 收紧为 false
+// （即使 URL 都是空串——收紧后旧直连隧道就是违规隧道）时，递增 gen 并关闭
+// 全部旧代际隧道；Chromium 对同一 origin 的 CONNECT 隧道复用很粘，不关它
+// 新请求会继续走旧出口/旧许可，换代理等于没换。allowDirect false→true 放宽
+// 不换代际：旧的非直连隧道仍然合法。
 func (b *browserProxyBridge) SetUpstream(proxyURL string, allowDirect bool) error {
 	if proxyURL != "" {
 		if err := validateProxyURL(proxyURL); err != nil {
 			return err
 		}
 	}
-	old, _ := b.upstream.Load().(string)
-	b.upstream.Store(proxyURL)
-	b.allowDirect.Store(allowDirect)
-	if old != proxyURL {
-		b.closeTunnels()
+	b.mu.Lock()
+	genBumped := false
+	if b.upstream != proxyURL || (!allowDirect && b.allowDirect) {
+		b.gen++
+		genBumped = true
 	}
-	return nil
-}
-
-// SetUpstreamLegacy 兼容单参调用：只换上游，不动直连许可。
-func (b *browserProxyBridge) SetUpstreamLegacy(proxyURL string) error {
-	if proxyURL != "" {
-		if err := validateProxyURL(proxyURL); err != nil {
-			return err
+	b.upstream = proxyURL
+	b.allowDirect = allowDirect
+	var stale []net.Conn
+	if genBumped {
+		for upConn := range b.tunnels {
+			stale = append(stale, upConn)
 		}
 	}
-	old, _ := b.upstream.Load().(string)
-	b.upstream.Store(proxyURL)
-	if old != proxyURL {
-		b.closeTunnels()
+	b.mu.Unlock()
+	for _, c := range stale {
+		_ = c.Close() // nil 在建项跳过：建成后由 gen 校验关闭
 	}
 	return nil
 }
-
-// closeTunnels 关掉当前所有活跃隧道（换出口时调用）。
-func (b *browserProxyBridge) closeTunnels() {
-	b.tunMu.Lock()
-	list := make([]net.Conn, 0, len(b.tunnels))
-	for c := range b.tunnels {
-		list = append(list, c)
-	}
-	b.tunMu.Unlock()
-	for _, c := range list {
-		_ = c.Close()
-	}
-}
-
-// CloseIdle 关闭连接池里已建立的隧道空闲端。
-// 每条 CONNECT 都是独立 TCP 直连目标，没有 http.Transport 的连接池可清；
-// 活跃隧道的关闭归 SetUpstream/closeTunnels 管。
-func (b *browserProxyBridge) CloseIdle() {}
 
 // handleConnect 只认 CONNECT 方法。
 // 非 CONNECT 一律 405：本机回环端口对 GET 回 "200 Connection Established"
@@ -204,8 +186,10 @@ func (b *browserProxyBridge) checkTarget(target string) error {
 	return nil
 }
 
-// tunnel 完成一条 CONNECT：先 hijack 出客户端 conn，再按当前上游建到目标的
-// 连接，两边 io.Copy 收尾。隧道 conn 登记进 tunMu 表，供换出口时强制断开。
+// tunnel 完成一条 CONNECT：先 hijack 出客户端 conn，在 mu 下取
+// (upstream, allowDirect, gen, closed) 原子快照并登记在建隧道，再按快照
+// 拨号到目标。拨号完成后回 mu 校验 closed/gen——桥已关或代际已换，立即
+// 关闭刚建成的连接，绝不把旧代际隧道放上线。
 func (b *browserProxyBridge) tunnel(w http.ResponseWriter, r *http.Request, target string) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -217,12 +201,26 @@ func (b *browserProxyBridge) tunnel(w http.ResponseWriter, r *http.Request, targ
 		return
 	}
 
-	upstreamURL, _ := b.upstream.Load().(string)
-	allowDirect := b.allowDirect.Load()
-	if upstreamURL == "" && !allowDirect {
+	b.mu.Lock()
+	upstreamURL := b.upstream
+	allowDirect := b.allowDirect
+	snapGen := b.gen
+	closed := b.closed
+	if !closed {
+		b.tunnels[clientConn] = nil // 在建登记：upstreamConn 建成前为 nil
+	}
+	b.mu.Unlock()
+
+	drop := func() {
+		b.mu.Lock()
+		delete(b.tunnels, clientConn)
+		b.mu.Unlock()
+		clientConn.Close()
+	}
+	if closed || (upstreamURL == "" && !allowDirect) {
 		fmt.Fprintf(clientRW, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		clientRW.Flush()
-		clientConn.Close()
+		drop()
 		return
 	}
 	upstreamConn, err := b.dialUpstream(r.Context(), upstreamURL, target)
@@ -230,45 +228,58 @@ func (b *browserProxyBridge) tunnel(w http.ResponseWriter, r *http.Request, targ
 		// 按 CONNECT 语义回 502 再关，Chromium 会把这次导航标成代理失败。
 		fmt.Fprintf(clientRW, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 		clientRW.Flush()
-		clientConn.Close()
+		drop()
 		return
 	}
 
+	// 拨号完成：在 mu 下终检——桥关了或代际换了，这条新隧道不许上线。
+	b.mu.Lock()
+	if b.closed || b.gen != snapGen {
+		delete(b.tunnels, clientConn)
+		b.mu.Unlock()
+		upstreamConn.Close()
+		fmt.Fprintf(clientRW, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+		clientRW.Flush()
+		clientConn.Close()
+		return
+	}
+	b.tunnels[clientConn] = upstreamConn
+	b.mu.Unlock()
+
 	// 200 之后再交隧道：回完这一行，clientConn 的后续字节就是目标协议的流量。
 	if _, err := clientRW.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		b.mu.Lock()
+		delete(b.tunnels, clientConn)
+		b.mu.Unlock()
 		clientConn.Close()
 		upstreamConn.Close()
 		return
 	}
 	if err := clientRW.Flush(); err != nil {
+		b.mu.Lock()
+		delete(b.tunnels, clientConn)
+		b.mu.Unlock()
 		clientConn.Close()
 		upstreamConn.Close()
 		return
 	}
 
-	b.tunMu.Lock()
-	b.tunnels[clientConn] = struct{}{}
-	b.tunnels[upstreamConn] = struct{}{}
-	b.tunMu.Unlock()
-	untrack := func(c net.Conn) {
-		b.tunMu.Lock()
-		delete(b.tunnels, c)
-		b.tunMu.Unlock()
+	untrack := func() {
+		b.mu.Lock()
+		delete(b.tunnels, clientConn)
+		b.mu.Unlock()
 	}
-
 	go func() {
 		io.Copy(upstreamConn, clientConn)
 		upstreamConn.Close()
 		clientConn.Close()
-		untrack(upstreamConn)
-		untrack(clientConn)
+		untrack()
 	}()
 	go func() {
 		io.Copy(clientConn, upstreamConn)
 		clientConn.Close()
 		upstreamConn.Close()
-		untrack(clientConn)
-		untrack(upstreamConn)
+		untrack()
 	}()
 }
 
@@ -309,9 +320,13 @@ func (b *browserProxyBridge) dialUpstream(ctx context.Context, upstreamURL, targ
 		}
 		// CONNECT 请求带 Basic 认证（若 URL 有 userinfo）；密码不出现在任何地方
 		// 的命令行——Chromium 不知道上游有认证，只看见 127.0.0.1。
+		// 必须取解码后的原始凭据（Username()/Password()）：u.User.String()
+		// 是按 URL 规则转义的串，密码含 @ / : / % 时会发出去一份错误凭据，
+		// 上游回 407 整条隧道死掉。
 		var authHdr string
 		if u.User != nil {
-			cred := u.User.String()
+			pass, _ := u.User.Password()
+			cred := u.User.Username() + ":" + pass
 			authHdr = "Proxy-Authorization: Basic " +
 				base64.StdEncoding.EncodeToString([]byte(cred)) + "\r\n"
 		}
@@ -385,7 +400,8 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 }
 
 // Shutdown 停掉监听并关掉在飞连接（http.Server.Close 只停新连接，hijack
-// 出去的隧道不归它管——这里显式把活跃隧道一并关掉）。
+// 出去的隧道不归它管——这里显式把全部在建与活跃隧道一并关掉；在建项
+// 由 tunnel 建成后的 closed/gen 终检负责立刻自关）。
 func (b *browserProxyBridge) Shutdown(ctx context.Context) {
 	b.mu.Lock()
 	if b.closed {
@@ -393,8 +409,15 @@ func (b *browserProxyBridge) Shutdown(ctx context.Context) {
 		return
 	}
 	b.closed = true
+	b.gen++ // 作废所有在建快照
+	list := make([]net.Conn, 0, len(b.tunnels))
+	for c := range b.tunnels {
+		list = append(list, c)
+	}
 	b.mu.Unlock()
-	b.closeTunnels()
+	for _, c := range list {
+		_ = c.Close()
+	}
 	_ = b.server.Close()
 	_ = b.ln.Close()
 }

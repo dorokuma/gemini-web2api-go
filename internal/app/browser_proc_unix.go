@@ -291,7 +291,9 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	}
 	// darwin：ps -ww -o command= 给整条命令行。带空格的可执行路径
 	// （"Google Chrome.app/Contents/MacOS/Google Chrome"）按空格切词后
-	// 最后一个词是 "Chrome"，exeNameOK 对每个词逐个试。
+	// 可执行段在 "--user-data-dir=" 之前的整段，不能再按词逐个碰运气——
+	// profile 路径本身可能含 "chrome"/"brave" 之类的词，误当可执行名
+	// 会放过一个根本不是浏览器的进程。
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-ww", "-o", "command=").Output()
 	if err != nil {
 		return false
@@ -300,22 +302,30 @@ func processIsOurBrowser(pid int, profileDir string) bool {
 	if line == "" {
 		return false
 	}
-	words := strings.Fields(line)
-	if len(words) == 0 {
+	return darwinCmdlineIsOurBrowser(line, want)
+}
+
+// darwinCmdlineIsOurBrowser 是 Darwin 命令行的纯解析判据（可单测）：
+//   - 先定位 "--user-data-dir=" 首次出现之前的片段作为可执行路径段，
+//     校验它的基名含合法浏览器名；
+//   - 再按 " --" 边界切出每个选项，找恰好等于 want 的 --user-data-dir=<abs>
+//     ——profile 路径可含空格，按 " --" 而不是空格切词才不会把一个带
+//     空格的 profile 值切碎。
+func darwinCmdlineIsOurBrowser(line, want string) bool {
+	// 可执行路径段 = "--user-data-dir=" 之前的全部（含内部空格）。
+	idx := strings.Index(line, "--user-data-dir=")
+	if idx <= 0 {
 		return false
 	}
-	exeOK := false
-	for _, w := range words {
-		if exeNameOK(w) {
-			exeOK = true
-			break
-		}
-	}
-	if !exeOK {
+	exeSeg := strings.TrimSpace(line[:idx])
+	if !exeNameOK(exeSeg) {
 		return false
 	}
-	for _, w := range words[1:] {
-		if w == want {
+	// 参数段按 " --" 边界切，逐项精确比对 --user-data-dir=<abs>。
+	args := line[idx:]
+	for _, a := range strings.Split(args, " --") {
+		a = strings.TrimSpace(a)
+		if a == want {
 			return true
 		}
 	}

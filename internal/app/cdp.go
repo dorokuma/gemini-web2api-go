@@ -54,6 +54,13 @@ type cdpClient struct {
 	err     error // 连接死后的终态错误，给后续 Call 立刻返回
 	errOnce sync.Once
 	done    chan struct{}
+
+	// onClose 是断连终态回调（failAll 首次触发时调用一次）：常驻浏览器层
+	// 靠它把 CDP 断连传播到所有在途流——拿到 headers 后上游沉默的流
+	// 不该再干等 stallLimit。异步派发（failAll 可能正持读循环路径，
+	// 回调里再抢锁会把断连通知本身卡死）。
+	onCloseMu sync.Mutex
+	onClose   func(error)
 }
 
 // newCDPClient 包住一条已握手的 conn，启动读循环。
@@ -91,6 +98,14 @@ func (c *cdpClient) Once(method string, fn func(cdpEvent)) {
 	c.evtMu.Lock()
 	c.onceHandlers[method] = append(c.onceHandlers[method], fn)
 	c.evtMu.Unlock()
+}
+
+// setOnClose 注册断连回调（只允许设一次，重复设置会覆盖旧值）。
+// 回调在独立 goroutine 里异步执行，拿到的 err 与 failAll 的终态错误一致。
+func (c *cdpClient) setOnClose(fn func(error)) {
+	c.onCloseMu.Lock()
+	c.onClose = fn
+	c.onCloseMu.Unlock()
 }
 
 // Call 发一条 method(params)，等带同 id 的响应回来，把 result 解进 out。
@@ -257,12 +272,22 @@ func (c *cdpClient) dispatch(payload []byte) {
 	}
 }
 
-// failAll 终态化：记错、关 done、唤醒全部 pending。
+// failAll 终态化：记错、关 done、唤醒全部 pending、异步通知 onClose。
 func (c *cdpClient) failAll(err error) {
+	first := false
 	c.errOnce.Do(func() {
 		c.err = err
 		close(c.done)
+		first = true
 	})
+	if first {
+		c.onCloseMu.Lock()
+		cb := c.onClose
+		c.onCloseMu.Unlock()
+		if cb != nil {
+			go cb(err)
+		}
+	}
 	c.pendMu.Lock()
 	for id, ch := range c.pending {
 		delete(c.pending, id)

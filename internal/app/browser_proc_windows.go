@@ -92,19 +92,22 @@ func killBrowserProcessGroup(pid, pgid int, gracefulTimeout time.Duration) {
 	if pid <= 0 {
 		return
 	}
-	gctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
-	defer cancel()
-	_ = exec.CommandContext(gctx, "taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
+	// 同一总 deadline：graceful taskkill、等活、强杀 taskkill 共享这一条
+	// gracefulTimeout 预算，绝不各自叠加 5s+10s 超出总预算——停机编排
+	// 给整个回收链的时间是有限的，每一步都不能自己再要一份。
 	deadline := time.Now().Add(gracefulTimeout)
+	graceCtx, graceCancel := context.WithDeadline(context.Background(), deadline)
+	defer graceCancel()
+	_ = exec.CommandContext(graceCtx, "taskkill", "/T", "/PID", strconv.Itoa(pid)).Run()
 	for time.Now().Before(deadline) {
 		if !pidAlive(pid) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	fctx, fcancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer fcancel()
-	_ = exec.CommandContext(fctx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+	forceCtx, forceCancel := context.WithDeadline(context.Background(), deadline)
+	defer forceCancel()
+	_ = exec.CommandContext(forceCtx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
 }
 
 // tasklistImageName 查 PID 现在对应的镜像名（CSV 第一列）。
@@ -202,16 +205,34 @@ var windowsBrowserImages = map[string]bool{
 	"new_chrome.exe": true,
 }
 
-// processIsOurBrowser 的 Windows 版：活进程 + 镜像名命中浏览器白名单。
+// processIsOurBrowser 的 Windows 版：活进程 + 镜像名命中浏览器白名单
+// + 真实命令行核验 --user-data-dir=<abs>。
 //
 // Windows 没法像 Linux 那样零成本读 cmdline（WMI 重、NtQueryInformationProcess
-// 不在标准库），所以核验到「这是台浏览器」为止——Profile 一致性已经在外层
-// reclaimOrphanBrowser 比过，两层叠加比只看 PID 强得多；镜像名对不上
-// （PID 复用给了别的程序）宁可不杀。
+// 不在标准库），但只靠 tasklist 镜像名太弱——镜像名对得上只能说明「这是台
+// Chrome」，不能证明它用的是我们这个 profileDir：误杀一个挂在别的 profile 的
+// Chrome 树，或误删活实例的 Singleton*，都是不可逆的。这里用 PowerShell 短超时
+// （1.5s）拉取 Win32_Process.CommandLine 做精确核验：拿不到命令行、或命令行
+// 不含目标 absProfileDir，一律保守返回 false。
 func processIsOurBrowser(pid int, profileDir string) bool {
 	image, ok := tasklistImageName(pid)
 	if !ok {
 		return false
 	}
-	return windowsBrowserImages[strings.ToLower(image)]
+	if !windowsBrowserImages[strings.ToLower(image)] {
+		return false
+	}
+	abs, err := filepath.Abs(profileDir)
+	if err != nil {
+		abs = profileDir
+	}
+	want := "--user-data-dir=" + abs
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine", pid)).Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), want)
 }

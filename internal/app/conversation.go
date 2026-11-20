@@ -191,24 +191,13 @@ func parseConvIDs(raw string) (cid, rid, rcid, tok26 string) {
 // 载体。续接请求必须每轮带上它，否则被服务端当新会话（实测不带 0/4 通、带 4/4 通）。
 // 必须走跟正式请求同一出口。
 func getAnonSession(proxyURL string) (string, error) {
-	// 浏览器传输模式：常驻浏览器的 jar 就是会话载体，匿名多轮直接用它——
-	// 返回空串表示「用浏览器 jar 即可」，调用方不必另持一份 session cookie。
-	if shouldUseBrowserTransport() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := browserMgr.ensureRunning(ctx); err != nil {
-			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
-				return "", err
-			}
-			if isBrowserLocalError(err) {
-				logf("[conv] 浏览器不可用，匿名会话回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
-			} else {
-				return "", err
-			}
-		} else {
-			return "", nil
-		}
-	}
+	// 浏览器传输模式下匿名会话**仍走纯 Go HTTP**：匿名多轮的会话载体是
+	// /app 下发的一份 session cookie（NID/COMPASS 等），必须逐轮带上；
+	// 常驻浏览器的页内 fetch 对匿名请求是 credentials:"omit"（JS fetch
+	// 也禁止手工设置 Cookie 头），会话 cookie 根本发不出去——让匿名
+	// 流量借浏览器 jar，不但丢续接，还会误带驻留主号的登录态。
+	// 所以匿名会话始终持自己的 session cookie 走原有纯 Go HTTP 路径，
+	// 仅登录态流量走常驻浏览器。
 	req := func() (*http.Response, io.ReadCloser, []string, error) {
 		if proxyURL != "" {
 			r, err := http.NewRequest("GET", "https://gemini.google.com/app", nil)
@@ -551,7 +540,8 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 				var a *CookieAccount
 				if shouldUseBrowserTransport() {
 					// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
-					a = stickyResidentAccount(exclude)
+					// 传真实 mc.Upstream：strict_model 模型级冷却按模型登记。
+					a = stickyResidentAccountFor(exclude, mc.Upstream)
 				}
 				if a == nil {
 					var perr error

@@ -124,10 +124,13 @@ func uploadPostCtx(ctx context.Context, url string, headers map[string]string, b
 	// 浏览器传输模式：gemini.google.com 同源的 batchexecute / StreamGenerate
 	// 走页内 fetch（cookie jar 由浏览器管，跟页内请求天然一致）。跨域的上传
 	// host（push.clients6.google.com）页内 fetch 也行，但 CORS 复杂，仍走 Go。
-	if shouldUseBrowserTransport() && strings.HasPrefix(url, "https://gemini.google.com") {
+	acct := browserAccountFromHeaders(headers)
+	// 非池会话载体（acct==nil 但带 Cookie，如匿名多轮/上传 token 场景）
+	// 走纯 Go HTTP——页内 fetch 发不出手工 Cookie 头，也不该带驻留 jar。
+	skipBrowser := acct == nil && headers["Cookie"] != ""
+	if shouldUseBrowserTransport() && strings.HasPrefix(url, "https://gemini.google.com") && !skipBrowser {
 		syncBridgeUpstream(proxyURL)
-		acct := browserAccountFromHeaders(headers)
-		status, b, err := browserMgr.doBrowserPost(ctx, acct, url, headers, body, nil)
+		status, b, err := browserMgr.doBrowserPost(ctx, acct, url, headers, body, true, nil)
 		if err != nil {
 			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
 				return 0, nil, nil, err

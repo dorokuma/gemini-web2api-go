@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -231,35 +230,28 @@ func Run() {
 	fmt.Println()
 	warnEnvProxyIgnored()
 
-	// 优雅退出：收到 SIGINT/SIGTERM 后两条收尾并行——
-	//   1. server.Shutdown 停接新连接并有界等待在飞 HTTP handler 收尾；
-	//   2. browserMgr.Shutdown 精确回收常驻浏览器进程组（≤2.5s）。
+	// 优雅退出：收到 SIGINT/SIGTERM 后**顺序**收尾——
+	//   1. server.Shutdown 先停接新连接并有界等待在飞 HTTP handler 收尾
+	//      （在飞的浏览器流式响应要优雅写完，不能先关浏览器把它们打成 502）；
+	//   2. browserMgr.Shutdown 再精确回收常驻浏览器进程组（≤2.5s）。
 	// 关键：ListenAndServe 在 Shutdown 被调用的那一刻就返回 ErrServerClosed，
 	// 主函数必须**显式等 shutdownDone**，否则 Run() 会抢在在飞 handler 与
 	// 浏览器回收完成前退出——在飞请求被截断、Chromium 变孤儿。
-	// 总耗时受控在编排 5s 超时内（server 2s + browser 2.5s 并行）。
+	// 顺序执行总上限 4.5s（server 2s + browser 2.5s），仍严格满足编排 5s
+	// 超时，且绝不提前把正在收尾的浏览器响应打成 502。
 	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		<-sigCtx.Done()
-		logf("[app] 收到退出信号，停接新请求并回收常驻浏览器")
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = server.Shutdown(sctx)
-		}()
-		go func() {
-			defer wg.Done()
-			bctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
-			defer cancel()
-			browserMgr.Shutdown(bctx)
-		}()
-		wg.Wait()
+		logf("[app] 收到退出信号，先排空 HTTP 再回收常驻浏览器")
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = server.Shutdown(sctx)
+		cancel()
+		bctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		browserMgr.Shutdown(bctx)
+		cancel()
 	}()
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

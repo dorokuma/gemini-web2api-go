@@ -549,7 +549,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 策略 M1：常驻浏览器有粘性主号且它还能用时，优先继续驻留
 			// （同 cookieIdentity 的 authuser=0..9 共用同一 /app Tab），
 			// 不轻易切号——切一次就是 30s 冷却 + 清种 cookie。
-			acct = stickyResidentAccount(exclude)
+			// 传真实 mc.Upstream：strict_model 的模型级冷却按模型登记，
+			// 传空串等于把「这个模型正被该号降级冷却」的事实吞掉。
+			acct = stickyResidentAccountFor(exclude, mc.Upstream)
 		}
 		if acct == nil {
 			a, s, err := pickAccountForModel(mc, exclude)
@@ -1413,8 +1415,21 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 		// fallback_direct=false + 代理池时桥绝不直连（真实 IP 不出桥）。
 		syncBridgeUpstream(proxyURL)
 		acct := browserAccountFromHeaders(headers)
-		status, pr, err := browserMgr.doBrowserStreamRequest(ctx, acct, endpoint, "POST", headers, []byte(body), nil)
-		if err != nil {
+		// 匿名多轮的会话载体 cookie 不在账号池里（acct==nil 但 headers 带
+		// Cookie）：这种「会话 cookie」绝不能经浏览器页内 fetch——JS fetch
+		// 禁止手工设置 Cookie 头，且 credentials:"omit" 也防它误带驻留
+		// 主号的登录态。非池会话载体跳过浏览器走纯 Go HTTP，仅登录态流量
+		// （池账号与匿名无 Cookie）走常驻浏览器。
+		skipBrowser := acct == nil && headers["Cookie"] != ""
+		var status int
+		var pr io.ReadCloser
+		var err error
+		if !skipBrowser {
+			status, pr, err = browserMgr.doBrowserStreamRequest(ctx, acct, endpoint, "POST", headers, []byte(body), true, nil)
+		}
+		if skipBrowser {
+			// 会话载体走纯 Go HTTP：落到下方 stdlib/tls-client 分支。
+		} else if err != nil {
 			// 浏览器不可用（没装/拉不起来/CDP 断）：默认绝不静默降级回纯 Go HTTP，
 			// 由 upstreamReason 归到 browser_unavailable 给 502；显式开了
 			// browser_fallback_http 才落回下面的纯 Go 路径。
@@ -1834,12 +1849,15 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	var locHeader string
 	var err error
 
-	if shouldUseBrowserTransport() {
+	acct := browserAccountFromHeaders(headers)
+	// 非池会话载体（acct==nil 但带 Cookie）不借浏览器 jar：页内 fetch 发不出
+	// 手工 Cookie 头也不该误带驻留主号登录态，probe 旁路探测走纯 Go HTTP。
+	skipBrowserProbe := acct == nil && headers["Cookie"] != ""
+	if shouldUseBrowserTransport() && !skipBrowserProbe {
 		// 浏览器传输模式：页内 fetch 探测，跟正式请求同一条链路。
 		syncBridgeUpstream(proxyURL)
-		acct := browserAccountFromHeaders(headers)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		status, b, e := browserMgr.doBrowserPost(ctx, acct, endpoint, headers, []byte(body), nil)
+		status, b, e := browserMgr.doBrowserPost(ctx, acct, endpoint, headers, []byte(body), false, nil)
 		cancel()
 		if e != nil {
 			if isBrowserLocalError(e) {
