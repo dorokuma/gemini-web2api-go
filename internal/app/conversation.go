@@ -191,6 +191,13 @@ func parseConvIDs(raw string) (cid, rid, rcid, tok26 string) {
 // 载体。续接请求必须每轮带上它，否则被服务端当新会话（实测不带 0/4 通、带 4/4 通）。
 // 必须走跟正式请求同一出口。
 func getAnonSession(proxyURL string) (string, error) {
+	// 浏览器传输模式下匿名会话**仍走纯 Go HTTP**：匿名多轮的会话载体是
+	// /app 下发的一份 session cookie（NID/COMPASS 等），必须逐轮带上；
+	// 常驻浏览器的页内 fetch 对匿名请求是 credentials:"omit"（JS fetch
+	// 也禁止手工设置 Cookie 头），会话 cookie 根本发不出去——让匿名
+	// 流量借浏览器 jar，不但丢续接，还会误带驻留主号的登录态。
+	// 所以匿名会话始终持自己的 session cookie 走原有纯 Go HTTP 路径，
+	// 仅登录态流量走常驻浏览器。
 	req := func() (*http.Response, io.ReadCloser, []string, error) {
 		if proxyURL != "" {
 			r, err := http.NewRequest("GET", "https://gemini.google.com/app", nil)
@@ -425,8 +432,9 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			} else {
 				lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 160))
 			}
-			// 出错话术跟出口无关，不记进代理健康度
-			if pickedOK && !errors.Is(err, errUpstreamFailureReply) {
+			// 出错话术跟出口无关，不记进代理健康度；浏览器自身错误
+			// （browser_unavailable）同理——那是本地浏览器层的问题。
+			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
 				recordProxyResult(p.ID, false, lastErr.Error())
 			}
 			if tracker.emitted != "" || rtracker.emitted != "" {
@@ -529,15 +537,24 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
 			// last_used_at，调了不用等于白占一轮。
 			if !anonFirstEligible(mc, false) {
-				a, _, perr := pickAccountForModel(mc, exclude)
-				if perr != nil {
-					var last *ModelDowngradedError
-					if try > 0 && errors.As(err, &last) {
-						// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
-						last.RetryAfter = perr.(*ModelDowngradedError).RetryAfter
-						break
+				var a *CookieAccount
+				if shouldUseBrowserTransport() {
+					// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
+					// 传真实 mc.Upstream：strict_model 模型级冷却按模型登记。
+					a = stickyResidentAccountFor(exclude, mc.Upstream)
+				}
+				if a == nil {
+					var perr error
+					a, _, perr = pickAccountForModel(mc, exclude)
+					if perr != nil {
+						var last *ModelDowngradedError
+						if try > 0 && errors.As(err, &last) {
+							// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
+							last.RetryAfter = perr.(*ModelDowngradedError).RetryAfter
+							break
+						}
+						return "", nil, &StreamResult{}, perr
 					}
-					return "", nil, &StreamResult{}, perr
 				}
 				if a != nil {
 					conv.cookie = a.Cookie

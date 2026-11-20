@@ -16,5 +16,9 @@
   "gemini_bl": "boq_gemini-web-uiserver_20261007.01_p0",
   "cookie_file": "",
   "proxy": "",
-  "log_requests": true
+  "log_requests": true,
+  "browser_transport": false,
+  "browser_fallback_http": false,
+  "browser_path": "",
+  "browser_profile_dir": ""
 }

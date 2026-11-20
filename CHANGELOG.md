@@ -2,6 +2,41 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+### 新增
+
+- **常驻真实浏览器传输层**（`browser_transport`，默认关）：对话请求改走常驻 Chromium
+  （CDP + 页内流式 `fetch`），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管
+  自动续期（上游刷的 `SIDCC` 直接进 jar，不再靠 `/RotateCookies` 双端抢刷）。
+  单常驻粘性主号（策略 M1）：同一份登录态下 `authuser=0..9` 共用一个 `/app` Tab，
+  驻留号失效/被停用/该模型 `strict_model` 冷却时才在 30s 最小冷却下切号。
+  默认不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。
+- **`browser_fallback_http`**（默认关）：`browser_transport` 开着但本机找不到或
+  拉不起浏览器时，绝不静默降级回纯 Go HTTP——请求直接回 HTTP 502 + 原因码
+  `browser_unavailable` 及可操作中文提示（安装 Chromium 或配置 `browser_path`）。
+  显式开 `true` 才回退原有纯 Go HTTP 路径。
+- **`browser_path` / `browser_profile_dir`**（部署级只读配置，config.json /
+  `--browser-path` / `--browser-profile-dir` / `BROWSER_PATH` / `BROWSER_PROFILE_DIR`）：
+  显式指定 Chromium 可执行路径与 profile 目录。安全红线——**绝不进 `RuntimeConfig`**，
+  `/admin` 默认免鉴权，面板可写浏览器可执行路径等于本地任意命令执行。
+- 管理面板：`/admin/api/config` 的 `deploy` 块只读展示 `browser_path` /
+  `browser_profile_dir` / `browser_detected` / `browser_running`；运行时设置组
+  `RT_GROUPS` 同步加入 `browser_transport` 与 `browser_fallback_http` 开关
+  （防止面板保存清零），并补回 `web_channel` 占位项（#27 同类清零坑）。
+- 优雅退出：收到 SIGINT/SIGTERM 先 ≤2.5s 精确终止常驻浏览器进程组（`-pgid`）
+  再 `server.Shutdown`，不留孤儿 Chromium 进程。
+- 离线假 CDP 单元测试（`internal/app/browser_test.go`）：纯回环 RFC 6455 服务端，
+  CI 无需真实 Chromium——握手/分片重组/Ping-Pong/断开唤醒 pending、真流式 TTFB、
+  argon/strict_model 身份校验、ctx 取消与 stopWhen Abort、stallWatch 心跳与超时、
+  `browser_unavailable` 502 与 `browser_fallback_http` 回退、崩溃重连退避，以及
+  `RuntimeConfig` 全字段必须出现在 `RT_GROUPS` 的反射测试。
+
+### 修复
+
+- **`browserManager.scheduleReconnect` 双重 `mu.Unlock`**：函数既有 `defer m.mu.Unlock()`
+  又在 return 前手动 `Unlock`，任何崩溃重连都会 `sync: unlock of unlocked mutex` fatal。
+
 ## 6.2.2 - 2026-11-19
 
 ### 修复

@@ -1,12 +1,15 @@
 package app
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +42,8 @@ func Run() {
 	dbPath := flag.String("db", "", "SQLite path (default: ./data/gemini.db)")
 	adminToken := flag.String("admin-token", "", "admin token (empty = no auth, only safe on 127.0.0.1)")
 	apiKey := flag.String("api-key", "", "API key for /v1/* (locked). Empty = use kv-table key (auto-gen on first boot, mutable from admin UI)")
+	browserPath := flag.String("browser-path", "", "explicit Chromium/Chrome/Edge executable path (deploy-only; empty = auto-detect)")
+	browserProfileDir := flag.String("browser-profile-dir", "", "explicit browser profile dir (deploy-only; empty = <db dir>/browser-profile)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -71,6 +76,14 @@ func Run() {
 	}
 	if envTok := os.Getenv("ADMIN_TOKEN"); envTok != "" && cfg.AdminToken == "" {
 		cfg.AdminToken = envTok
+	}
+	// 浏览器路径/profile 目录是部署级配置：CLI > config.json > 环境变量。
+	// 绝不进 RuntimeConfig（/admin 默认免鉴权，面板可写等于本地任意执行）。
+	if *browserPath != "" {
+		cfg.BrowserPath = *browserPath
+	}
+	if *browserProfileDir != "" {
+		cfg.BrowserProfileDir = *browserProfileDir
 	}
 
 	// boot DB and load proxy pool
@@ -200,12 +213,60 @@ func Run() {
 	fmt.Printf("  Per-IP 限流: 并发=%d / RPM=%d / RPH=%d\n",
 		rtCfg().PerIPConcurrent, rtCfg().PerIPRPM, rtCfg().PerIPRPH)
 	fmt.Printf("  Retry:       %dx / %ds\n", rtCfg().RetryAttempts, rtCfg().RetryDelaySec)
+	// 浏览器传输层状态：enabled 时说明拉起模式（自动探测 / 显式路径 / 失败原因）。
+	if rtCfg().BrowserTransport {
+		desc := "auto-detect"
+		if p := cfgBrowserPath(); p != "" {
+			desc = p
+		} else if p, err := discoverBrowserBinary(""); err == nil {
+			desc = p
+		} else {
+			desc = "none found (requests will return 502 browser_unavailable)"
+		}
+		fmt.Printf("  Browser:     enabled (%s, fallback_http=%v)\n", desc, rtCfg().BrowserFallbackHTTP)
+	} else {
+		fmt.Printf("  Browser:     disabled\n")
+	}
 	fmt.Println()
 	warnEnvProxyIgnored()
 
-	if err := server.ListenAndServe(); err != nil {
+	// 优雅退出：收到 SIGINT/SIGTERM 后**顺序**收尾——
+	//   1. server.Shutdown 先停接新连接并有界等待在飞 HTTP handler 收尾
+	//      （在飞的浏览器流式响应要优雅写完，不能先关浏览器把它们打成 502）；
+	//   2. browserMgr.Shutdown 再精确回收常驻浏览器进程组（≤2.5s）。
+	// 关键：ListenAndServe 在 Shutdown 被调用的那一刻就返回 ErrServerClosed，
+	// 主函数必须**显式等 shutdownDone**，否则 Run() 会抢在在飞 handler 与
+	// 浏览器回收完成前退出——在飞请求被截断、Chromium 变孤儿。
+	// 顺序执行总上限 4.5s（server 2s + browser 2.5s），仍严格满足编排 5s
+	// 超时，且绝不提前把正在收尾的浏览器响应打成 502。
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-sigCtx.Done()
+		logf("[app] 收到退出信号，先排空 HTTP 再回收常驻浏览器")
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = server.Shutdown(sctx)
+		cancel()
+		bctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		browserMgr.Shutdown(bctx)
+		cancel()
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
+	}
+	// 等到收尾协程跑完再返回：信号触发的退出路径下 server.Shutdown /
+	// 浏览器回收才真正做完；自然退出（ErrServerClosed 之外的原因）时
+	// shutdownDone 未关也不等——select 区分两种终态。
+	select {
+	case <-shutdownDone:
+	case <-sigCtx.Done():
+		// 信号刚来、收尾协程还在跑：真等它完成。
+		<-shutdownDone
+	default:
 	}
 }
 

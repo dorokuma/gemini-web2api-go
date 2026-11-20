@@ -243,7 +243,7 @@ func TestRefreshAppTokensFailureDropsCache(t *testing.T) {
 	xsrfMu.Unlock()
 	t.Cleanup(func() { invalidateXSRF(cookie) })
 
-	refreshAppTokens(key, cookie, 0, "http://127.0.0.1:1")
+	refreshAppTokens(key, cookie, 0, "http://127.0.0.1:1", true)
 	xsrfMu.Lock()
 	_, ok := xsrfCache[key]
 	xsrfMu.Unlock()

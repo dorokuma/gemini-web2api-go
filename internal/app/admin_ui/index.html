@@ -1059,6 +1059,8 @@ const RT_GROUPS = [
         hint: '出图后照网页「下载」按钮那样取图：Ultra 号的图会放大到宽高各 2 倍（1376×768 → 2752×1536），普通号拿到未重新压缩的原始文件（尺寸不变、画质更好）。每张图多一次请求，返回体积大几倍。只登录态生效，取不到就退回原来那张，不会重新生成。默认关' },
       { k: 'anon_first', label: '匿名优先', type: 'bool',
         hint: '这次请求不需要登录态能力时（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号（默认关）' },
+      { k: 'web_channel', label: 'WebChannel 新协议（未启用）', type: 'bool',
+        hint: '（#43）改走 processSession 而非 StreamGenerate。当前版本代码里强制 useWC=false，此项仅为占位防止面板保存清零——开启它**不会改变**实际行为，仅会在日志里提示被忽略。默认关' },
     ],
   },
   {
@@ -1074,6 +1076,15 @@ const RT_GROUPS = [
         hint: '开：服务端自报的模型跟请求的不一致时（通常是这个号这一档额度用完、被静默降级），不把降级后的回答当成功返回，而是换下一个号重试；全池都被降级就回 429 insufficient_quota（code: model_downgraded）。流式在吐出第一个字之前就判断。关：照常返回降级后的回答（默认）' },
       { k: 'strict_model_cooldown_min', label: '降级冷却（分钟）', type: 'int', min: 0, max: 10080,
         hint: '严格模型校验开着时，被降级的号在这个模型上歇多久再用。网页端用量按 5 小时窗口算，默认 300；0=不记，每次请求都重新试' },
+    ],
+  },
+  {
+    title: '常驻浏览器传输层',
+    fields: [
+      { k: 'browser_transport', label: '浏览器传输（常驻 Chromium）', type: 'bool',
+        hint: '开：对话请求改走常驻真实浏览器（Chromium CDP + 页内流式 fetch），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管自动续期。默认关——不主动拉起 Chromium（常驻约 1.45 GB 内存）。浏览器路径与 profile 目录是部署级配置（--browser-path / config.json），不在本面板。单常驻粘性主号（策略 M1）：同一份登录态下 authuser=0..9 共用一个 /app Tab，驻留号失效或该模型冷却时才在 30s 最小冷却下切号' },
+      { k: 'browser_fallback_http', label: '浏览器缺席时回退 HTTP', type: 'bool',
+        hint: '关（默认）：浏览器传输开着但本机找不到/拉不起浏览器时，请求直接回 502 browser_unavailable，绝不静默降级回纯 Go HTTP（开这个功能图的就是浏览器指纹，悄悄换回 Go 等于没开）。开：可用性优先，浏览器缺席时回退原有纯 Go HTTP 路径' },
     ],
   },
   {
@@ -1139,6 +1150,28 @@ async function loadRtCfg() {
                              : '<span class="badge fail">未设 token</span>', 'compose 的 ADMIN_TOKEN'],
     ['API Key', d.api_key_locked ? '<span class="badge">部署锁定</span>'
                                  : '<span class="badge ok">面板可轮换</span>', 'compose 的 API_KEY'],
+    // browser_path 是配置值，browser_detected 是校验后的实际可用路径——
+    // 两者分开显示：配置了但不可执行/不存在时 browser_detected 为空，
+    // 显示「配置无效」而不是把坏路径伪装成「已找到」。
+    ['浏览器路径', d.browser_path
+        ? escapeHtml(d.browser_path) + (d.browser_detected
+            ? ' <span class="badge muted">已配置</span>'
+            : ' <span class="badge fail">路径无效</span>')
+        : (d.browser_detected
+            ? escapeHtml(d.browser_detected) + ' <span class="badge muted">自动探测</span>'
+            : '<span class="badge fail">未找到</span>'),
+     '部署级只读：--browser-path / config.json browser_path / BROWSER_PATH'],
+    ['浏览器探测', d.browser_detected ? escapeHtml(d.browser_detected)
+        : '<span class="badge fail">不可用（请求将回 502 browser_unavailable）</span>',
+     '自动探测/配置校验后的实际可用浏览器路径'],
+    ['浏览器 profile', d.browser_profile_dir ? escapeHtml(d.browser_profile_dir)
+        : '<span class="badge muted">默认（&lt;db 目录&gt;/browser-profile）</span>',
+     '部署级只读：--browser-profile-dir / config.json browser_profile_dir / BROWSER_PROFILE_DIR'],
+    ['常驻浏览器', rtCfgCache && rtCfgCache.browser_transport
+        ? (d.browser_running ? '<span class="badge ok">运行中</span>'
+                             : '<span class="badge fail">未拉起（请求将回 502 browser_unavailable）</span>')
+        : '<span class="badge muted">未启用</span>',
+     '运行时开关 browser_transport；运行状态实时探测'],
   ].map(r => `<tr><td title="${escapeHtml(r[2])}">${r[0]}</td>
       <td class="pre" style="word-break:break-all;">${r[1]}</td></tr>`).join('');
 }

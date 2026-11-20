@@ -369,8 +369,21 @@ func rotateDo(method, url string, headers map[string]string, body []byte, proxyU
 // 网络抖一下就把号标成坏的，会让它在挑号时沉底，反而伤可用性。
 func rotateAllAccounts() time.Duration {
 	next := defaultRotateInterval
+	// 浏览器模式下：当前被常驻浏览器持有的活跃账号，跳过纯 Go /RotateCookies
+	// 双端抢刷——浏览器 jar 才是权威，上游刷的 SIDCC 它都收下了，拿 DB 旧串
+	// 去刷等于两边各刷一份、互相覆盖。改为把 jar 当前值写回 DB。
+	var residentID int64
+	if shouldUseBrowserTransport() {
+		browserMgr.mu.Lock()
+		residentID = browserMgr.seed.AccountID
+		browserMgr.mu.Unlock()
+	}
 	for _, a := range accountList() {
 		if a.Status != "enabled" {
+			continue
+		}
+		if residentID > 0 && a.ID == residentID {
+			syncResidentCookiesBack()
 			continue
 		}
 		iv, _, err := rotateAccount(a)

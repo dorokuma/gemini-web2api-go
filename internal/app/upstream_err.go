@@ -28,6 +28,9 @@ const (
 	reasonEmptyContent    = "empty_content"    // 有内容帧但抽取后正文为空（整条回复只有无法解析的 tool_call 围栏等）
 	reasonUpstreamHTTP    = "upstream_http"    // 上游回了非 200
 	reasonUpstreamError   = "upstream_error"   // 其余上游失败兜底
+	// browser_transport 开着但本机找不到/拉不起浏览器时的硬错：绝不静默降级
+	// 回纯 Go HTTP（browser_fallback_http 显式开才回退），见 browser.go。
+	reasonBrowserUnavailable = "browser_unavailable"
 )
 
 // upstreamDiag 是 502 body 和 requests.error 前缀共用的一份诊断。
@@ -89,6 +92,11 @@ func diagHint(reason string) string {
 		return "上游返回了内容帧但抽不出正文：可能是回复被清洗规则剥空或协议字段已变更"
 	case reasonUpstreamHTTP:
 		return "上游返回了非 200 状态码：可能是出口被风控（302/sorry）、限流（429）或上游临时故障"
+	case reasonBrowserUnavailable:
+		return "常驻浏览器不可用：browser_transport 已开启但本机找不到 Chromium/Chrome/Edge，" +
+			"或拉起/连接失败。请安装 chromium（如 apt install chromium），" +
+			"或在 config.json / 启动参数里配置 browser_path 指向已装浏览器；" +
+			"确需在浏览器缺席时继续跑，可显式打开 browser_fallback_http 回退纯 Go HTTP"
 	default:
 		return "上游调用失败：详见 message 字段"
 	}
@@ -102,6 +110,8 @@ func diagHint(reason string) string {
 func upstreamReason(err error) string {
 	var se *StallError
 	switch {
+	case isBrowserLocalError(err):
+		return reasonBrowserUnavailable
 	case errors.Is(err, errUpstreamFailureReply):
 		return reasonFailureReply
 	case errors.Is(err, errEmptyContent):

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -104,16 +105,22 @@ func invalidateXSRF(cookie string) {
 // getXSRF 取该 cookie（第 authuser 个号）对应的 XSRF token；命中缓存且没过期就直接返回。
 // cookie 为空（匿名）时返回空串——匿名请求不需要这个字段。
 func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
+	return getXSRFSwitch(cookie, authuser, proxyURL, true)
+}
+
+// getXSRFSwitch 是 getXSRF 的辅助入口版：allowSwitch=false 时浏览器路径
+// 绝不切驻留 jar（驻留号坏了直接回错，由调用方回退纯 Go HTTP）。
+func getXSRFSwitch(cookie string, authuser int, proxyURL string, allowSwitch bool) (string, error) {
 	if cookie == "" {
 		return "", nil
 	}
 	key := xsrfKey(cookie, authuser)
 
-	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL); ok {
+	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL, allowSwitch); ok {
 		return e.token, nil
 	}
 
-	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+	e, err := fetchAppTokens(cookie, authuser, proxyURL, allowSwitch)
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +131,9 @@ func getXSRF(cookie string, authuser int, proxyURL string) (string, error) {
 }
 
 // cachedAppTokens 返回未过期的缓存项；过了 xsrfRefreshAfter 时顺带踢一次后台刷新。
-func cachedAppTokens(key, cookie string, authuser int, proxyURL string) (xsrfEntry, bool) {
+// 后台刷新是**辅助入口**：无论本次调用方 allowSwitch 是什么，一律固定传
+// false——绝不能让主请求的 true 透传进后台 goroutine 去偷换驻留 jar。
+func cachedAppTokens(key, cookie string, authuser int, proxyURL string, allowSwitch bool) (xsrfEntry, bool) {
 	xsrfMu.Lock()
 	defer xsrfMu.Unlock()
 	e, ok := xsrfCache[key]
@@ -134,20 +143,21 @@ func cachedAppTokens(key, cookie string, authuser int, proxyURL string) (xsrfEnt
 	if !e.refreshing && time.Since(e.fetched) >= xsrfRefreshAfter {
 		e.refreshing = true
 		xsrfCache[key] = e
-		go refreshAppTokens(key, cookie, authuser, proxyURL)
+		go refreshAppTokens(key, cookie, authuser, proxyURL, false)
 	}
 	return e, true
 }
 
 // refreshAppTokens 后台重抓页面。失败就丢掉缓存，让下一个请求同步重取并报出失效。
-func refreshAppTokens(key, cookie string, authuser int, proxyURL string) {
-	if err := storeAppTokens(key, cookie, authuser, proxyURL); err != nil {
+// 后台刷新是辅助入口：allowSwitch=false，不打扰驻留 jar。
+func refreshAppTokens(key, cookie string, authuser int, proxyURL string, allowSwitch bool) {
+	if err := storeAppTokens(key, cookie, authuser, proxyURL, allowSwitch); err != nil {
 		logf("[xsrf] 后台刷新失败，已作废缓存: %v", err)
 	}
 }
 
-func storeAppTokens(key, cookie string, authuser int, proxyURL string) error {
-	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+func storeAppTokens(key, cookie string, authuser int, proxyURL string, allowSwitch bool) error {
+	e, err := fetchAppTokens(cookie, authuser, proxyURL, allowSwitch)
 	xsrfMu.Lock()
 	defer xsrfMu.Unlock()
 	if err != nil {
@@ -162,11 +172,11 @@ func storeAppTokens(key, cookie string, authuser int, proxyURL string) error {
 func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx string, err error) {
 	key := xsrfKey(cookie, authuser)
 
-	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL); ok {
+	if e, ok := cachedAppTokens(key, cookie, authuser, proxyURL, true); ok {
 		return e.pushID, e.pctx, nil
 	}
 
-	e, err := fetchAppTokens(cookie, authuser, proxyURL)
+	e, err := fetchAppTokens(cookie, authuser, proxyURL, true)
 	if err != nil {
 		return "", "", err
 	}
@@ -239,7 +249,47 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 }
 
 // fetchAppTokens 抓一次 /app 页面，把三个 token 一起抠出来。
-func fetchAppTokens(cookie string, authuser int, proxyURL string) (xsrfEntry, error) {
+// allowSwitch=false 时浏览器路径绝不切驻留 jar（辅助/管理入口）。
+func fetchAppTokens(cookie string, authuser int, proxyURL string, allowSwitch bool) (xsrfEntry, error) {
+	// 浏览器传输模式：直接从常驻页面上下文拿（页内 fetch /app 的 HTML 里就有
+	// WIZ_global_data），绕开纯 Go HTTP 的另一次 GET /app。
+	if shouldUseBrowserTransport() {
+		// 透传调用方真实 authuser：同 cookieIdentity 下 /u/N 的 token 不同，
+		// browserAccountFromHeaders 靠这个头精确匹配到对应 authuser 的记录。
+		acct := browserAccountFromHeaders(map[string]string{
+			"Cookie":          cookie,
+			"X-Goog-AuthUser": strconv.Itoa(authuser),
+		})
+		// 带 Cookie 但反查不到 enabled 账号（status=disabled 的管理员检测、
+		// 未入池 Cookie）：绝不能把 acct=nil 传进浏览器当匿名处理——匿名
+		// /app 页拿不到 SNlM0e，上层会误报「登录态有效」且重置 authuser。
+		// 与 gemini.go / upload.go 的 skipBrowser 语义一致：带 Cookie 的
+		// 非池请求走纯 Go HTTP，用原 cookie 与 authuser 完成真实检测。
+		if !(cookie != "" && acct == nil) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
+			// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
+			e, err := browserMgr.fetchAppTokensViaBrowserCtx(ctx, proxyURL, acct, allowSwitch, nil)
+			if err != nil {
+				// 辅助入口哨兵：该用哪个 jar 与驻留不符——无条件回退纯 Go HTTP，
+				// 不看 browser_fallback_http，也不是浏览器坏了。
+				if isBrowserAuxSkip(err) {
+					logf("[xsrf] 辅助入口不适配驻留 jar，回退纯 Go HTTP")
+				} else if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+					// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
+					// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
+					return xsrfEntry{}, err
+				} else if isBrowserLocalError(err) {
+					logf("[xsrf] 浏览器取 token 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+				} else {
+					return xsrfEntry{}, err
+				}
+			} else {
+				return e, nil
+			}
+		}
+	}
 	body, err := fetchAppPage(cookie, authuser, proxyURL)
 	if err != nil {
 		return xsrfEntry{}, err

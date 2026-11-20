@@ -493,7 +493,8 @@ Saving takes effect **immediately**, no restart. Values live in the database and
 | Fall back to direct when no proxy is available (`fallback_direct`) | off by default: when every proxy is full or tripped, return an error so the host IP is never exposed upstream. On: availability first, but the upstream sees the host's real exit |
 | Fall back to anonymous when the cookie is dead (`fallback_anon`) | off by default: return an error so you notice right away that the account needs replacing. On: keep going, but 3.1 Pro is silently downgraded to 3.5 Flash-Lite and the reasoning chain disappears |
 | New protocol (`web_channel`) | off by default. When on, chats go through processSession (WebChannel), the interface the current web app uses, instead of the legacy StreamGenerate. Same backend, different transport. The legacy interface still works; turn this on if it breaks. Text, image input, image generation and anonymous use are tested; multi-turn resume still uses the legacy interface, and extended thinking does not take effect on the new protocol yet (the normal tier is reported). |
-| Static proxy | fallback when the proxy pool is empty; normally use the Proxy pool page |
+| Browser transport (`browser_transport`) | off by default. When on, chat requests go through a resident real browser (Chromium CDP + in-page streaming `fetch`): TLS/JS fingerprint is identical to a real browser, and cookies live in the browser jar which refreshes `SIDCC` automatically (no more `/RotateCookies` racing). Off by default because a resident Chromium costs ~1.45 GB RAM — enable it when you need a real browser fingerprint. Policy M1 single sticky account: `authuser=0..9` under the same cookie identity share one `/app` tab; switching happens only when the resident account is disabled/deleted/401-403 or enters a `strict_model` cooldown, under a 30 s minimum cooldown. |
+| Fall back to HTTP when the browser is unavailable (`browser_fallback_http`) | off by default: with `browser_transport` on, if no Chromium/Chrome/Edge can be found or launched, requests return HTTP 502 `browser_unavailable` with an actionable hint — never silently degrade to plain Go HTTP (the whole point of the feature is the browser fingerprint; silently falling back would make it a no-op). Set `true` to fall back to the plain Go HTTP path when the browser is absent. |
 | Request logging | |
 
 Every value is range-checked on the server (for example `retry_attempts` accepts 1-10, timeouts 5-600 seconds) and illegal values are rejected with a reason — browser-side limits are trivial to bypass, so the real gate is server-side.
@@ -537,7 +538,14 @@ All flags:
 | `--cookie-file` | imports the cookie in this file into the cookie pool at startup |
 | `--proxy` | imports this proxy into the proxy pool at startup |
 | `--impersonate` | TLS fingerprint profile |
+| `--browser-path` | explicit Chromium/Chrome/Edge executable (deploy-only, same as `BROWSER_PATH`) |
+| `--browser-profile-dir` | explicit browser profile dir (deploy-only, same as `BROWSER_PROFILE_DIR`, default `<db dir>/browser-profile`) |
 | `--version` | print version and exit (this is what the Docker healthcheck runs) |
+
+> `browser_path` / `browser_profile_dir` are **deploy-level** settings and deliberately
+> stay out of the admin panel's runtime config: `/admin` is unauthenticated by default,
+> so a panel-writable browser executable path would be local arbitrary command execution.
+
 
 ## Cookie (optional)
 

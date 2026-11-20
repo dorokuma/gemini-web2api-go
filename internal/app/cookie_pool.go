@@ -553,9 +553,11 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 		name = "直连"
 	}
 
-	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了
+	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了。
+	// 管理面板的 Cookie 检测是辅助入口：allowSwitch=false，浏览器路径
+	// 驻留号坏了直接回错回退纯 Go HTTP，不偷换驻留 jar。
 	invalidateXSRF(a.Cookie)
-	_, err = getXSRF(a.Cookie, a.AuthUser, proxyURL)
+	_, err = getXSRFSwitch(a.Cookie, a.AuthUser, proxyURL, false)
 	took := time.Since(t0).Milliseconds()
 	if err != nil {
 		// 断网、被拦这类不是 cookie 的错，不动健康度（也不算成功）

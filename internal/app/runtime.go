@@ -80,6 +80,17 @@ type RuntimeConfig struct {
 	// StreamKeepaliveSec 是流式请求连续空闲多少秒就发一次保活（#70），0 = 关（默认）。
 	// 开了之后慢请求会先开流，失败只能在流里报错、HTTP 状态码锁成 200，见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
+	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch）。
+	// 默认 false：不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。
+	// 关掉时 saveRuntimeConfig 会异步 shutdownBrowser() 立刻回收内存。见 browser.go。
+	BrowserTransport bool `json:"browser_transport"`
+	// BrowserFallbackHTTP 决定浏览器不可用（没装/拉不起来/连接失败）时怎么办。
+	// 默认 false：返回 502 browser_unavailable，绝不静默降级回纯 Go HTTP——
+	// 开 browser_transport 图的就是浏览器指纹，悄悄换回 Go 指纹等于功能名存实亡。
+	// 显式开 true 才回退原有纯 Go HTTP 路径。
+	BrowserFallbackHTTP bool `json:"browser_fallback_http"`
+	// 安全红线：BrowserPath / BrowserProfileDir 绝不进 RuntimeConfig。
+	// /admin 在 127.0.0.1 默认免鉴权，面板可写浏览器可执行路径等于本地任意命令执行。
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -122,6 +133,8 @@ func initRuntimeConfig() {
 		StrictModel:            cfg.StrictModel,
 		StrictModelCooldownMin: cfg.StrictModelCooldownMin,
 		StreamKeepaliveSec:     cfg.StreamKeepaliveSec,
+		BrowserTransport:       cfg.BrowserTransport,
+		BrowserFallbackHTTP:    cfg.BrowserFallbackHTTP,
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
@@ -198,8 +211,14 @@ func saveRuntimeConfig(next RuntimeConfig) error {
 		return err
 	}
 	rtMu.Lock()
+	wasOn := rtVal.BrowserTransport
 	rtVal = next
 	rtMu.Unlock()
+	// browser_transport 被关掉时立刻回收常驻浏览器：~1.45GB 内存不该
+	// 因为一个面板开关继续白占着。异步做，别把 HTTP 响应等住。
+	if wasOn && !next.BrowserTransport {
+		go shutdownBrowser()
+	}
 	logf("[config] 运行时配置已更新")
 	return nil
 }

@@ -93,7 +93,7 @@ func videoQuotaFor(a CookieAccount, now time.Time, lookback time.Duration) accou
 	sapisid := extractSAPISID(a.Cookie)
 	var xsrf string
 	err := viaSlot(a, func(proxyURL string) (err error) {
-		xsrf, err = getXSRF(a.Cookie, a.AuthUser, proxyURL)
+		xsrf, err = getXSRFSwitch(a.Cookie, a.AuthUser, proxyURL, false)
 		return err
 	})
 	if err != nil {
@@ -236,7 +236,7 @@ func listConversations(cookie, sapisid, xsrf, proxyURL string, n, authuser int) 
 	h := buildGeminiHeaders(cookie, sapisid, "")
 	setAuthUserHeaders(h, authuser)
 	delete(h, "x-goog-ext-525001261-jspb")
-	st, _, body, err := uploadPost(ep, h, []byte(form.Encode()), proxyURL)
+	st, _, body, err := uploadPostAux(ep, h, []byte(form.Encode()), proxyURL)
 	if err != nil {
 		return nil, err
 	}
