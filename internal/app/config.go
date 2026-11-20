@@ -74,6 +74,23 @@ type Config struct {
 	StrictModelCooldownMin int `json:"strict_model_cooldown_min"`
 	// 流式保活间隔（秒），0 = 关（默认）。见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
+
+	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch），
+	// 见 browser.go。默认 false：不主动拉起 Chromium（常驻约 1.45 GB 内存），
+	// 需要浏览器指纹/页内上下文时才开。
+	BrowserTransport bool `json:"browser_transport"`
+	// BrowserFallbackHTTP 决定 browser_transport 开着但本机找不到/拉不起浏览器时
+	// 怎么办。默认 false：绝不静默降级回纯 Go HTTP（浏览器指纹是开这个功能的
+	// 目的，悄悄换回 Go 指纹等于功能名存实亡），直接回 502 browser_unavailable；
+	// 显式开 true 才回退原有纯 Go HTTP 路径。
+	BrowserFallbackHTTP bool `json:"browser_fallback_http"`
+	// BrowserPath 显式指定 Chromium/Chrome/Edge 可执行文件路径，空 = 自动探测。
+	// 部署期只读（config.json / --browser-path / BROWSER_PATH），不进 RuntimeConfig：
+	// /admin 在 127.0.0.1 默认免鉴权，面板可写它等于本地任意可执行文件执行。
+	BrowserPath string `json:"browser_path"`
+	// BrowserProfileDir 显式指定浏览器 profile 目录，空 = <db 目录>/browser-profile。
+	// 同 BrowserPath，部署期只读。
+	BrowserProfileDir string `json:"browser_profile_dir"`
 }
 
 var (
@@ -122,6 +139,10 @@ func defaultConfig() Config {
 		FirefoxFingerprint:     false,
 		StrictModel:            false,
 		StrictModelCooldownMin: 300,
+		BrowserTransport:       false,
+		BrowserFallbackHTTP:    false,
+		BrowserPath:            "",
+		BrowserProfileDir:      "",
 	}
 }
 

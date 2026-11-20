@@ -121,6 +121,26 @@ func uploadPost(url string, headers map[string]string, body []byte, proxyURL str
 
 func uploadPostCtx(ctx context.Context, url string, headers map[string]string, body []byte, proxyURL string) (
 	int, map[string]string, []byte, error) {
+	// 浏览器传输模式：gemini.google.com 同源的 batchexecute / StreamGenerate
+	// 走页内 fetch（cookie jar 由浏览器管，跟页内请求天然一致）。跨域的上传
+	// host（push.clients6.google.com）页内 fetch 也行，但 CORS 复杂，仍走 Go。
+	if shouldUseBrowserTransport() && strings.HasPrefix(url, "https://gemini.google.com") {
+		acct := browserAccountFromHeaders(headers)
+		status, b, err := browserMgr.doBrowserPost(ctx, acct, url, headers, body, nil)
+		if err != nil {
+			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+				return 0, nil, nil, err
+			}
+			if isBrowserLocalError(err) {
+				logf("[upload] 浏览器 POST 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+			} else {
+				return 0, nil, nil, err
+			}
+		} else {
+			// 页内 fetch 拿到的响应头是 map，压成跟 Go 侧一致的小写键。
+			return status, map[string]string{}, b, nil
+		}
+	}
 	if proxyURL != "" {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 		if err != nil {

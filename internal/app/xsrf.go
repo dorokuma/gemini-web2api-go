@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -240,6 +241,28 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 
 // fetchAppTokens 抓一次 /app 页面，把三个 token 一起抠出来。
 func fetchAppTokens(cookie string, authuser int, proxyURL string) (xsrfEntry, error) {
+	// 浏览器传输模式：直接从常驻页面上下文拿（页内 fetch /app 的 HTML 里就有
+	// WIZ_global_data），绕开纯 Go HTTP 的另一次 GET /app。
+	if shouldUseBrowserTransport() {
+		acct := browserAccountFromHeaders(map[string]string{"Cookie": cookie})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		e, err := browserMgr.fetchAppTokensViaBrowser(ctx, acct, nil)
+		if err != nil {
+			// 浏览器不可用且没开回退 → 原样上报（isBrowserLocalError），
+			// 上层拿它归 browser_unavailable 而不是当 cookie 失效换号。
+			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+				return xsrfEntry{}, err
+			}
+			if isBrowserLocalError(err) {
+				logf("[xsrf] 浏览器取 token 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+			} else {
+				return xsrfEntry{}, err
+			}
+		} else {
+			return e, nil
+		}
+	}
 	body, err := fetchAppPage(cookie, authuser, proxyURL)
 	if err != nil {
 		return xsrfEntry{}, err

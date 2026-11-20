@@ -545,11 +545,19 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		}
 		acct = a
 	} else if !anonFirstEligible(mc, len(pending) > 0) {
-		a, s, err := pickAccountForModel(mc, exclude)
-		if err != nil {
-			return &StreamResult{}, err
+		if shouldUseBrowserTransport() {
+			// 策略 M1：常驻浏览器有粘性主号且它还能用时，优先继续驻留
+			// （同 cookieIdentity 的 authuser=0..9 共用同一 /app Tab），
+			// 不轻易切号——切一次就是 30s 冷却 + 清种 cookie。
+			acct = stickyResidentAccount(exclude)
 		}
-		acct, skip = a, s
+		if acct == nil {
+			a, s, err := pickAccountForModel(mc, exclude)
+			if err != nil {
+				return &StreamResult{}, err
+			}
+			acct, skip = a, s
+		}
 	}
 	preferProxy := int64(0)
 	if acct != nil {
@@ -953,7 +961,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			lastErr = err
 			// 出错话术不记进代理健康度：匿名直连也一样出，跟出口无关，算进去会误熔断。
-			if pickedOK && !errors.Is(err, errUpstreamFailureReply) {
+			// 浏览器自身错误（browser_unavailable）同理：那是本地浏览器层的问题，
+			// 跟出口质量无关，也不该算 cookie 的错。
+			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
 				recordProxyResult(picked.ID, false, err.Error())
 			}
 			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
@@ -978,6 +988,16 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
+				// 浏览器模式下顺带让常驻页刷新一次 /app 上下文：页内 fetch /app
+				// 拿到的 HTML 里就是新 token（WIZ_global_data 随响应刷新）。
+				// 刷新失败不阻塞——getXSRF 的浏览器路径本身就会再取一次。
+				if shouldUseBrowserTransport() {
+					if a := browserAccountFromHeaders(geminiHeaders); a != nil {
+						rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+						_ = browserMgr.reloadResidentPage(rctx, a)
+						rcancel()
+					}
+				}
 				if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
 					xsrfToken = tok // 同步给收尾：phantomCleanup 按闭包取当前值
 					body = buildBody(tok)
@@ -991,7 +1011,8 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 200))
 			lastStatus = statusCode
-			if pickedOK {
+			// 浏览器自身问题回的非 200（不该发生，但保险）也不扣出口分。
+			if pickedOK && !isBrowserLocalError(lastErr) {
 				recordProxyResult(picked.ID, false, lastErr.Error())
 			}
 			if tracker.emitted != "" || rtracker.emitted != "" {
@@ -1392,6 +1413,35 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 	watch := newStallWatch(ctx, stallLimit())
 	defer watch.done()
 	ctx = watch.ctx
+	// 常驻真实浏览器传输层：开着时一律走页内 fetch——浏览器的意义就是指纹一致，
+	// 有代理也照走（流量经 browserProxyBridge 的 CONNECT 隧道转给当前上游代理）。
+	if shouldUseBrowserTransport() {
+		acct := browserAccountFromHeaders(headers)
+		status, pr, err := browserMgr.doBrowserStreamRequest(ctx, acct, endpoint, "POST", headers, []byte(body), nil)
+		if err != nil {
+			// 浏览器不可用（没装/拉不起来/CDP 断）：默认绝不静默降级回纯 Go HTTP，
+			// 由 upstreamReason 归到 browser_unavailable 给 502；显式开了
+			// browser_fallback_http 才落回下面的纯 Go 路径。
+			if isBrowserLocalError(err) && !rtCfg().BrowserFallbackHTTP {
+				return 0, nil, 0, nil, err
+			}
+			if isBrowserLocalError(err) {
+				logf("[browser] 不可用，本次回退纯 Go HTTP（browser_fallback_http 已开）: %v", err)
+			} else {
+				return 0, nil, 0, nil, watch.explain(err)
+			}
+		} else {
+			defer pr.Close() // Close 会 unregister + Abort 页内 fetch
+			raw, ttfb, err := readModelCheckedBodyMode(
+				stopReader{heardReader{pr, watch}, stop}, onLine, sendAt, status,
+				headers["x-goog-ext-525001261-jspb"], taskMode)
+			if err != nil {
+				// raw 原样回传：已到的首帧可能带 c_xxx，上层 phantomCleanup 要靠它。
+				return status, raw, ttfb, nil, watch.explain(err)
+			}
+			return status, raw, ttfb, nil, nil
+		}
+	}
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
 		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
@@ -1788,7 +1838,27 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	var locHeader string
 	var err error
 
-	if proxyURL != "" {
+	if shouldUseBrowserTransport() {
+		// 浏览器传输模式：页内 fetch 探测，跟正式请求同一条链路。
+		acct := browserAccountFromHeaders(headers)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		status, b, e := browserMgr.doBrowserPost(ctx, acct, endpoint, headers, []byte(body), nil)
+		cancel()
+		if e != nil {
+			if isBrowserLocalError(e) {
+				res.Status = "network_error"
+				res.HTTPCode = 502
+				res.Diagnostic = "常驻浏览器不可用: " + e.Error() +
+					"。请安装 Chromium 或配置 browser_path；browser_fallback_http 开时才回退纯 Go HTTP"
+				return res
+			}
+			res.Status = "network_error"
+			res.Diagnostic = "网络层错误: " + e.Error()
+			return res
+		}
+		statusCode = status
+		raw = b
+	} else if proxyURL != "" {
 		req, e := http.NewRequest("POST", endpoint, strings.NewReader(body))
 		if e != nil {
 			res.Status = "network_error"

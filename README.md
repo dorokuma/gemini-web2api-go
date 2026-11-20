@@ -508,6 +508,8 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 无可用代理时退回直连（`fallback_direct`） | 默认关：代理全满或全熔断时直接报错，本机 IP 不暴露给上游。开：可用性优先，但上游会看到本机出口 |
 | cookie 失效时降级匿名（`fallback_anon`） | 默认关：直接报错，能立刻发现该换号了。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失 |
 | 新协议（`web_channel`） | 默认关。开启后对话改走网页新版用的 processSession（WebChannel）接口，而不是老的 StreamGenerate。后端是同一个，只换传输方式；老接口目前仍正常，老接口出问题时再打开。文本、看图、生图、匿名都已实测；多轮续接仍走老接口；扩展思考在新协议上暂时不生效（回报普通档）。 |
+| 浏览器传输（`browser_transport`） | 默认关。开启后对话请求改走常驻真实浏览器（Chromium CDP + 页内流式 `fetch`），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管自动续期。默认不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。策略 M1 单常驻粘性主号：同一份登录态下 `authuser=0..9` 共用一个 `/app` Tab，驻留号失效/停用/该模型 `strict_model` 冷却时才在 30s 最小冷却下切号。 |
+| 浏览器缺席时回退 HTTP（`browser_fallback_http`） | 默认关：`browser_transport` 开着但本机找不到或拉不起浏览器时，请求直接回 502 `browser_unavailable`，绝不静默降级回纯 Go HTTP（开这个功能图的就是浏览器指纹，悄悄换回 Go 等于没开）。显式开 `true` 才回退原有纯 Go HTTP 路径。 |
 | 打印请求日志 | |
 
 所有值都在后端做范围校验（比如 `retry_attempts` 只接受 1-10、超时 5-600 秒），
@@ -557,6 +559,11 @@ Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。�
 | `--cookie-file` | 启动时把文件里的 cookie 导入 Cookie 池 |
 | `--proxy` | 启动时把这个代理导入代理池 |
 | `--impersonate` | TLS 指纹档位 |
+| `--browser-path` | 显式 Chromium/Chrome/Edge 可执行路径（部署级只读，等价 `BROWSER_PATH`） |
+| `--browser-profile-dir` | 显式浏览器 profile 目录（部署级只读，等价 `BROWSER_PROFILE_DIR`，默认 `<db 目录>/browser-profile`） |
+
+> `browser_path` / `browser_profile_dir` 是**部署级**配置，刻意不进管理面板的运行时设置：
+> `/admin` 默认免鉴权，面板可写浏览器可执行路径等于本地任意命令执行。
 | `--version` | 打印版本退出（Docker healthcheck 用的就是它） |
 
 ## Cookie（可选）

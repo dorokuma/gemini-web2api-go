@@ -44,10 +44,13 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		modelNames = append(modelNames, n)
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"status":       "ok",
-		"version":      Version,
-		"models":       modelNames,
-		"capabilities": map[string]bool{"account_proxy_binding": true},
+		"status":  "ok",
+		"version": Version,
+		"models":  modelNames,
+		"capabilities": map[string]bool{
+			"account_proxy_binding": true,
+			"browser_transport":     true,
+		},
 	})
 }
 

@@ -631,6 +631,12 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 				"admin_auth":  cfg.AdminToken != "",
 				// 面板的部署配置表要展示 Key 是否被启动参数锁死
 				"api_key_locked": apiKeyLocked,
+				// 浏览器传输层的部署级配置与实时状态（只读；browser_path /
+				// browser_profile_dir 绝不进 RuntimeConfig，见 runtime.go 红线）。
+				"browser_path":        cfg.BrowserPath,
+				"browser_profile_dir": cfg.BrowserProfileDir,
+				"browser_detected":    browserDetected(),
+				"browser_running":     browserRunning(),
 			},
 		})
 	case http.MethodPut:
@@ -681,6 +687,10 @@ func classifyError(errStr string) string {
 		return "blocked_sorry"
 	case strings.Contains(errStr, "upstream HTTP 429"):
 		return "upstream_429"
+	case strings.Contains(errStr, "[browser_unavailable]"), strings.Contains(errStr, "browser:"):
+		// 常驻浏览器没装/拉不起来：不是上游问题也不是出口问题，面板单列一类。
+		// "browser:" 是 browserLocalError.Error() 的统一前缀（见 browser.go）。
+		return "browser_unavailable"
 	case strings.Contains(errStr, "upstream HTTP"):
 		return "upstream_http_error"
 	case strings.Contains(errStr, "unknown model"), strings.Contains(errStr, "not supported"):

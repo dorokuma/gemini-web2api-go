@@ -44,10 +44,12 @@ type cdpClient struct {
 
 	// 事件分发：按 method 精确匹配注册。同一个 method 允许多个监听器
 	// （崩溃自愈和流式管道都要听 Inspector.targetCrashed 一类的信号时
-	// 不必互相覆盖）。
-	evtMu      sync.RWMutex
-	handlers   map[string][]func(cdpEvent)
-	anyHandler func(cdpEvent) // 兜底监听器，nil = 不要
+	// 不必互相覆盖）。onceHandlers 是触发一次就摘除的监听器（waitPageLoad
+	// 这类「等一次事件」的场景，反复注册会累积）。
+	evtMu        sync.RWMutex
+	handlers     map[string][]func(cdpEvent)
+	onceHandlers map[string][]func(cdpEvent)
+	anyHandler   func(cdpEvent) // 兜底监听器，nil = 不要
 
 	err     error // 连接死后的终态错误，给后续 Call 立刻返回
 	errOnce sync.Once
@@ -58,10 +60,11 @@ type cdpClient struct {
 // wsURL 仅供错误信息用。
 func newCDPClient(conn *cdpConn) *cdpClient {
 	c := &cdpClient{
-		conn:     conn,
-		pending:  map[int64]chan cdpReply{},
-		handlers: map[string][]func(cdpEvent){},
-		done:     make(chan struct{}),
+		conn:         conn,
+		pending:      map[int64]chan cdpReply{},
+		handlers:     map[string][]func(cdpEvent){},
+		onceHandlers: map[string][]func(cdpEvent){},
+		done:         make(chan struct{}),
 	}
 	go c.readLoop()
 	return c
@@ -79,6 +82,14 @@ func (c *cdpClient) On(method string, fn func(cdpEvent)) {
 func (c *cdpClient) OnAny(fn func(cdpEvent)) {
 	c.evtMu.Lock()
 	c.anyHandler = fn
+	c.evtMu.Unlock()
+}
+
+// Once 注册一个只触发一次的 method 监听器：第一次匹配事件到达时调用 fn 后
+// 自动摘除。用于「等一次事件」的场合（Page.loadEventFired），避免反复注册累积。
+func (c *cdpClient) Once(method string, fn func(cdpEvent)) {
+	c.evtMu.Lock()
+	c.onceHandlers[method] = append(c.onceHandlers[method], fn)
 	c.evtMu.Unlock()
 }
 
@@ -214,11 +225,18 @@ func (c *cdpClient) dispatch(payload []byte) {
 	}
 	// 事件
 	evt := cdpEvent{SessionID: head.SessionID, Method: head.Method, Params: head.Params}
-	c.evtMu.RLock()
+	c.evtMu.Lock()
 	fns := append([]func(cdpEvent){}, c.handlers[head.Method]...)
+	onces := c.onceHandlers[head.Method]
+	if len(onces) > 0 {
+		delete(c.onceHandlers, head.Method) // 触发即摘除，不管 fn 是否真用到
+	}
 	any := c.anyHandler
-	c.evtMu.RUnlock()
+	c.evtMu.Unlock()
 	for _, fn := range fns {
+		fn(evt)
+	}
+	for _, fn := range onces {
 		fn(evt)
 	}
 	if any != nil {

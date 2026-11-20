@@ -279,14 +279,17 @@ func (m *browserManager) doStart() error {
 	m.client = client
 	m.registerCDPEvents(client)
 
-	// attach 到 browser target 下默认创建的 page（about:blank 已经载入）。
+	// attach 到 browser target 下创建的 page。主 Tab 必须停在
+	// https://gemini.google.com/app：页内 fetch 是同源请求，没有 CORS 拦截
+	// （about:blank origin 发 fetch 会被 Chromium 按跨域拒掉——Failed to fetch）。
 	// flatten 模式让所有会话消息都走同一条 WS、用 sessionId 路由——
 	// 不开 flatten 每条 session 要单独连接，不符合我们单 WS 的假设。
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
-	if err := client.callCDPWithTimeout(context.Background(), 10*time.Second, "",
-		"Target.createTarget", map[string]interface{}{"url": "about:blank"}, &created); err != nil {
+	if err := client.callCDPWithTimeout(context.Background(), 15*time.Second, "",
+		"Target.createTarget",
+		map[string]interface{}{"url": "https://gemini.google.com/app"}, &created); err != nil {
 		client.Close()
 		killBrowserProcessGroup(proc.PID, proc.PGID, 1500*time.Millisecond)
 		bridge.Shutdown(context.Background())
@@ -358,9 +361,13 @@ func browserLaunchArgs(profileDir string, bridgePort int) []string {
 	return args
 }
 
-// browserProfileDir 决定 profile 落点。跟 DBPath 同级放 browser-profile/，
-// 升级/容器重建时跟数据一起挂卷就活了；显式 BROWSER_PROFILE_DIR 可覆盖。
+// browserProfileDir 决定 profile 落点。优先级：--browser-profile-dir /
+// config.json browser_profile_dir > BROWSER_PROFILE_DIR 环境变量 >
+// <db 目录>/browser-profile（跟 DBPath 同级放，升级/容器重建跟数据一起挂卷）。
 func browserProfileDir() (string, error) {
+	if cfg.BrowserProfileDir != "" {
+		return cfg.BrowserProfileDir, nil
+	}
 	if env := os.Getenv("BROWSER_PROFILE_DIR"); env != "" {
 		return env, nil
 	}
@@ -371,17 +378,119 @@ func browserProfileDir() (string, error) {
 	return filepath.Join(base, "browser-profile"), nil
 }
 
-// cfgBrowserPath 取配置里的显式浏览器路径（config.json 的 browser_path，
-// 运行时不可改——改浏览器路径本来就要重启）。RuntimeConfig 不存它。
+// cfgBrowserPath 取配置里的显式浏览器路径（--browser-path / config.json 的
+// browser_path > BROWSER_PATH 环境变量；运行时不可改——改浏览器路径本来就要
+// 重启）。RuntimeConfig 不存它，/admin 默认免鉴权，面板可写等于本地任意
+// 可执行文件执行。
 func cfgBrowserPath() string {
-	var m map[string]interface{}
-	if raw := kvGet("config_extra"); raw != "" {
-		_ = json.Unmarshal([]byte(raw), &m)
-		if v, _ := m["browser_path"].(string); v != "" {
-			return v
-		}
+	if cfg.BrowserPath != "" {
+		return cfg.BrowserPath
 	}
 	return os.Getenv("BROWSER_PATH")
+}
+
+// shouldUseBrowserTransport 是业务接线的总开关判断：browser_transport 开着才
+// 走浏览器路径；关掉时一切照旧（默认就是关，零开销）。
+func shouldUseBrowserTransport() bool {
+	return rtCfg().BrowserTransport
+}
+
+// browserAccountFromHeaders 从请求头里的 Cookie 反查池子里的账号：
+// doGeminiRequestStopInner 只拿到 headers，而策略 M1 切号/写回都需要 *CookieAccount。
+// 按 cookieIdentity（SAPISID + __Secure-1PSID）匹配——账号的 *SIDCC 会被上游刷，
+// 按整串对不上。匿名请求（无 Cookie 头）返回 nil，走浏览器的匿名会话。
+func browserAccountFromHeaders(headers map[string]string) *CookieAccount {
+	c := headers["Cookie"]
+	if c == "" {
+		return nil
+	}
+	id := cookieIdentity(c)
+	if id == "|" {
+		return nil
+	}
+	for _, a := range accountList() {
+		if cookieIdentity(a.Cookie) == id {
+			cp := a
+			return &cp
+		}
+	}
+	return nil
+}
+
+// stickyResidentAccount 返回策略 M1 的常驻粘性主号：浏览器已播种且该号仍然
+// 启用、不在 exclude 里时，优先让它继续驻留（同 cookieIdentity 的 authuser=0..9
+// 共用同一 /app Tab）。不在 exclude 中的驻留号优先于 pickAccountForModel 的
+// 常规轮换——M1 的核心就是「能不动就不动」。
+// 浏览器还没起过（seed.AccountID==0）或驻留号该换时返回 nil，由调用方走常规挑号。
+func stickyResidentAccount(exclude map[int64]bool) *CookieAccount {
+	browserMgr.mu.Lock()
+	sid := browserMgr.seed.AccountID
+	browserMgr.mu.Unlock()
+	if sid == 0 || exclude[sid] {
+		return nil
+	}
+	a := accountByID(sid)
+	if a == nil || a.Status != "enabled" {
+		return nil
+	}
+	return a
+}
+
+// syncResidentCookiesBack 是 rotateAllAccounts 在浏览器模式下的替代路径：
+// 常驻浏览器自己就是 cookie 的权威 jar，上游刷的 SIDCC 它都收下了，
+// 不该再拿 DB 里的旧串去打 /RotateCookies 双端抢刷（刷了也进不了浏览器 jar）。
+// 这里把 jar 当前值立刻（绕过节流）写回 DB。
+func syncResidentCookiesBack() {
+	m := browserMgr
+	m.mu.Lock()
+	seed := m.seed
+	m.mu.Unlock()
+	if seed.AccountID == 0 {
+		return
+	}
+	// 绕过节流写回一次：轮转周期（分钟级）远大于 cookieSyncThrottle，不冲突。
+	m.mu.Lock()
+	m.lastCookieSync = time.Time{}
+	m.mu.Unlock()
+	m.syncCookiesBack()
+}
+
+// reloadResidentPage 在 XSRF 400 这类「页面 token 失效」时让主 Tab 重新拿一份
+// /app 上下文：fetch /app 页面本身就能让 WIZ_global_data 刷新（见
+// fetchAppTokensViaBrowser 的注释——页内 fetch 拿到的 HTML 里就有新 token）。
+// 调它等价于作废本地 XSRF 缓存后重取，调用方负责 invalidateXSRF。
+func (m *browserManager) reloadResidentPage(ctx context.Context, account *CookieAccount) error {
+	_, err := m.fetchAppTokensViaBrowser(ctx, account, nil)
+	return err
+}
+
+// shutdownBrowser 回收常驻浏览器。saveRuntimeConfig 在 browser_transport 被
+// 关掉时异步调用（关掉就该立刻释放 ~1.45GB 内存，不该等下次进程重启）。
+// 幂等；浏览器没起过时直接返回。
+func shutdownBrowser() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	browserMgr.Shutdown(ctx)
+}
+
+// browserRunning 报告常驻浏览器当前是否活着（管理面板只读展示用）。
+func browserRunning() bool {
+	browserMgr.mu.Lock()
+	defer browserMgr.mu.Unlock()
+	return browserMgr.proc != nil && browserMgr.client != nil && pidAlive(browserMgr.proc.PID)
+}
+
+// browserDetected 探测本机可用的浏览器路径。管理面板只读展示用；
+// 显式配置了 browser_path 时原样返回（探测失败会在拉起时才暴露）。
+func browserDetected() string {
+	if p := cfgBrowserPath(); p != "" {
+		return p
+	}
+	p, err := discoverBrowserBinary("")
+	if err != nil {
+		return ""
+	}
+	return p
 }
 
 // waitDevToolsPort 等 Chromium 把 DevToolsActivePort 写进 profileDir。
@@ -476,8 +585,9 @@ func (m *browserManager) recreateTab() {
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
+	// 同 doStart：主 Tab 停在 /app，页内 fetch 才能同源。
 	if err := client.Call(ctx, "", "Target.createTarget",
-		map[string]interface{}{"url": "about:blank"}, &created); err != nil {
+		map[string]interface{}{"url": "https://gemini.google.com/app"}, &created); err != nil {
 		logf("[browser] recreate target failed: %v", err)
 		return
 	}
@@ -526,8 +636,13 @@ func (m *browserManager) enablePageDomain() error {
 // 参数直接序列化成字符串，不用劫持 console 也不用收日志噪声；而且
 // Runtime.addBinding 是 CDP 专门为「页面→外部」设计的机制。
 func (m *browserManager) installBridge() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	// addBinding 只对未来/现存 context 生效；页面加载中的旧 context 销毁后
+	// binding 随之消失，所以必须等页面就位（waitPageLoad）再注册——否则
+	// __gwPush 在加载完的 document 里是 undefined，push 全部被 JS 里的
+	// try/catch 静默吞掉，流永远等不到 headers（实测就是这么挂死的）。
+	m.waitPageLoad(ctx)
 	if err := m.client.Call(ctx, m.sessionID, "Runtime.addBinding",
 		map[string]interface{}{"name": "__gwPush"}, nil); err != nil {
 		return browserErr("addBinding: %w", err)
@@ -586,8 +701,93 @@ func (m *browserManager) installBridge() error {
     }
   };
 })();`
-	return m.client.Call(ctx, m.sessionID, "Page.addScriptToEvaluateOnNewDocument",
-		map[string]interface{}{"source": src}, nil)
+	// 两条腿：addScriptToEvaluateOnNewDocument 保证**将来的导航**仍有桥；
+	// 但当前页面的 document 可能已经在加载中（createTarget 带 url 就开了导航），
+	// 钩子的时序不保证赶得上这第一页——所以等 load 后再就地 evaluate 注入一次，
+	// 覆盖两种时序（重复注入幂等，window.__gwBridge 覆盖无副作用）。
+	if err := m.client.Call(ctx, m.sessionID, "Page.addScriptToEvaluateOnNewDocument",
+		map[string]interface{}{"source": src}, nil); err != nil {
+		return err
+	}
+	return m.client.Call(ctx, m.sessionID, "Runtime.evaluate",
+		map[string]interface{}{"expression": src, "awaitPromise": false}, nil)
+}
+
+// ensureBridge 确认当前页上下文里 __gwPush（binding）与 __gwBridge（fetch 桥）
+// 都在；任一缺失就重跑 installBridge（幂等）。这是 doBrowserStreamRequest 的
+// 每次前置检查——CDP addBinding/addScriptToEvaluateOnNewDocument 只对之后的
+// context 生效，页面导航会重建 context 把注入丢掉，靠一次 install 的时序
+// 永远有缝（实测 install 时页面还在 loading，注入落到旧 context）。
+func (m *browserManager) ensureBridge(ctx context.Context) error {
+	m.mu.Lock()
+	client := m.client
+	sess := m.sessionID
+	m.mu.Unlock()
+	if client == nil {
+		return browserErr("cdp client gone")
+	}
+	var out struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := client.Call(cctx, sess, "Runtime.evaluate",
+		map[string]interface{}{
+			"expression":   `typeof __gwPush + "/" + typeof window.__gwBridge`,
+			"awaitPromise": false,
+		}, &out)
+	cancel()
+	if err == nil && out.Result.Value == "function/object" {
+		return nil
+	}
+	logf("[browser] 桥不完整（%q），重新注入", out.Result.Value)
+	return m.installBridge()
+}
+
+// waitPageLoad 等当前主 Tab 到可注入状态：document.readyState 已经
+// interactive/complete 就直接返回；否则等 Page.loadEventFired（Once，触发即摘）。
+// 超时只记日志不报错——注入失败会在后续 fetch 时以「无 push」暴露，
+// 不该让整个启动失败。
+func (m *browserManager) waitPageLoad(ctx context.Context) {
+	m.mu.Lock()
+	client := m.client
+	sess := m.sessionID
+	m.mu.Unlock()
+	if client == nil {
+		return
+	}
+	// 先查 readyState：页面可能已经加载完（loadEventFired 在我们注册前就发了，
+	// 等一个已经发生的事件会空等超时）。
+	var ready struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)
+	err := client.Call(rctx, sess, "Runtime.evaluate",
+		map[string]interface{}{"expression": "document.readyState", "awaitPromise": false}, &ready)
+	rcancel()
+	if err == nil && (ready.Result.Value == "interactive" || ready.Result.Value == "complete") {
+		return
+	}
+	done := make(chan struct{}, 1)
+	// Once：触发即摘除，不会随 installBridge 重入累积。
+	client.Once("Page.loadEventFired", func(evt cdpEvent) {
+		if evt.SessionID == "" || evt.SessionID == sess {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+	})
+	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	select {
+	case <-done:
+	case <-lctx.Done():
+		logf("[browser] 等页面 load 超时（继续，桥将在下次导航时注入）")
+	}
 }
 
 // ─── Cookie 播种 / 反向同步 / 策略 M1 切号 ───────────────────────────────────
@@ -1042,6 +1242,13 @@ func (m *browserManager) doBrowserStreamRequest(ctx context.Context,
 		}
 	}
 
+	// 桥健康检查：addBinding/addScript 都只对「之后的 context」生效，页面导航
+	// 会重建 context 丢掉注入——每次 fetch 前确认 __gwPush/__gwBridge 都在，
+	// 不在就重装桥（幂等，重复注入无副作用）。这一步扛住所有时序竞争。
+	if err := m.ensureBridge(ctx); err != nil {
+		return 0, nil, err
+	}
+
 	s := newBrowserStream()
 	m.registerStream(s)
 
@@ -1158,13 +1365,14 @@ func (sc *streamReadCloser) Close() error {
 
 // ─── 非流式辅助 ─────────────────────────────────────────────────────────────
 
-// doBrowserPost 是一次性非流式 POST（取 XSRF、上传、删除会话等）。
+// doBrowserFetch 是一次性非流式请求（取 XSRF、/app 页面、上传、删除会话等）。
 // 跟 doBrowserStreamRequest 共用管道，但把 body 一次性读完——这些响应
-// 都小（几 KB 到几百 KB），全读进内存比开流划算。
-func (m *browserManager) doBrowserPost(ctx context.Context,
-	account *CookieAccount, fetchURL string, headers map[string]string, body []byte,
+// 都小（几 KB 到几百 KB），全读进内存比开流划算。method 可以是 GET/POST——
+// /app 页面必须 GET（POST 实测回 405）。
+func (m *browserManager) doBrowserFetch(ctx context.Context,
+	account *CookieAccount, fetchURL, method string, headers map[string]string, body []byte,
 	exclude map[int64]bool) (int, []byte, error) {
-	status, rc, err := m.doBrowserStreamRequest(ctx, account, fetchURL, "POST", headers, body, exclude)
+	status, rc, err := m.doBrowserStreamRequest(ctx, account, fetchURL, method, headers, body, exclude)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1174,6 +1382,13 @@ func (m *browserManager) doBrowserPost(ctx context.Context,
 		return status, nil, err
 	}
 	return status, data, nil
+}
+
+// doBrowserPost 是 doBrowserFetch 的 POST 薄包，保留原签名。
+func (m *browserManager) doBrowserPost(ctx context.Context,
+	account *CookieAccount, fetchURL string, headers map[string]string, body []byte,
+	exclude map[int64]bool) (int, []byte, error) {
+	return m.doBrowserFetch(ctx, account, fetchURL, "POST", headers, body, exclude)
 }
 
 // fetchAppTokensViaBrowser 用浏览器 fetch 拿 xsrfEntry：
@@ -1200,8 +1415,9 @@ func (m *browserManager) fetchAppTokensViaBrowser(ctx context.Context,
 	if account != nil && account.AuthUser > 0 {
 		path = "/u/" + strconv.Itoa(account.AuthUser) + "/app"
 	}
-	status, body, err := m.doBrowserPost(ctx, account,
-		"https://gemini.google.com"+path,
+	// /app 页面必须 GET（POST 实测回 405），token 就在响应 HTML 的 WIZ_global_data。
+	status, body, err := m.doBrowserFetch(ctx, account,
+		"https://gemini.google.com"+path, "GET",
 		map[string]string{
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Accept-Language": "en-US,en;q=0.9",
@@ -1248,8 +1464,8 @@ func (m *browserManager) scheduleReconnect() {
 	m.started = false
 	m.readyCh = make(chan struct{})
 	m.ready.Store(false)
-	m.mu.Unlock()
-	// 上面已解锁；退避时长只在日志里体现
+	// 退避时长只在日志里体现；锁由 defer 统一释放，别再手动 Unlock
+	// （手动 + defer 是双重解锁，sync fatal）。
 	backoffs := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second}
 	idx := streak - 1
 	if idx >= len(backoffs) {
