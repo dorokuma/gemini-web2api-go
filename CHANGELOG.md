@@ -2,7 +2,7 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## Unreleased
+## 6.3.0 - 2026-11-21
 
 ### 新增
 
@@ -36,6 +36,40 @@
 
 - **`browserManager.scheduleReconnect` 双重 `mu.Unlock`**：函数既有 `defer m.mu.Unlock()`
   又在 return 前手动 `Unlock`，任何崩溃重连都会 `sync: unlock of unlocked mutex` fatal。
+- **本地代理桥（`browserProxyBridge`）SSRF 守卫**：CONNECT 目标严格校验——拒绝
+  指向本桥自身监听端口的自环连接（防 FD 耗尽）、`localhost` / `*.localhost`
+  （含 `localhost.` 等尾点 FQDN）、回环与未指定地址（`127.0.0.0/8` / `::1` /
+  `0.0.0.0` / `[::]`，含 `::ffff:127.0.0.1` 等 IPv4-mapped 形式经 `To4`
+  等价比较），以及含 `%` 的 IPv6 zone id（`[::1%lo]` 会让 `net.ParseIP`
+  返回 nil 逃逸回环判定、拨号却指向本机接口）；非 CONNECT 方法一律 405
+  （回环端口对 GET 回隧道成功等于开了零鉴权正向代理）。代理池非空且
+  `fallback_direct` 关闭时，即便本次请求分配到的出口为空串，桥也绝不
+  直连漏本机真实 IP（CONNECT 回 502）；`SetUpstream` 换出口或收紧直连
+  许可时递增出口代际并关闭全部旧代际隧道（Chromium 隧道复用很粘，
+  不关它新请求会继续走旧出口）。
+- **跨出口切换协调（`acquireBridgeExit` / `releaseBridgeExit`）**：共享代理桥
+  同一时刻只有一个「在飞出口」——同出口请求计数 +1 自由并发，跨出口请求
+  等旧在飞归零才 `SetUpstream` 切换，消除「请求 A 刚切到代理 B 还没派发
+  fetch，并发请求 B 就切到代理 C 并切断 A 的在飞隧道」的竞态。等待登记用
+  计数器不用布尔：只有真正的跨出口等待者占 `bridgeSwitchWaiters` 名额，
+  等待方被 `ctx` 取消只撤自己的登记，最后一名登记等待者离开时广播唤醒
+  被暂缓的同出口请求恢复自由并发——单人取消不会把健康同出口请求永久
+  挡死，无死锁、无计数泄漏（唤醒重查时在飞出口已变成目标出口的退化
+  路径同样先撤销登记再走自由并发）。
+- **CDP WebSocket 写帧终态断连（`sendTextCtx` / `sendPong`）**：写权经容量 1
+  信号量获取并全程绑调用方 `ctx`——持写权写入期间 `ctx` 取消，或写帧
+  超时/失败（5s 写超时、TCP 半断开），都可能已写出半帧/残帧，此时立刻
+  `Close()` 终态断连、绝不把残帧连接还给下一条消息复用（RFC 6455 下半帧
+  连接不可复用）。写 deadline 取 `min(5s, ctx 剩余)`，停机时排在阻塞写
+  后面的 Call 不再干等 5s 写锁拖穿停机预算。
+- **驻留 jar 并发混配与凭据泄漏**：请求路径的「驻留身份校验 + `Runtime.evaluate`
+  派发 fetch」统一持 `jarRW` 读锁，与 `maybeSwitchAccount` 的写锁
+  （写回旧号 Cookie → `clearBrowserCookies` → `seedAccount` 播种新号）互斥——
+  核完身份后切号写锁必须等到 fetch 已派发进当前 jar 才放行，彻底消除
+  「请求 A 带着刚切完的 B 号 Cookie 发出」的串号混配。最终身份守卫无条件
+  执行：点名账号的请求其 Cookie 身份必须与驻留 jar 一致才允许发（同
+  `cookieIdentity` 的不同 `authuser` 合法共用），且错误日志只输出账号
+  ID 整数，绝不带 `cookieIdentity` 明文凭据进日志与 API 响应。
 
 ## 6.2.2 - 2026-11-19
 
