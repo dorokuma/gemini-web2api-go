@@ -51,15 +51,15 @@ import (
 // 音乐、视频没测。
 const wcEndpoint = "https://geminiweb-pa.clients6.google.com/v1/processSession"
 
-// wcAckWait 是等 ofs=0 确认的上限，到点没等到也照发正文。
-const wcAckWait = 3 * time.Second
+// wcAckWait 是等 ofs=0 确认的上限，到点没等到也照发正文。测试里可改短。
+var wcAckWait = 3 * time.Second
 
-// wcPromptGap 是收到 ofs=0 确认之后、发正文之前再等的时间。
+// wcPromptGap 是收到 ofs=0 确认之后、发正文之前再等的时间。测试里可改短。
 //
 // 确认只说明收到了，不说明会话准备好了：确认后立即发正文，同一个号连续实测约 6 次只成 1 次，
 // 其余只回会话 id 和 rid、不生成，或回一句通用失败文案；隔 500ms 连续 5 次全成。浏览器在用户
 // 打字时就先发 ofs=0，正文通常隔几秒才到，所以这个间隔本来就在。
-const wcPromptGap = 500 * time.Millisecond
+var wcPromptGap = 500 * time.Millisecond
 
 // wcRequest 是一次新协议请求需要的全部输入。
 type wcRequest struct {
@@ -108,28 +108,55 @@ var (
 	wcKeyAt time.Time
 )
 
-func webChannelAPIKey(proxyURL string) (string, error) {
+func invalidateWebChannelAPIKey() {
 	wcKeyMu.Lock()
-	defer wcKeyMu.Unlock()
-	if wcKey != "" && time.Since(wcKeyAt) < wcKeyTTL {
-		return wcKey, nil
+	wcKey = ""
+	wcKeyAt = time.Time{}
+	wcKeyMu.Unlock()
+}
+
+func webChannelAPIKey(proxyURL string) (string, error) {
+	return webChannelAPIKeyCtx(context.Background(), proxyURL)
+}
+
+func webChannelAPIKeyCtx(ctx context.Context, proxyURL string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	body, err := fetchAppPage("", 0, proxyURL)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	wcKeyMu.Lock()
+	if wcKey != "" && time.Since(wcKeyAt) < wcKeyTTL {
+		k := wcKey
+		wcKeyMu.Unlock()
+		return k, nil
+	}
+	fallback := wcKey
+	wcKeyMu.Unlock()
+
+	body, err := fetchAppPageCtx(ctx, "", 0, proxyURL)
 	if err != nil {
-		if wcKey != "" {
-			return wcKey, nil // 抓页失败先用旧的，key 很少变
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if fallback != "" {
+			return fallback, nil // 抓页失败先用旧的，key 很少变
 		}
 		return "", fmt.Errorf("取 processSession API key: %w", err)
 	}
 	m := wcKeyRe.FindSubmatch(body)
 	if m == nil {
-		if wcKey != "" {
-			return wcKey, nil
+		if fallback != "" {
+			return fallback, nil
 		}
 		return "", errors.New("取 processSession API key: 页面里没有 d2zJAe")
 	}
-	wcKey, wcKeyAt = string(m[1]), time.Now()
-	return wcKey, nil
+	k := string(m[1])
+	wcKeyMu.Lock()
+	wcKey, wcKeyAt = k, time.Now()
+	wcKeyMu.Unlock()
+	return k, nil
 }
 
 // --- 请求头 ---
@@ -339,8 +366,18 @@ func (e *wcRedactedError) Temporary() bool {
 	return false
 }
 
-// wcSend 发一条请求。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
+// wcSend 发一条短 RPC 请求（握手/上行）。跟 doGeminiRequest 同一套出口规则：配了代理走 stdlib，直连走 tls-client。
 func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {
+	return wcSendWith(ctx, method, u, body, cookie, proxyURL, false)
+}
+
+// wcSendStream 发一条流式长轮询请求（下行 GET）：使用不限整次时长的 stream client，
+// 生命周期完全由调用方 ctx 与 stallWatch 沉默计时接管（与 doGeminiRequestStopMode 一致）。
+func wcSendStream(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcResp, error) {
+	return wcSendWith(ctx, method, u, body, cookie, proxyURL, true)
+}
+
+func wcSendWith(ctx context.Context, method, u, body, cookie, proxyURL string, stream bool) (*wcResp, error) {
 	headers := map[string]string{
 		"Accept":          "*/*",
 		"Accept-Language": "en-US,en;q=0.9",
@@ -367,7 +404,11 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		resp, err := getStdlibClient(proxyURL).Do(req)
+		client := getStdlibClient(proxyURL)
+		if stream {
+			client = getStdlibStreamClient(proxyURL)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, wcRedactErr(err)
 		}
@@ -381,7 +422,11 @@ func wcSend(ctx context.Context, method, u, body, cookie, proxyURL string) (*wcR
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := getTLSClient().Do(req)
+	client := getTLSClient()
+	if stream {
+		client = getTLSStreamClient()
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, wcRedactErr(err)
 	}
@@ -498,6 +543,9 @@ func wcClassify(p json.RawMessage) wcEvent {
 //
 //	[[[16,"Request is missing required authentication credential…"]]]
 //	[[{"error":{"code":400,"message":"Invalid JSON payload…"}}]]
+//
+// 兜底禁止拼入原始帧内容（防止未识别 200 帧经 requests.error / last_error / 502 响应外泄），
+// 只给出脱敏后的结构化诊断（字节数与 JSON 形态）。
 func wcParseStatus(p json.RawMessage) *wcStatusError {
 	var sm struct {
 		SM struct {
@@ -510,12 +558,15 @@ func wcParseStatus(p json.RawMessage) *wcStatusError {
 	first := sm.SM.Status[0][0]
 	var tuple []json.RawMessage
 	if json.Unmarshal(first, &tuple) == nil && len(tuple) >= 1 {
-		e := &wcStatusError{}
-		_ = json.Unmarshal(tuple[0], &e.Code)
-		if len(tuple) >= 2 {
-			_ = json.Unmarshal(tuple[1], &e.Msg)
+		var code int
+		if json.Unmarshal(tuple[0], &code) == nil && code != 0 {
+			e := &wcStatusError{Code: code}
+			if len(tuple) >= 2 {
+				_ = json.Unmarshal(tuple[1], &e.Msg)
+				e.Msg = wcRedactURL(e.Msg)
+			}
+			return e
 		}
-		return e
 	}
 	var obj struct {
 		Error struct {
@@ -524,35 +575,99 @@ func wcParseStatus(p json.RawMessage) *wcStatusError {
 		} `json:"error"`
 	}
 	if json.Unmarshal(first, &obj) == nil && obj.Error.Code != 0 {
-		return &wcStatusError{Code: obj.Error.Code, Msg: obj.Error.Message}
+		return &wcStatusError{Code: obj.Error.Code, Msg: wcRedactURL(obj.Error.Message)}
 	}
-	return &wcStatusError{Code: 2, Msg: truncate(string(p), 200)}
+	return &wcStatusError{
+		Code: 2,
+		Msg:  fmt.Sprintf("unrecognized status frame (%d bytes, kind=%s)", len(p), wcJSONKind(first)),
+	}
+}
+
+func wcJSONKind(raw json.RawMessage) string {
+	b := bytes.TrimSpace(raw)
+	if len(b) == 0 {
+		return "empty"
+	}
+	switch b[0] {
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	case 'n':
+		return "null"
+	default:
+		if b[0] == '-' || (b[0] >= '0' && b[0] <= '9') {
+			return "number"
+		}
+		return "unknown"
+	}
 }
 
 // --- 主流程 ---
 
-// doWebChannelRequest 走新协议发一次请求，返回值跟 doGeminiRequest 对齐：
-// (HTTP 状态, 老格式的 raw, TTFB 毫秒, Set-Cookie, err)。下行错误按 wcStatusError.httpStatus
-// 映射成状态码，body 是错误文本，让上层的重试和 cookie 健康度逻辑原样生效。
-func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error) (int, []byte, int64, []string, error) {
-	sendAt := time.Now()
-	apiKey, err := webChannelAPIKey(proxyURL)
-	if err != nil {
+// doWebChannelRequest 走新协议发一次请求，返回值跟 doGeminiRequestStopMode 对齐：
+// (HTTP 状态, 老格式的 raw, TTFB 毫秒, Set-Cookie, err)。
+// 透传调用方 ctx 取消至 API key 抓取与握手/上下行请求；使用 stallWatch 按沉默计时
+// 掐断卡死的连接；stop 置位后（工具调用提前收尾）立即停止读取并按已收内容返回 200；
+// 下行帧在读取时即线程安全累计进 raw，任何提前返回路径都不丢帧（保障 phantomCleanup）。
+func doWebChannelRequest(ctx context.Context, r wcRequest, proxyURL string, onLine func(string) error, stop *atomic.Bool) (int, []byte, int64, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, nil, 0, nil, err
 	}
-	timeout := time.Duration(rtCfg().RequestTimeout) * time.Second
-	if timeout <= 0 {
-		timeout = 300 * time.Second
+	sendAt := time.Now()
+	watch := newStallWatch(ctx, stallLimit())
+	defer watch.done()
+	wctx := watch.ctx
+
+	apiKey, err := webChannelAPIKeyCtx(wctx, proxyURL)
+	if err != nil {
+		return 0, nil, 0, nil, watch.explain(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	watch.heard()
 
 	var setCookie []string
 	var setCookieMu sync.Mutex
 	keepCookies := func(sc []string) {
+		if len(sc) == 0 {
+			return
+		}
 		setCookieMu.Lock()
 		setCookie = append(setCookie, sc...)
 		setCookieMu.Unlock()
+	}
+	snapshotCookies := func() []string {
+		setCookieMu.Lock()
+		defer setCookieMu.Unlock()
+		if len(setCookie) == 0 {
+			return nil
+		}
+		return append([]string(nil), setCookie...)
+	}
+
+	// 已收下行帧在读取时即线程安全累计进 raw：即使主循环在上行报错/超时/取消/onLine 报错
+	// 提前返回时 events 缓冲里还有尚未取出的帧，c_xxx 也不会丢失（phantomCleanup 依赖它）。
+	var raw strings.Builder
+	var rawMu sync.Mutex
+	appendRaw := func(line string) {
+		rawMu.Lock()
+		raw.WriteString(line)
+		raw.WriteByte('\n')
+		rawMu.Unlock()
+	}
+	rawBytes := func() []byte {
+		rawMu.Lock()
+		defer rawMu.Unlock()
+		if raw.Len() == 0 {
+			return nil
+		}
+		return []byte(raw.String())
 	}
 
 	// 1) 握手
@@ -560,27 +675,28 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	hsURL := fmt.Sprintf("%s?VER=8&RID=%d&CVER=22&X-HTTP-Session-Id=gsessionid&$httpHeaders=%s&zx=%s&t=1",
 		wcEndpoint, rid, url.QueryEscape(wcHTTPHeaders(apiKey, r)), wcZX())
 	rid++
-	hs, err := wcSend(ctx, "POST", hsURL, "count=0", r.Cookie, proxyURL)
+	hs, err := wcSend(wctx, "POST", hsURL, "count=0", r.Cookie, proxyURL)
 	if err != nil {
-		return 0, nil, 0, nil, err
+		return 0, nil, 0, nil, watch.explain(err)
 	}
 	keepCookies(hs.setCookie)
-	hsBody, _ := io.ReadAll(io.LimitReader(hs.body, 1<<20))
+	hsBody, hsReadErr := io.ReadAll(io.LimitReader(heardReader{r: hs.body, w: watch}, 1<<20))
 	hs.body.Close()
+	if hsReadErr != nil {
+		return 0, nil, 0, snapshotCookies(), watch.explain(hsReadErr)
+	}
 	if hs.status != 200 {
 		// 不回传响应体：非 200 的体可能是上游错误 JSON 或含会话帧，原样作 raw 会经
 		// lastErr 拼进 requests.error、502 响应和三张 last_error 表（同下方缺 sid
 		// 分支的考量）。只给状态码/字节数/是否疑似含会话帧的定位信息。
-		// 上层依赖核查：非 200 只读 statusCode 与 raw 文本；XSRF 自愈判 400+正文含
-		// "xsrf"（isXSRFError），这里把该信号原样透出成标记以保住判定，不带正文。
-		// WC 不参与 XSRF 自愈（本协议不发 xsrf token），该标记仅为与旧协议错误分类
-		// 保持文本一致；若后续确认无消费者可一并删除。
+		// 握手 400 且正文命中 isXSRFError 时，透出结构化标记 wcHandshakeXSRFMarker
+		// 供上层 isXSRFError 触发一次 XSRF + API key 自愈刷新（不回传正文）。
 		diag := fmt.Sprintf("processSession 握手 HTTP %d: 响应体 %d 字节, 含会话帧=%v",
 			hs.status, len(hsBody), bytes.Contains(hsBody, []byte(`["c","`)))
-		if bytes.Contains(hsBody, []byte(`"xsrf"`)) {
-			diag += `, "xsrf"`
+		if hs.status == 400 && isXSRFError(string(hsBody)) {
+			diag += ", " + wcHandshakeXSRFMarker
 		}
-		return hs.status, []byte(diag), 0, setCookie, nil
+		return hs.status, []byte(diag), 0, snapshotCookies(), nil
 	}
 	var sid string
 	_ = wcReadFrames(strings.NewReader(string(hsBody)), func(it wcItem) bool {
@@ -597,11 +713,11 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		// 会经 last_error 和 502 响应外泄。只给状态码/字节数/是否解析到 sid 的
 		// 元信息用于定位。
 		return 502, []byte(fmt.Sprintf("processSession 握手没拿到会话: HTTP %d, 响应体 %d 字节, sid=%v, gsessionid=%v",
-			hs.status, len(hsBody), sid != "", gsid != "")), 0, setCookie, nil
+			hs.status, len(hsBody), sid != "", gsid != "")), 0, snapshotCookies(), nil
 	}
 	sess := fmt.Sprintf("gsessionid=%s&SID=%s", url.QueryEscape(gsid), url.QueryEscape(sid))
 
-	// 2) 下行：单独 goroutine 读帧，服务端关连接就带 AID 重连，直到流结束或超时。
+	// 2) 下行：单独 goroutine 读帧，服务端关连接就带 AID 重连，直到流结束、提前停止或超时/取消。
 	var lastID atomic.Int64
 	events := make(chan wcEvent, 64)
 	getErr := make(chan error, 1)
@@ -609,10 +725,10 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	var readyOnce sync.Once
 	go func() {
 		defer close(events)
-		for ctx.Err() == nil {
+		for wctx.Err() == nil && (stop == nil || !stop.Load()) {
 			gURL := fmt.Sprintf("%s?%s&VER=8&RID=rpc&AID=%d&CI=0&TYPE=xmlhttp&zx=%s&t=1",
 				wcEndpoint, sess, lastID.Load(), wcZX())
-			g, err := wcSend(ctx, "GET", gURL, "", r.Cookie, proxyURL)
+			g, err := wcSendStream(wctx, "GET", gURL, "", r.Cookie, proxyURL)
 			if err != nil {
 				getErr <- err
 				return
@@ -629,7 +745,12 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			}
 			readyOnce.Do(func() { close(getReady) })
 			ended := false
-			rerr := wcReadFrames(g.body, func(it wcItem) bool {
+			bodyReader := stopReader{r: heardReader{r: g.body, w: watch}, stop: stop}
+			rerr := wcReadFrames(bodyReader, func(it wcItem) bool {
+				if stop != nil && stop.Load() {
+					ended = true
+					return false
+				}
 				if it.ID > lastID.Load() {
 					lastID.Store(it.ID)
 				}
@@ -637,9 +758,12 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				if ev.Line == "" && !ev.Done && !ev.End && !ev.Ack && ev.Err == nil {
 					return true
 				}
+				if ev.Line != "" {
+					appendRaw(ev.Line)
+				}
 				select {
 				case events <- ev:
-				case <-ctx.Done():
+				case <-wctx.Done():
 					return false
 				}
 				if ev.End || ev.Err != nil {
@@ -649,10 +773,10 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				return true
 			})
 			g.body.Close()
-			if ended {
+			if ended || (stop != nil && stop.Load()) {
 				return
 			}
-			if rerr != nil && ctx.Err() == nil {
+			if rerr != nil && wctx.Err() == nil {
 				getErr <- rerr
 				return
 			}
@@ -667,14 +791,17 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 		}
 		n := atomic.AddInt64(&rid, 1) - 1
 		pURL := fmt.Sprintf("%s?VER=8&%s&RID=%d&AID=%d&zx=%s&t=1", wcEndpoint, sess, n, lastID.Load(), wcZX())
-		resp, err := wcSend(ctx, "POST", pURL,
+		resp, err := wcSend(wctx, "POST", pURL,
 			fmt.Sprintf("count=1&ofs=%d&req0___data__=%s", ofs, url.QueryEscape(string(j))), r.Cookie, proxyURL)
 		if err != nil {
 			return err
 		}
 		keepCookies(resp.setCookie)
-		b, _ := io.ReadAll(io.LimitReader(resp.body, 4096))
+		b, rerr := io.ReadAll(io.LimitReader(resp.body, 4096))
 		resp.body.Close()
+		if rerr != nil {
+			return rerr
+		}
 		if resp.status != 200 {
 			// 同下行分支：不回传上游响应体（见下行处注释）。
 			diag := fmt.Sprintf("processSession 上行 ofs=%d HTTP %d: 响应体 %d 字节", ofs, resp.status, len(b))
@@ -691,37 +818,48 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 	select {
 	case <-getReady:
 	case e := <-getErr:
-		return 0, nil, 0, setCookie, e
-	case <-ctx.Done():
-		return 0, nil, 0, setCookie, fmt.Errorf("processSession 下行没建立（%s）: %w", timeout, errUpstreamTimeout)
+		return 0, rawBytes(), 0, snapshotCookies(), watch.explain(e)
+	case <-wctx.Done():
+		return 0, rawBytes(), 0, snapshotCookies(), watch.explain(wctx.Err())
 	}
 	if err := post(0, ofs0); err != nil {
-		return 0, nil, 0, setCookie, err
+		return 0, rawBytes(), 0, snapshotCookies(), watch.explain(err)
 	}
+	watch.heard()
 
-	// 4) 收下行，直到结束帧。正文（ofs=1）要等下行回了对 ofs=0 的确认（[[]]）再发：
-	// 抢在确认之前发，服务端只回会话 id 和 rid、不生成（实测时有时无，是时序竞争）。
+	// 4) 收下行，直到结束帧、提前停止或出错/取消/超时。正文（ofs=1）要等下行回了对 ofs=0
+	// 的确认（[[]]）再发：抢在确认之前发，服务端只回会话 id 和 rid、不生成（时序竞争）。
 	// 确认一直不来就按超时补发，免得卡死。
-	// 已收下行帧统一收进 raw，错误返回也要带回 —— 取消/出错路径上
-	// phantomCleanup 要靠 raw 里的 c_xxx 删幽灵会话，跟 doGeminiRequestStop 一致。
-	var raw strings.Builder
 	var ttfb int64 = -1
-	rawBytes := func() []byte { return []byte(raw.String()) }
 	closing := false
 	promptSent := false
 	sendPrompt := func() error {
 		promptSent = true
-		time.Sleep(wcPromptGap)
-		return post(1, ofs1)
+		if wcPromptGap > 0 {
+			watch.pause()
+			err := sleepCtx(wctx, wcPromptGap)
+			watch.resume()
+			if err != nil {
+				return err
+			}
+		}
+		if err := post(1, ofs1); err != nil {
+			return err
+		}
+		watch.heard()
+		return nil
 	}
 	ackTimer := time.NewTimer(wcAckWait)
 	defer ackTimer.Stop()
 	for {
+		if wctx.Err() != nil {
+			return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(wctx.Err())
+		}
 		select {
 		case <-ackTimer.C:
 			if !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, err
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(err)
 				}
 			}
 			continue
@@ -729,41 +867,48 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 			if !ok {
 				select {
 				case e := <-getErr:
-					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, e
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(e)
 				default:
 				}
-				if ctx.Err() != nil {
-					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie,
-						fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
+				if wctx.Err() != nil {
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(wctx.Err())
 				}
-				return 200, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, nil
+				return 200, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), nil
 			}
 			if ev.Err != nil {
 				// body 照旧带错误文本；raw 里已收的帧一并附上，phantomCleanup 还能
 				// 从里面找到 c_xxx。
 				msg := ev.Err.Error()
+				rb := rawBytes()
 				var body []byte
-				if raw.Len() > 0 {
-					body = append(rawBytes(), msg...)
+				if len(rb) > 0 {
+					body = append(rb, msg...)
 				} else {
 					body = []byte(msg)
 				}
-				return ev.Err.httpStatus(), body, ttfbOr(ttfb, sendAt), setCookie, nil
+				return ev.Err.httpStatus(), body, ttfbOr(ttfb, sendAt), snapshotCookies(), nil
 			}
 			if ev.Ack && !promptSent {
 				if err := sendPrompt(); err != nil {
-					return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, err
+					return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(err)
 				}
 			}
 			if ev.Line != "" {
 				if ttfb < 0 {
 					ttfb = time.Since(sendAt).Milliseconds()
 				}
-				raw.WriteString(ev.Line)
-				raw.WriteByte('\n')
+				if stop != nil && stop.Load() {
+					return 200, rawBytes(), ttfb, snapshotCookies(), nil
+				}
 				if onLine != nil {
 					if err := onLine(ev.Line); err != nil {
-						return 200, rawBytes(), ttfb, setCookie, err
+						return 200, rawBytes(), ttfb, snapshotCookies(), err
+					}
+					if stop != nil && stop.Load() {
+						return 200, rawBytes(), ttfb, snapshotCookies(), nil
+					}
+					if wctx.Err() != nil {
+						return 0, rawBytes(), ttfb, snapshotCookies(), watch.explain(wctx.Err())
 					}
 				}
 			}
@@ -773,11 +918,10 @@ func doWebChannelRequest(r wcRequest, proxyURL string, onLine func(string) error
 				go func() { _ = post(2, ofs2) }()
 			}
 			if ev.End {
-				return 200, rawBytes(), ttfbOr(ttfb, sendAt), setCookie, nil
+				return 200, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), nil
 			}
-		case <-ctx.Done():
-			return 0, rawBytes(), ttfbOr(ttfb, sendAt), setCookie,
-				fmt.Errorf("processSession 超时（%s）: %w", timeout, errUpstreamTimeout)
+		case <-wctx.Done():
+			return 0, rawBytes(), ttfbOr(ttfb, sendAt), snapshotCookies(), watch.explain(wctx.Err())
 		}
 	}
 }

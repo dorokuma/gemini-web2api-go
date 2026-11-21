@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -922,14 +923,17 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		var ttfb int64
 		var setCookie []string
 		var err error
+		reqEndpoint := endpoint
 		if useWC {
+			reqEndpoint = wcEndpoint
 			wcReq.Cookie = cookieStr
-			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(wcReq, proxyURL, lh.cb)
+			wcReq.SAPISID = extractSAPISID(cookieStr)
+			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(ctx, wcReq, proxyURL, lh.cb, &lh.stop)
 		} else {
 			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop, mc.TaskMode)
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
-			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
+			if merged := mergeSetCookieForHost(cookieStr, setCookie, reqEndpoint, geminiCookieTargetHost); merged != cookieStr {
 				cookieStr = merged
 				updateAccountCookie(cookieID, merged)
 			}
@@ -989,17 +993,20 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 这种自愈不算进重试预算，否则一次过期就吃掉全部重试。
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
-				invalidateXSRF(cookieStr)
 				// 浏览器模式下不要再先 reloadResidentPage 又 getXSRF——两者都
 				// 会页内 fetch /app 一次，连续抓两遍纯粹浪费一次上游往返。
 				// getXSRF 的浏览器路径本身就会重抓页面拿新 token。
-				if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
+				if tok, e := healXSRFRefresh(cookieStr, authUser, proxyURL, useWC); e == nil {
 					xsrfToken = tok // 同步给收尾：phantomCleanup 按闭包取当前值
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 					setAuthUserHeaders(geminiHeaders, authUser)
 					geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
 					geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
+					if useWC {
+						wcReq.Cookie = cookieStr
+						wcReq.SAPISID = extractSAPISID(cookieStr)
+					}
 					attempt--
 					continue
 				}
@@ -1180,6 +1187,16 @@ func newLineHandler(onDelta, onReasoning func(string), stopWhen func(string) boo
 	return lh
 }
 
+// healXSRFRefresh 在上游返回 400 + isXSRFError 时作废本地 XSRF 缓存并重取 token；
+// 若当前走 WebChannel 路径，同时作废缓存的 processSession API key，确保重试拿到最新凭证。
+func healXSRFRefresh(cookieStr string, authUser int, proxyURL string, useWC bool) (string, error) {
+	invalidateXSRF(cookieStr)
+	if useWC {
+		invalidateWebChannelAPIKey()
+	}
+	return getXSRF(cookieStr, authUser, proxyURL)
+}
+
 // webChannelIgnoredLogged 记下「web_channel 开着但被忽略」是否已经提示过；开关关掉时清零，
 // 再打开会再提示一次。
 var webChannelIgnoredLogged atomic.Bool
@@ -1340,10 +1357,13 @@ func (e *StallError) Temporary() bool { return true }
 // 计时，心跳就让排队的请求一直等下去，只有连心跳都断了（limit 默认 180 秒，等于连着
 // 丢三个）才算卡住。
 type stallWatch struct {
-	ctx    context.Context
-	limit  time.Duration
-	timer  *time.Timer
-	cancel context.CancelCauseFunc
+	ctx     context.Context
+	limit   time.Duration
+	mu      sync.Mutex
+	timer   *time.Timer
+	stopped bool
+	paused  bool
+	cancel  context.CancelCauseFunc
 }
 
 func newStallWatch(ctx context.Context, limit time.Duration) *stallWatch {
@@ -1357,16 +1377,44 @@ func newStallWatch(ctx context.Context, limit time.Duration) *stallWatch {
 
 // heard 说上游又来了数据，沉默从现在重新算。
 func (w *stallWatch) heard() {
-	if w.timer != nil {
+	w.mu.Lock()
+	if !w.stopped && !w.paused && w.timer != nil {
 		w.timer.Reset(w.limit)
 	}
+	w.mu.Unlock()
+}
+
+// pause 在客户端主动节流等待（如 WebChannel 的 wcPromptGap）期间暂停沉默计时，
+// 避免客户端主动 sleep 被误判为上游沉默；调用方 ctx 取消仍照常立即生效。
+func (w *stallWatch) pause() {
+	w.mu.Lock()
+	if !w.stopped && w.timer != nil {
+		w.paused = true
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+}
+
+// resume 恢复沉默计时并重开一个完整的 limit 窗口。
+func (w *stallWatch) resume() {
+	w.mu.Lock()
+	if !w.stopped && w.paused {
+		w.paused = false
+		if w.timer != nil {
+			w.timer.Reset(w.limit)
+		}
+	}
+	w.mu.Unlock()
 }
 
 // done 结束盯梢。
 func (w *stallWatch) done() {
+	w.mu.Lock()
+	w.stopped = true
 	if w.timer != nil {
 		w.timer.Stop()
 	}
+	w.mu.Unlock()
 	w.cancel(nil)
 }
 

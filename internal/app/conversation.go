@@ -402,7 +402,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
 		}
 		if len(setCookie) > 0 && conv.cookie != "" {
-			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
+			if merged := mergeSetCookieForHost(conv.cookie, setCookie, endpoint, geminiCookieTargetHost); merged != conv.cookie {
 				conv.cookie = merged
 			}
 		}
