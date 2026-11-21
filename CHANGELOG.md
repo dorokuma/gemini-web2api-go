@@ -2,6 +2,48 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 6.3.1 - 2026-11-21
+
+### 新增
+
+- **WebChannel（`useWC`）启用前置 6 项全部实现并补单测**：
+  - `doWebChannelRequest` 透传调用方 `ctx` 取消至 API key 抓取与握手/上下行请求
+    （`fetchAppPageCtx` / `webChannelAPIKeyCtx`；`wcPromptGap` 等待改走 `sleepCtx`），
+    不再忽略客户端取消。
+  - WebChannel 下行接入 `stallWatch` 沉默超时掐断与工具调用 `stopWhen` 提前停止：
+    下行 GET 改走不限整次时长的 `wcSendStream`，挂接 `stopReader{heardReader, stop}`；
+    `stallWatch` 补齐并发安全互斥与 `pause`/`resume`（客户端主动 `wcPromptGap` 节流
+    等待不再被误判为上游沉默）。
+  - `wcParseStatus` 兜底改为脱敏结构化诊断
+    `unrecognized status frame (%d bytes, kind=%s)`，不再把未识别 200 帧前缀拼进
+    `requests.error` / `last_error` / 502 响应体。
+  - 握手 400 脱敏诊断新增 `xsrf=true` 结构化标记并纳入 `isXSRFError`，WebChannel
+    路径命中 XSRF 过期可触发自愈刷新。
+  - WebChannel 下行队列排空线程安全累计：各提前返回路径均完整带回已收帧中的
+    会话 ID，保证 `phantomCleanup` 可靠删幽灵会话。
+
+### 修复
+
+- **`mergeSetCookieForHost` 按目标主机过滤 `Set-Cookie` 写回**：`StreamGenerate` 与
+  多轮续接路径的响应 `Set-Cookie` 先按 RFC 6265 来源主机与目标主机
+  （`gemini.google.com`）过滤再合并进账号池——host-only cookie 仅同主机保留、
+  `Domain` 需双向 domain-match 且拒绝单段顶级域、`__Host-` 前缀禁带 `Domain` 且
+  仅限同源根路径、跨主机拒绝 `Partitioned` 并要求显式 `Path=/`；防止 WebChannel
+  端点（`geminiweb-pa.clients6.google.com`）下发的 clients6 作用域 cookie 混入
+  主账号池。
+- **`stallWatch` 并发安全**：`heard`/`done` 及新增 `pause`/`resume` 全部走互斥锁
+  保护 `timer`/`stopped`/`paused` 状态，消除下行读取 goroutine 与收尾路径的
+  计时器竞争。
+- **XSRF 自愈覆盖 WebChannel 路径**：`healXSRFRefresh` 在命中 400 + `isXSRFError`
+  时统一作废 XSRF 缓存并重取 token，`useWC` 路径同时作废缓存的 processSession
+  API key 并刷新 `wcReq.Cookie`/`wcReq.SAPISID`。
+- `conversation`/`xsrf` 辅助函数同步加固：`fetchAppPage` 新增 `fetchAppPageCtx`
+  透传 `ctx`；`isXSRFError` 兼容 WebChannel 握手 400 的 `xsrf=true` 标记。
+
+> **启用门控状态**：`internal/app/gemini.go` 中 `useWC := false` 保持锁定不变，
+> WebChannel 6 项启用前置虽已完备，正式接通 `rtCfg().WebChannel` 仍需单独验收
+> （见 `.agents/notes/webchannel-enable-prerequisites.md`）。
+
 ## 6.3.0 - 2026-11-21
 
 ### 新增
