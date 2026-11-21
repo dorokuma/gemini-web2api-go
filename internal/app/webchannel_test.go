@@ -514,7 +514,7 @@ func TestWCHandshakeFailureRedactsBody(t *testing.T) {
 			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
 
 			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
-			status, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			status, raw, _, _, err := doWebChannelRequest(context.Background(), r, fakeProxy, nil, nil)
 			if err != nil {
 				t.Fatalf("握手失败应走状态码而不是 err: %v", err)
 			}
@@ -604,7 +604,7 @@ func TestWCStreamUploadFailureRedactsBody(t *testing.T) {
 			defer func() { wcKeyMu.Lock(); wcKey, wcKeyAt = oldKey, oldAt; wcKeyMu.Unlock() }()
 
 			r := wcRequest{HexID: "fbb127bbb056c959", Mode: 1, Cookie: "SAPISID=x", SAPISID: "x", Prompt: "hi"}
-			_, raw, _, _, err := doWebChannelRequest(r, fakeProxy, nil)
+			_, raw, _, _, err := doWebChannelRequest(context.Background(), r, fakeProxy, nil, nil)
 			if err == nil {
 				t.Fatalf("%s应报错", c.name)
 			}

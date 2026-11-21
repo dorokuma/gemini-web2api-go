@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -607,6 +608,154 @@ func accountDisplayName(a *CookieAccount) string {
 		return a.Label
 	}
 	return fmt.Sprintf("#%d", a.ID)
+}
+
+// geminiCookieTargetHost 是主账号池 cookie 的目标主机：只有按 RFC 6265 对该主机生效
+// 的 Set-Cookie 才允许合并进主账号池，防止跨主机（如 WebChannel 的
+// geminiweb-pa.clients6.google.com）下发的 host-only 或 clients6 作用域 cookie 混入。
+const geminiCookieTargetHost = "gemini.google.com"
+
+// mergeSetCookieForHost 先按 RFC 6265 来源主机与目标主机过滤 setCookie，再合并进现有 cookie 串。
+// 任一 host 缺失或非法时 fail-closed，不做合并。
+func mergeSetCookieForHost(cookie string, setCookie []string, sourceURLOrHost, targetHost string) string {
+	filtered := filterSetCookieForHost(setCookie, sourceURLOrHost, targetHost)
+	if len(filtered) == 0 {
+		return cookie
+	}
+	return mergeSetCookie(cookie, filtered)
+}
+
+// filterSetCookieForHost 仅保留来自 sourceURLOrHost 且按 RFC 6265 对 targetHost 根路径生效的 Set-Cookie：
+//   - host-only（无 Domain 属性）仅在 sourceHost == targetHost 时保留；
+//   - 带 Domain 属性时，sourceHost 与 targetHost 必须同时 domain-match 该 Domain（且拒绝单段顶级域）；
+//   - __Host- 前缀 cookie 禁止带 Domain、仅允许同源且根路径；
+//   - 跨主机时（如 geminiweb-pa.clients6.google.com -> gemini.google.com），拒绝 Partitioned
+//     且要求显式 Path=/（否则按请求路径 /v1 默认作用域不覆盖目标根路径）。
+func filterSetCookieForHost(setCookie []string, sourceURLOrHost, targetHost string) []string {
+	if len(setCookie) == 0 {
+		return nil
+	}
+	srcHost, srcPath := parseCookieSource(sourceURLOrHost)
+	tgtHost, _ := parseCookieSource(targetHost)
+	if srcHost == "" || tgtHost == "" {
+		return nil
+	}
+	sameHost := srcHost == tgtHost
+	defaultPath := cookieDefaultPath(srcPath)
+
+	var out []string
+	for _, sc := range setCookie {
+		if setCookieAppliesToTarget(sc, srcHost, defaultPath, tgtHost, sameHost) {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+func parseCookieSource(raw string) (host, path string) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", ""
+	}
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return "", ""
+		}
+		h := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+		return h, u.Path
+	}
+	// 裸 host（可选端口）：通过 dummy scheme 解析以可靠剥离端口与非法字符。
+	u, err := url.Parse("https://" + s)
+	if err != nil || u.Path != "" {
+		return "", ""
+	}
+	h := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	return h, "/"
+}
+
+// cookieDefaultPath 按 RFC 6265 §5.1.4 计算请求路径的默认 cookie Path。
+func cookieDefaultPath(reqPath string) string {
+	if reqPath == "" || !strings.HasPrefix(reqPath, "/") {
+		return "/"
+	}
+	i := strings.LastIndexByte(reqPath, '/')
+	if i <= 0 {
+		return "/"
+	}
+	return reqPath[:i]
+}
+
+// cookieDomainMatches 判断 host 是否按 RFC 6265 §5.1.3 匹配已规范化的 domain（无前导点、小写）。
+func cookieDomainMatches(host, domain string) bool {
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+func setCookieAppliesToTarget(sc, srcHost, defaultPath, tgtHost string, sameHost bool) bool {
+	parts := strings.Split(sc, ";")
+	first := strings.TrimSpace(parts[0])
+	eq := strings.IndexByte(first, '=')
+	if eq <= 0 {
+		return false
+	}
+	name := strings.TrimSpace(first[:eq])
+	if name == "" {
+		return false
+	}
+
+	var domainAttr, pathAttr string
+	var hasDomain, hasPath, partitioned bool
+	for _, rawAttr := range parts[1:] {
+		attr := strings.TrimSpace(rawAttr)
+		if attr == "" {
+			continue
+		}
+		k, v, hasEq := strings.Cut(attr, "=")
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		switch {
+		case strings.EqualFold(k, "domain") && hasEq:
+			hasDomain = true
+			domainAttr = v
+		case strings.EqualFold(k, "path") && hasEq:
+			hasPath = true
+			pathAttr = v
+		case strings.EqualFold(k, "partitioned"):
+			partitioned = true
+		}
+	}
+
+	if partitioned && !sameHost {
+		return false
+	}
+	if strings.HasPrefix(name, "__Host-") {
+		if hasDomain || !sameHost {
+			return false
+		}
+		if hasPath && pathAttr != "/" {
+			return false
+		}
+		return true
+	}
+
+	// Path 校验：目标池 cookie 会随所有 gemini.google.com 请求发出，非根路径 cookie 不应混入。
+	if hasPath {
+		if pathAttr != "/" {
+			return false
+		}
+	} else if !sameHost && defaultPath != "/" {
+		return false
+	}
+
+	if !hasDomain || domainAttr == "" {
+		// host-only cookie：仅同主机适用。
+		return sameHost
+	}
+	d := strings.TrimPrefix(strings.ToLower(strings.TrimSuffix(domainAttr, ".")), ".")
+	if d == "" || !strings.Contains(d, ".") {
+		return false
+	}
+	return cookieDomainMatches(srcHost, d) && cookieDomainMatches(tgtHost, d)
 }
 
 // mergeSetCookie 把响应下发的 Set-Cookie 合并进现有 cookie 串。

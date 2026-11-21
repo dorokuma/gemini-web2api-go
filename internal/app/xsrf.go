@@ -192,6 +192,14 @@ func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx
 // cookie 传空串就是匿名抓（页面照样返回，只是没有登录态字段）。
 // authuser>0 抓 /u/N/app，页面里的 token 才是第 N 个号的。
 func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) {
+	return fetchAppPageCtx(context.Background(), cookie, authuser, proxyURL)
+}
+
+// fetchAppPageCtx 同 fetchAppPage，支持透传调用方 ctx 取消/超时。
+func fetchAppPageCtx(ctx context.Context, cookie string, authuser int, proxyURL string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pageURL := geminiBase(authuser) + "/app"
 	headers := map[string]string{
 		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -203,7 +211,7 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 
 	var body []byte
 	if proxyURL != "" {
-		req, err := http.NewRequest("GET", pageURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -224,7 +232,7 @@ func fetchAppPage(cookie string, authuser int, proxyURL string) ([]byte, error) 
 			return nil, err
 		}
 	} else {
-		req, err := fhttp.NewRequest("GET", pageURL, nil)
+		req, err := fhttp.NewRequestWithContext(ctx, "GET", pageURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -310,10 +318,16 @@ func fetchAppTokens(cookie string, authuser int, proxyURL string, allowSwitch bo
 	return e, nil
 }
 
+// wcHandshakeXSRFMarker 是 WebChannel 握手 400 脱敏诊断里透出的 XSRF 信号标记：
+// 握手非 200 不回传上游响应体，但 400 正文含 "xsrf" 时附带该结构化标记，
+// 让上层 isXSRFError 能稳定触发自愈刷新（不泄露原文）。
+const wcHandshakeXSRFMarker = "xsrf=true"
+
 // isXSRFError 判断上游 400 是不是 XSRF token 的问题。
-// 响应体形如：[["er",null,...,400,...,[{"48448350":["xsrf","<新token>",...]}]]]
+// 老协议响应体形如：[["er",null,...,400,...,[{"48448350":["xsrf","<新token>",...]}]]]
+// WebChannel 握手 400 脱敏诊断不回传响应体，只带 wcHandshakeXSRFMarker 标记。
 func isXSRFError(raw string) bool {
-	return strings.Contains(raw, `"xsrf"`)
+	return strings.Contains(raw, `"xsrf"`) || strings.Contains(raw, wcHandshakeXSRFMarker)
 }
 
 // appPageStatusError 是抓 /app 拿到非 200 时的错误，带上重定向目标。
