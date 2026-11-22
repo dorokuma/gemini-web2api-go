@@ -1,6 +1,9 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 面板的填空模板要能跟原始 cookie 串一样入池。
 // 判据是"填进去什么，拼出来就是什么"——归一化错了的话池子里存的是一整段 JSON，
@@ -114,5 +117,58 @@ func TestAccountAddAcceptsNoSpaceCookie(t *testing.T) {
 	}
 	if extractSAPISID(accountList()[0].Cookie) != "b" {
 		t.Error("入池后取不出 SAPISID")
+	}
+}
+
+// 逐项模板顺序末尾是 OSID：已有七项的拼接顺序不变，JSON 逐项输入带 OSID 也能拼进去。
+func TestCookieTemplateOrderEndsWithOSID(t *testing.T) {
+	if cookieTemplateOrder[len(cookieTemplateOrder)-1] != "OSID" {
+		t.Fatalf("template 末尾应为 OSID, got %v", cookieTemplateOrder)
+	}
+	got, ok := normalizeCookie(`{"SID":"s","OSID":"o","SAPISID":"p"}`, "t")
+	if !ok || !strings.Contains(got, "OSID=o") {
+		t.Fatalf("逐项 JSON 里的 OSID 应拼进串, got %q ok=%v", got, ok)
+	}
+	// 前七项原有顺序不变
+	want7 := []string{"SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID", "__Secure-1PSIDTS"}
+	for i, w := range want7 {
+		if cookieTemplateOrder[i] != w {
+			t.Fatalf("第 %d 项应为 %s, got %v", i, w, cookieTemplateOrder)
+		}
+	}
+}
+
+// hasCookieName 精确匹配：__Secure-OSID 不能替代 OSID。
+func TestHasCookieNameExactOSID(t *testing.T) {
+	if !hasCookieName("SID=a; OSID=c", "OSID") {
+		t.Error("精确 OSID 应命中")
+	}
+	if hasCookieName("SID=a; __Secure-OSID=c", "OSID") {
+		t.Error("__Secure-OSID 不能当成 OSID")
+	}
+	if hasCookieName("SID=a", "OSID") {
+		t.Error("没有 OSID 不该命中")
+	}
+}
+
+// cookieAcctView 要带 has_osid 与 key_cookies 里的 OSID。
+func TestCookieAcctViewHasOSID(t *testing.T) {
+	v := cookieAcctView(CookieAccount{Cookie: "SID=a; OSID=o; SAPISID=p; __Secure-1PSID=q"})
+	if v["has_osid"] != true {
+		t.Error("带 OSID 的账号 has_osid 应为 true")
+	}
+	keys, _ := v["key_cookies"].([]string)
+	found := false
+	for _, k := range keys {
+		if k == "OSID" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("key_cookies 应含 OSID, got %v", keys)
+	}
+	v = cookieAcctView(CookieAccount{Cookie: "SID=a; SAPISID=p"})
+	if v["has_osid"] != false {
+		t.Error("缺 OSID 的账号 has_osid 应为 false")
 	}
 }

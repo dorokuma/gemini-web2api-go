@@ -138,6 +138,14 @@ type ModelConfig struct {
 	// "Nano Banana 2" 这类后端名）。只能用显示名：跟它并排的 hex 现在不管实际用了
 	// 哪个模型都回 Flash-Lite 的那个。
 	Upstream string
+	// Retired 非空 = 上游已经不提供这个模型，值是给客户端看的原因。这种模型不进模型列表，
+	// 请求直接 400 回这句话，不发上游（发了要么挂到超时、要么被静默换成别的模型）。
+	// 名字留在表里而不是删掉，是为了让老配置拿到的是「下线了，换 X」而不是「unknown model」。
+	Retired string
+	// UpstreamAliases 仅用于已确认的上游改名/原位升级：本模型条目仍接受旧显示名和
+	// 新显示名。strict_model 的 modelDowngraded 遍历它放行原位升级别名；显式请求新
+	// 模型时不登记旧名，避免把尚未升级的账号当成新模型。
+	UpstreamAliases []string
 	// VideoAspect is the inner[55] aspect code for video: 16 = 16:9 (default), 17 = 9:16.
 	VideoAspect int
 	// PinAccountID forces the request onto one cookie-pool account (no fallback to
@@ -172,18 +180,23 @@ func (mc ModelConfig) thinkWire() int {
 // gemini-flash-lite 别名已移除：它们在服务端没有对应条目，留着只会让人
 // 以为有五种不同的模型可选。
 var Models = map[string]ModelConfig{
-	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Upstream: "3.6 Flash", Desc: "Latest all-around model"},
+	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Upstream: "3.6 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "Flash route: 3.5 Flash-Lite when anonymous, 4 Hydrogen when signed in"},
 	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Upstream: "3.5 Flash-Lite", Desc: "Fastest, lightweight"},
-	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Upstream: "3.1 Pro", Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
+	// 3.1 Pro 的位置（mode 3）现在是 4 Neon（2026-11-19 Ultra 号实测回报 "4 Neon"；otAQ7b 里
+	// Neon 的 compat hex 列表含原 3.1 Pro 的 9d8ca3786ebdfbea，Neon 接替了这个位置）。名字留着
+	// 兼容老配置，跟 gemini-4-neon 是同一条路由。3.1 Pro 与 Neon 的回报名互认（UpstreamAliases），
+	// strict_model 不把对方当降级。
+	"gemini-3.1-pro": {HexID: hexPro31, Mode: 3, Upstream: "3.1 Pro", UpstreamAliases: []string{"4 Neon"}, Desc: "alias of gemini-4-neon (upstream replaced 3.1 Pro with 4 Neon); needs a signed-in PAID/Ultra Google account"},
 	// 3.8 Flash：Google 把原 3.7 那个 hex 原地升级了（同 hex，服务端显示名从 3.7 变 3.8）。
-	// 实测是**付费号专属**（不是灰度）：只有付费 Gemini 账号有，免费号降级成 3.5 Flash-Lite。
+	// 现在服务端回报 "4 Hydrogen"，登录号（含免费号）都拿得到，匿名拿不到。
 	// gemini-3.7-flash 保留为别名（同 hex）。
-	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
-	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "Legacy Flash route, now 4 Hydrogen; needs a signed-in Google account"},
+	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "alias of gemini-3.8-flash (same route, now 4 Hydrogen)"},
 	// 4 Hydrogen：Google 2026-11 把同一槽位（hexFlash38 / Mode=1）从 3.8 Flash 原位升级成
-	// "4 Hydrogen"。与 3.8 三条完全同 hex 同 Mode，仅对外名和登记的 Upstream 名不同。
-	// 仍 gate 成要 cookie（modelNeedsLogin 按 hexFlash38 覆盖）。
-	"gemini-4-hydrogen": {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", Desc: "4 Hydrogen (Everyday help, replaced 3.8 Flash on same slot); needs a signed-in Google account"},
+	// "4 Hydrogen"。2026-11-17 实测免费号（档位 1）发 mode 1 也回报 "4 Hydrogen"，不只付费号；
+	// 匿名发 mode 1 回报 3.5 Flash-Lite，所以跟 3.8 一样要登录（modelNeedsLogin 按 hexFlash38 判）。
+	// 与 3.8 三条完全同 hex 同 Mode，仅对外名和登记的 Upstream 名不同。
+	"gemini-4-hydrogen": {HexID: hexFlash38, Mode: 1, Upstream: "4 Hydrogen", Desc: "4 Hydrogen; needs a signed-in Google account (free accounts work too)"},
 	// 4 Carbon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
 	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
 	// 对话模式走**纯普通 Chat inner**（不再补 argonMode8Slots）：实测 think=1/2/4 均
@@ -193,7 +206,8 @@ var Models = map[string]ModelConfig{
 	"gemini-4-carbon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Carbon", Desc: "4 Carbon (renamed 4 Argon, same slot); needs a signed-in PAID/Ultra Google account"},
 	// 4 Neon：Mode=3 路由（hexNeon4 注释）。上游实测 think=1/2/4 均 HTTP 200、自报
 	// "4 Neon"/"4 Neon High"/"4 Neon Medium"。付费号专属，gate 成要 cookie。
-	"gemini-4-neon": {HexID: hexNeon4, Mode: 3, Upstream: "4 Neon", Desc: "4 Neon (deeper analysis); needs a signed-in PAID/Ultra Google account"},
+	// UpstreamAliases 登记 "3.1 Pro"：Neon 接替了原 3.1 Pro 的槽位，strict_model 互认。
+	"gemini-4-neon": {HexID: hexNeon4, Mode: 3, Upstream: "4 Neon", UpstreamAliases: []string{"3.1 Pro"}, Desc: "4 Neon (deeper analysis); needs a signed-in PAID/Ultra Google account"},
 	// 任务模式（Task Mode）：与对话模式分离的独立模型，走任务槽位（Mode==8 走
 	// argonMode8Slots、其余走 taskModeSlots，均含 inner[49]=40）。不注册 -task-thinking
 	// 变体，让下游插件天然以独立模型呈现。
@@ -212,12 +226,12 @@ var Models = map[string]ModelConfig{
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
-	"gemini-3.6-flash-thinking":        {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.6-flash-thinking":        {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.5-flash-lite-thinking":   {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
-	"gemini-3.1-pro-thinking":          {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
-	"gemini-3.8-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.7-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
-	"gemini-3.8-flash-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "3.8 Flash", Desc: "3.8 Flash at the Medium thinking tier; needs a signed-in Google account"},
+	"gemini-3.1-pro-thinking":          {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", UpstreamAliases: []string{"4 Neon"}, Desc: "alias of gemini-4-neon-thinking; needs a signed-in PAID/Ultra account"},
+	"gemini-3.8-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "Legacy Flash route with extended thinking, now 4 Hydrogen; needs a signed-in Google account"},
+	"gemini-3.7-flash-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "alias of gemini-3.8-flash-thinking"},
+	"gemini-3.8-flash-thinking-medium": {HexID: hexFlash38, Mode: 1, ThinkWire: thinkingMedium, Upstream: "3.8 Flash", UpstreamAliases: []string{"4 Hydrogen"}, Desc: "3.8 Flash at the Medium thinking tier (route now reports 4 Hydrogen); needs a signed-in Google account"},
 	// 4 Carbon + 扩展思考：Mode=8 + inner[80]=2（上游现在把这档叫 "High"）。
 	// 对话模式实测自报 "4 Carbon High"（滚动期也收裸名 "4 Carbon"，见 argon.go）。
 	// Thinking=true 使 thinkWire()==2（高档线值）——ThinkWire 不设时靠它推档，必须保留。
@@ -229,8 +243,8 @@ var Models = map[string]ModelConfig{
 	// 4 Neon + 思考档：Mode=3（选 Neon），高档 think 线值 2、自报 "4 Neon High"，中档
 	// thinkingMedium=4、自报 "4 Neon Medium"。实测三档都不吐思考链——思考在服务端内部
 	// 完成，不设 Thinking、不期望 reasoning_content。
-	"gemini-4-neon-thinking":        {HexID: hexNeon4, Mode: 3, Thinking: true, Upstream: "4 Neon High", Desc: "4 Neon High thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
-	"gemini-4-neon-thinking-medium": {HexID: hexNeon4, Mode: 3, ThinkWire: thinkingMedium, Upstream: "4 Neon Medium", Desc: "4 Neon Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-neon-thinking":        {HexID: hexNeon4, Mode: 3, Thinking: true, Upstream: "4 Neon High", UpstreamAliases: []string{"3.1 Pro"}, Desc: "4 Neon High thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
+	"gemini-4-neon-thinking-medium": {HexID: hexNeon4, Mode: 3, ThinkWire: thinkingMedium, Upstream: "4 Neon Medium", UpstreamAliases: []string{"3.1 Pro"}, Desc: "4 Neon Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
 	// 4 Hydrogen 思考档：与 3.8 Flash 同槽位（hexFlash38 / Mode=1），高档自报 "4 Hydrogen High"
 	// 并吐思考链，中档 think 线值 thinkingMedium、服务端内部思考不吐链。
 	"gemini-4-hydrogen-thinking":        {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "4 Hydrogen", Desc: "4 Hydrogen with extended thinking (High tier); emits reasoning_content; needs a signed-in Google account"},
@@ -244,6 +258,9 @@ var Models = map[string]ModelConfig{
 	// 画布：生成 immersive 交互 HTML 文档，内联返回（不是二进制、不用下载）。要登录态。
 	"gemini-canvas": {HexID: hexFlash36, Mode: 1, Tool: toolCanvas, Desc: "Canvas: generates an interactive HTML document (returned inline as a ```html block); needs a signed-in cookie"},
 }
+
+// fallbackDefaultModel 是默认模型被下线时换上的那个。
+const fallbackDefaultModel = "gemini-3.6-flash"
 
 // hasCookie 表示 cookie 池里有没有可用账号。决定 3.1 Pro 是否出现在模型列表里。
 func hasCookie() bool {
@@ -284,20 +301,14 @@ func temporaryChatEligible() bool {
 
 // availableModels 返回当前配置下值得暴露的模型。
 //
-// 没配 cookie 时排除 3.1 Pro：实测匿名请求它会被静默降级成 3.5 Flash-Lite，
-// 客户端还以为自己用上了 Pro。与其让它"成功"，不如直接不提供、让选型时就报错。
-//
-// 配了有效 cookie 时它是真能用的：连打 6 次服务端回报的都是 "3.1 Pro" 本身，
-// 且每次都带思考链（118-152 字符，普通 3.6 Flash 为 0）。早前记录的「免费号
-// 登录也只能拿到 3.6 Flash 扩展」是在缺 XSRF token 的条件下测的，那时候带
-// cookie 的请求根本发不出去（见 xsrf.go）。
+// 没配 cookie 时排除要登录的模型：匿名请求它们会被静默降级成 3.5 Flash-Lite，
+// 客户端还以为自己用上了。与其让它"成功"，不如直接不提供、让选型时就报错。
+// 上游已下线的（Retired）不管有没有 cookie 都排除。
 func availableModels() map[string]ModelConfig {
-	if hasCookie() {
-		return Models
-	}
+	cookie := hasCookie()
 	out := make(map[string]ModelConfig, len(Models))
 	for k, v := range Models {
-		if modelNeedsLogin(v) {
+		if v.Retired != "" || (!cookie && modelNeedsLogin(v)) {
 			continue
 		}
 		out[k] = v
@@ -317,6 +328,9 @@ func resolveModel(modelName string) (string, ModelConfig, error) {
 	}
 	mc, ok := availableModels()[modelName]
 	if !ok {
+		if full, exists := Models[modelName]; exists && full.Retired != "" {
+			return "", ModelConfig{}, fmt.Errorf("%s is retired: %s", modelName, full.Retired)
+		}
 		if full, exists := Models[modelName]; exists && !hasCookie() {
 			downgrade := "are silently downgraded to 3.5 Flash-Lite"
 			if full.Tool > 0 {

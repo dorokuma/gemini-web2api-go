@@ -155,6 +155,28 @@ func TestModelDowngraded(t *testing.T) {
 		{"gemini-4-neon-thinking", "4 Neon High", false},
 		{"gemini-4-neon-thinking-medium", "4 Neon Medium", false},
 		{"gemini-3.7-flash", "3.8 Flash", false},
+		// 2026-11-17 实测：登录号（免费号也是）发 mode 1 回报 4 Hydrogen，3.6 Flash 已不在清单
+		{"gemini-3.6-flash", "4 Hydrogen", false},
+		{"gemini-3.6-flash", "4 Hydrogen High", false},
+		{"gemini-3.6-flash-thinking", "4 Hydrogen", false},
+		{"gemini-3.6-flash-thinking", "4 Hydrogen High", false},
+		{"gemini-3.8-flash", "4 Hydrogen", false},
+		{"gemini-3.8-flash-thinking", "4 Hydrogen High", false},
+		{"gemini-4-hydrogen", "4 Hydrogen", false},
+		{"gemini-4-hydrogen-thinking", "4 Hydrogen High", false},
+		// 2026-11-19 实测：mode 3 回报 4 Neon（接替 3.1 Pro），新旧两个名字互认
+		{"gemini-3.1-pro", "4 Neon", false},
+		{"gemini-3.1-pro", "4 Neon High", false},
+		{"gemini-3.1-pro-thinking", "4 Neon", false},
+		{"gemini-3.1-pro-thinking", "4 Neon High", false},
+		{"gemini-4-neon", "3.1 Pro", false},
+		{"gemini-4-neon-thinking", "3.1 Pro", false},
+		// 匿名回报 3.5 Flash-Lite 在 strict_model 下仍判降级
+		{"gemini-3.6-flash", "3.5 Flash-Lite", true},
+		// 显式请求 Hydrogen 收到旧 Flash 族自报仍判降级
+		{"gemini-4-hydrogen", "3.8 Flash", true},
+		{"gemini-4-hydrogen", "3.5 Flash-Lite", true},
+		{"gemini-4-neon", "4 Hydrogen", true},
 		// Neon 中档→高档是同槽升级：不报降级、不触发账号冷却（错档由 argon 身份核验拒）
 		{"gemini-4-neon-thinking-medium", "4 Neon High", false},
 		{"gemini-4-neon-thinking-medium", "Gemini 4 Neon High", false},

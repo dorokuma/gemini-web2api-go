@@ -162,6 +162,8 @@ func foldModelName(s string) string {
 //
 // 看不见就不判：没自报（reported 为空）或模型没登记 Upstream 一律当没降级——
 // 误报会让开了开关的人白白丢请求，比漏判更伤。
+// 已确认的原位改名/升级可由 UpstreamAliases 放行（3.8 Flash→4 Hydrogen、
+// 3.1 Pro→4 Neon）；显式新模型条目不登记旧名，返回旧名时仍判降级。
 func modelDowngraded(mc ModelConfig, reported string) bool {
 	want := foldModelName(mc.Upstream)
 	got := foldModelName(reported)
@@ -173,12 +175,6 @@ func modelDowngraded(mc ModelConfig, reported string) bool {
 	if want == "" || got == "" {
 		return false
 	}
-	// hexFlash38 / Mode=1 槽位 2026-11 原位升级：显示名 "3.8 Flash" → "4 Hydrogen"
-	// （同 hex、同 Mode，只是名字变了）。是单向升级：请求旧名收到新名算同槽升级、
-	// 不算降级；反过来明确请求 4 Hydrogen 收到 Flash 族自报仍按下面前缀比较判降级。
-	if want == "3.8 flash" && (got == "4 hydrogen" || strings.HasPrefix(got, "4 hydrogen ")) {
-		return false
-	}
 	// Neon 中档→高档是同槽升级：中档自报 "4 Neon Medium"，被服务端升成高档时报
 	// "4 Neon High"。前缀规则断在词边界会把它当成降级，但升级错档不该触发
 	// strict_model 的账号 300 分钟冷却——档位不符仍由 argon.go 的强身份核验拒绝
@@ -186,5 +182,15 @@ func modelDowngraded(mc ModelConfig, reported string) bool {
 	if want == "4 neon medium" && (got == "4 neon high" || strings.HasPrefix(got, "4 neon high ")) {
 		return false
 	}
-	return got != want && !strings.HasPrefix(got, want+" ")
+	if got == want || strings.HasPrefix(got, want+" ") {
+		return false
+	}
+	// 登记的别名（原位升级/改名后的新显示名）同样放行：精确匹配或词边界前缀匹配。
+	for _, alias := range mc.UpstreamAliases {
+		name := strings.ReplaceAll(foldModelName(alias), "carbon", "argon")
+		if name != "" && (got == name || strings.HasPrefix(got, name+" ")) {
+			return false
+		}
+	}
+	return true
 }
