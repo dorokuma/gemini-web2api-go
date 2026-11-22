@@ -65,7 +65,7 @@ func conversationToolCalls(value interface{}) []ToolCall {
 		return nil
 	}
 	var calls []ToolCall
-	if json.Unmarshal(b, &calls) != nil {
+	if unmarshalJSONUseNumber(b, &calls) != nil {
 		return nil
 	}
 	for i := range calls {
@@ -89,8 +89,11 @@ func conversationCallMaps(calls []ToolCall) []interface{} {
 }
 
 // Responses may replay one assistant turn as separate function_call/message
-// items. Chat replays it as a single message. Normalize both to the same turn,
-// including call identity/arguments rather than just the visible assistant text.
+// items; the responsesToMessages adapter already coalesces them back into one
+// message, and Gemini model turns arrive inside a single message. Chat replays
+// keep each message boundary as-is: merging two adjacent assistant messages
+// here would give ["first","second"] the same fingerprint as ["firstsecond"],
+// so consecutive assistant messages stay separate.
 func normalizeConversationMessages(messages []map[string]interface{}) []map[string]interface{} {
 	var result []map[string]interface{}
 	names := map[string]string{}
@@ -109,22 +112,17 @@ func normalizeConversationMessages(messages []map[string]interface{}) []map[stri
 		if len(calls) > 0 {
 			m["tool_calls"] = conversationCallMaps(calls)
 			for _, call := range calls {
-				names[call.ID] = call.Function.Name
+				if call.ID != "" {
+					names[call.ID] = call.Function.Name
+				}
 			}
 		}
 		if role == "tool" && getStr(m, "name") == "" {
-			if name := names[getStr(m, "tool_call_id")]; name != "" {
-				m["name"] = name
+			if id := getStr(m, "tool_call_id"); id != "" {
+				if name := names[id]; name != "" {
+					m["name"] = name
+				}
 			}
-		}
-		if role == "assistant" && len(result) > 0 && getStr(result[len(result)-1], "role") == "assistant" {
-			prev := result[len(result)-1]
-			prev["content"] = getStr(prev, "content") + getStr(m, "content")
-			if len(calls) > 0 {
-				all := append(conversationToolCalls(prev["tool_calls"]), calls...)
-				prev["tool_calls"] = conversationCallMaps(all)
-			}
-			continue
 		}
 		result = append(result, m)
 	}
@@ -148,7 +146,8 @@ func convScopeKey(mc ModelConfig, tools []map[string]interface{}, choice interfa
 		Tools                []map[string]interface{}
 		ToolMode, ForcedTool string
 		Task                 bool
-	}{1, requestScope, mc.HexID, mc.Mode, mc.thinkWire(), mc.Tool, mc.PinAccountID, tools, mode, forced, mc.TaskMode})
+		Upstream             string
+	}{1, requestScope, mc.HexID, mc.Mode, mc.thinkWire(), mc.Tool, mc.PinAccountID, tools, mode, forced, mc.TaskMode, mc.Upstream})
 	return hashStr(string(b))
 }
 
@@ -182,7 +181,9 @@ func conversationWithoutWireIDs(messages []map[string]interface{}) []map[string]
 	for _, m := range messages {
 		calls := conversationToolCalls(m["tool_calls"])
 		for i := range calls {
-			id := fmt.Sprintf("call_%d", callIndex)
+			// 归一化位置 ID 用 "#N" 命名空间，跟客户端送来的原始 wireID
+			// （可能是 "call_0" 甚至 "#0"）永远不会撞名。
+			id := fmt.Sprintf("#%d", callIndex)
 			callIndex++
 			if calls[i].ID != "" {
 				ids[calls[i].ID] = id
@@ -209,6 +210,11 @@ func conversationWithoutWireIDs(messages []map[string]interface{}) []map[string]
 		if id != "" {
 			m["tool_call_id"] = id
 			used[id] = true
+		} else if wireID != "" {
+			// 匹配不到任何调用的原始 wireID 也不能原样保留：原样留下时，
+			// 客户端随手编的 "#0"/"call_0" 会跟归一化位置 ID 撞出同一份
+			// 指纹。重写成 "raw:" 前缀占另一个命名空间，且不参与 used 去重。
+			m["tool_call_id"] = "raw:" + wireID
 		}
 	}
 	return messages

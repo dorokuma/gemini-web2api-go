@@ -65,16 +65,23 @@ func TestCanonicalMessagesNormalizesOnlyToolArguments(t *testing.T) {
 	}
 }
 
-func TestCanonicalMessagesCoalescesAssistantReplay(t *testing.T) {
+// 规范层不再合并相邻 assistant（任务书修复 3）：同轮拆分回放的合并由
+// responsesToMessages 适配层承担，规范层保留 Chat 消息边界。split 与
+// combined 现在指纹不同、是合法的两段历史。Responses 拆分回放等价性在
+// TestResponsesInputAssistantReplayGrouping 核验。
+func TestCanonicalMessagesDoesNotMergeAssistantReplay(t *testing.T) {
 	call := conversationTestCall("call_1", "read_file", `{"path":"one"}`)
 	combined := []map[string]interface{}{{"role": "assistant", "content": "Checking", "tool_calls": []interface{}{call}}}
-	for _, split := range [][]map[string]interface{}{
-		{{"role": "assistant", "tool_calls": []interface{}{call}}, {"role": "assistant", "content": "Checking"}},
-		{{"role": "assistant", "content": "Checking"}, {"role": "assistant", "tool_calls": []interface{}{call}}},
-	} {
-		if canonicalMessages(combined) != canonicalMessages(split) {
-			t.Fatal("separate assistant text and function call items must identify the same turn")
-		}
+	split := []map[string]interface{}{
+		{"role": "assistant", "tool_calls": []interface{}{call}},
+		{"role": "assistant", "content": "Checking"},
+	}
+	if canonicalMessages(combined) == canonicalMessages(split) {
+		t.Fatal("normalization must not merge adjacent assistant messages into one turn")
+	}
+	// Chat 里客户端分两条发的合法边界要原样保留。
+	if got := normalizeConversationMessages(split); len(got) != 2 {
+		t.Fatalf("adjacent assistant messages must stay separate: %#v", got)
 	}
 }
 
@@ -102,7 +109,9 @@ func resetConversationTestState(t *testing.T) {
 func conversationTestRaw(t *testing.T, text string) string {
 	t.Helper()
 	inner := make([]interface{}, 44)
-	inner[1] = []interface{}{"c_test", "r_test"}
+	// inner[1] 故意不给 cid/rid：测试不依赖 parseConvIDs 回填，各续接桩显式
+	// 设置 st.cid（生产路径只有拿到 cid 才入库，见 callGeminiConv 尾部）。
+	inner[1] = []interface{}{"", ""}
 	inner[4] = []interface{}{[]interface{}{"rc_test", []interface{}{text}, nil, nil, nil, nil, nil, nil, []interface{}{2}, "en"}}
 	inner[39], inner[42], inner[43] = "cf41b0e0dd7d53e5", "3.5 Flash-Lite", true
 	body, err := json.Marshal(inner)
@@ -281,6 +290,7 @@ func TestCallGeminiConvPlainChatAndConsumedHeads(t *testing.T) {
 	var turns []int
 	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
 		turns = append(turns, st.turn)
+		st.cid = "plain-conversation"
 		st.turn++
 		return &StreamResult{Raw: conversationTestRaw(t, "first-answer")}, nil
 	})
@@ -309,6 +319,7 @@ func TestCallGeminiConvChangedHistoryOrScopeStartsFresh(t *testing.T) {
 			var turns []int
 			stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
 				turns = append(turns, st.turn)
+				st.cid = "scope-conversation"
 				st.turn++
 				return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
 			})
@@ -347,6 +358,7 @@ func TestCallGeminiConvFailedContinuationIsNotReused(t *testing.T) {
 	var turns []int
 	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
 		turns = append(turns, st.turn)
+		st.cid = "failed-continuation"
 		st.turn++ // Even a failed request may already have advanced upstream.
 		if len(turns) == 2 {
 			return &StreamResult{}, errors.New("lost upstream response")
@@ -375,6 +387,7 @@ func TestCallGeminiConvEmptyContinuationIsNotReused(t *testing.T) {
 	var turns []int
 	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
 		turns = append(turns, st.turn)
+		st.cid = "empty-continuation"
 		st.turn++
 		if len(turns) == 2 {
 			return &StreamResult{Raw: conversationTestRaw(t, "")}, nil
@@ -451,6 +464,7 @@ func TestCallGeminiConvPassesContextThrough(t *testing.T) {
 	var got context.Context
 	stubConversationTestTurn(t, func(c context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
 		got = c
+		st.cid = "ctx-conversation"
 		st.turn++
 		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
 	})
@@ -509,5 +523,204 @@ func TestCallGeminiConvTaskModeContinuationKeepsScopeAndMode(t *testing.T) {
 	}
 	if turns[len(turns)-1] != 0 {
 		t.Fatalf("chat-mode request must cold-start, not reuse task conversation: %v", turns)
+	}
+}
+
+// 相邻两条 assistant 是合法的 Chat 历史边界（比如客户端拼接的续写）。归一化
+// 无条件合并会把 ["first","second"] 和 ["firstsecond"] 变成同一份指纹，
+// 让两段真实不同的对话互相续接 —— 指纹必须保留消息边界。
+func TestNormalizeConversationKeepsAssistantBoundaries(t *testing.T) {
+	split := []map[string]interface{}{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": "first"},
+		{"role": "assistant", "content": "second"},
+		{"role": "user", "content": "next"},
+	}
+	merged := []map[string]interface{}{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": "firstsecond"},
+		{"role": "user", "content": "next"},
+	}
+	if canonicalMessages(split) == canonicalMessages(merged) {
+		t.Fatal("adjacent assistant messages must keep their boundary, not collapse into one")
+	}
+	if got := normalizeConversationMessages(split); len(got) != 4 {
+		t.Fatalf("split assistant messages must not be merged: %#v", got)
+	}
+	// 冷启动 prompt 也要带两条独立的 [Assistant] 行，不是拼接后的一条。
+	prompt := buildPrompt(split, nil, nil, false)
+	if !strings.Contains(prompt, "[Assistant]: first\n\n[Assistant]: second") {
+		t.Fatalf("prompt must keep two separate assistant turns: %q", prompt)
+	}
+}
+
+// 缺省 call_id 的 tool_calls 不能污染 names[""]：后面一条既没 tool_call_id 也
+// 没 name 的 tool 消息不能蹭到别的调用的函数名，也不能和显式 name 撞车。
+func TestNormalizeConversationEmptyCallIDDoesNotLeakName(t *testing.T) {
+	messages := []map[string]interface{}{
+		{"role": "assistant", "tool_calls": []interface{}{
+			map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "alpha", "arguments": "{}"}},
+			map[string]interface{}{"type": "function", "function": map[string]interface{}{"name": "beta", "arguments": "{}"}},
+		}},
+		{"role": "tool", "content": "anonymous result"},
+		{"role": "tool", "name": "beta", "content": "named result"},
+	}
+	got := normalizeConversationMessages(messages)
+	if getStr(got[1], "name") != "" {
+		t.Fatalf("id-less tool result must not inherit a call name: %#v", got[1])
+	}
+	if getStr(got[2], "name") != "beta" {
+		t.Fatalf("explicit tool result name must be kept: %#v", got[2])
+	}
+	// 显式 name 回填仍要工作：tool_call_id 能对上时从 calls 找回函数名。
+	resolved := normalizeConversationMessages([]map[string]interface{}{
+		{"role": "assistant", "tool_calls": []interface{}{
+			conversationTestCall("call_x", "gamma", "{}"),
+		}},
+		{"role": "tool", "tool_call_id": "call_x", "content": "ok"},
+	})
+	if getStr(resolved[1], "name") != "gamma" {
+		t.Fatalf("tool result name resolution broke: %#v", resolved[1])
+	}
+}
+
+// 归一化位置 ID（#N）与客户端原样的未匹配 wireID 不能撞名："call_0"/"#0"
+// 这类原始 ID 必须重写成独立命名空间，否则两条语义不同的结果撞同一份指纹。
+func TestConversationWithoutWireIDsNamespacesUnmatchedIDs(t *testing.T) {
+	calls := []interface{}{
+		conversationTestCall("fc_1", "read_file", `{"path":"one"}`),
+		conversationTestCall("fc_2", "read_file", `{"path":"two"}`),
+	}
+	histA := []map[string]interface{}{
+		{"role": "assistant", "tool_calls": calls},
+		{"role": "tool", "tool_call_id": "fc_1", "name": "read_file", "content": "result-A"},
+	}
+	histB := []map[string]interface{}{
+		{"role": "assistant", "tool_calls": calls},
+		{"role": "tool", "tool_call_id": "call_0", "name": "read_file", "content": "result-A"},
+	}
+	keysA := convPrefixKeys(histA, "scope", true)
+	keysB := convPrefixKeys(histB, "scope", true)
+	if len(keysA) != 2 || len(keysB) != 2 {
+		t.Fatalf("unexpected key counts: %v vs %v", keysA, keysB)
+	}
+	if keysA[1] == keysB[1] {
+		t.Fatal("unmatched raw wire ID must not collide with the normalized position ID")
+	}
+	// 显式 wireID 是 "#0"（位置 ID 的同名字面量）也不能撞位置 0。
+	histC := []map[string]interface{}{
+		{"role": "assistant", "tool_calls": calls},
+		{"role": "tool", "tool_call_id": "#0", "name": "read_file", "content": "result-A"},
+	}
+	if convPrefixKeys(histC, "scope", true)[1] == keysA[1] {
+		t.Fatal("literal \"#0\" wire ID must not collide with normalized position 0")
+	}
+}
+
+// mc.Upstream 必须进会话 scope：同 hex/mode、仅登记上游名不同的模型（例如
+// gemini-3.8-flash 与 gemini-4-hydrogen）在 strict_model 下语义不同，不能共享
+// 一路服务端会话（混用会把 3.8 的续接发到 4 Hydrogen 上报的身份下）。
+func TestConversationScopeSeparatesUpstreamName(t *testing.T) {
+	if convScopeKey(Models["gemini-3.8-flash"], nil, nil, "thread") ==
+		convScopeKey(Models["gemini-4-hydrogen"], nil, nil, "thread") {
+		t.Fatal("models with different registered Upstream names must not share a scope")
+	}
+}
+
+// 已取消的 ctx 必须在动会话存储和账号池之前返回：以前续接请求先 convTake
+// 销毁了健康 head，等 runConversationTurn 才发现 ctx 已死，好好的会话作废。
+func TestCallGeminiConvRejectsCancelledContextBeforeTake(t *testing.T) {
+	resetConversationTestState(t)
+	mc := Models["gemini-3.5-flash-lite"]
+	first := []map[string]interface{}{{"role": "user", "content": "question"}}
+	var turns []int
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		st.cid = "cancel-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	if _, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	next := append(append([]map[string]interface{}{}, first...),
+		map[string]interface{}{"role": "assistant", "content": "answer"},
+		map[string]interface{}{"role": "user", "content": "next"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err := callGeminiConv(ctx, next, mc, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled context must return context.Canceled, got %v", err)
+	}
+	// 被取消的请求不能碰会话 head：正常请求还得在原会话上续接（turn 1）。
+	if _, _, _, err := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 2 || turns[1] != 1 {
+		t.Fatalf("cancelled request must not consume the conversation head: %v", turns)
+	}
+}
+
+// 续接绑定的登录号被禁用/删除后，不能再拿原号发——禁用号在 BrowserTransport
+// 下绕过浏览器会漏 Go HTTP 指纹，也可能直接失败。必须回退冷启动重新挑号。
+func TestCallGeminiConvDisabledAccountFallsBackToFresh(t *testing.T) {
+	resetConversationTestState(t)
+	// 会话要求登录态：放一个池内账号供首轮挑号，再手动把 convState 记成它。
+	id, err := accountAdd("test", "SAPISID=dummy; SID=x", "")
+	if err != nil {
+		t.Fatalf("insert test account: %v", err)
+	}
+	t.Cleanup(func() { _ = accountDelete(id) })
+	mc := Models["gemini-3.8-flash"] // modelNeedsLogin，走登录号路径
+	var turns []int
+	var accountSeen []int64
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		accountSeen = append(accountSeen, st.accountID)
+		st.cid = "account-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "account-question"}}
+	if _, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "acct-thread"}); err != nil {
+		t.Fatal(err)
+	}
+	if accountSeen[0] != id {
+		t.Fatalf("first turn must pick the pool account #%d, got %d", id, accountSeen[0])
+	}
+	// 禁用该账号：下一轮同历史续接必须冷启动（fresh），不能再把请求发到 #id。
+	if err := accountSetStatus(id, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	next := append(append([]map[string]interface{}{}, first...),
+		map[string]interface{}{"role": "assistant", "content": "answer"},
+		map[string]interface{}{"role": "user", "content": "account-followup"})
+	// 唯一账号被禁后没有健康账号可挑：调用必须报错或冷启动（turn==0），
+	// 绝不能拿被禁的号去发续接（turn==1 是失败信号）。turns=[0,0] 正确：
+	// 禁用后第二轮回退冷启动（upstream 桩仍被调用，但 turn=0 不是续接）。
+	_, _, _, callErr := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil, conversationOptions{requestScope: "acct-thread"})
+	if len(turns) != 2 || turns[1] != 0 {
+		t.Fatalf("disabled bound account must not continue turn 1 on it: turns=%v err=%v", turns, callErr)
+	}
+	_ = callErr // 报错（无号可挑）或冷启动都接受，关键是没在原号上续接 turn 1
+}
+
+// 上游一轮成功但没回 cid（坏帧）：这种状态续接不上，绝不能落库——否则下一
+// 路同前缀请求撞进一条永远失败的发空 cid 的死会话。
+func TestCallGeminiConvDoesNotStoreHeadWithoutCID(t *testing.T) {
+	resetConversationTestState(t)
+	mc := Models["gemini-3.5-flash-lite"]
+	first := []map[string]interface{}{{"role": "user", "content": "no-cid-question"}}
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		// 成功返回但刻意不给 st.cid，模拟上游帧缺续接 ID。
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "no-cid-answer")}, nil
+	})
+	if _, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "nocid-thread"}); err != nil {
+		t.Fatal(err)
+	}
+	convMu.Lock()
+	defer convMu.Unlock()
+	if len(convStore) != 0 {
+		t.Fatalf("a turn without cid must not be stored as a continuation head: %d entries", len(convStore))
 	}
 }

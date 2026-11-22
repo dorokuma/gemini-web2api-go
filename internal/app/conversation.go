@@ -500,6 +500,11 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc ModelConfig,
 	tools []map[string]interface{}, toolChoice interface{},
 	onDelta, onReasoning func(string), options ...conversationOptions) (string, []ToolCall, *StreamResult, error) {
+	// 已取消的请求不许动会话存储和账号池：convTake 会销毁健康 head，
+	// pickAccountForModel 会白占一轮轮询。
+	if err := ctx.Err(); err != nil {
+		return "", nil, &StreamResult{}, err
+	}
 	messages = normalizeConversationMessages(messages)
 	var opt conversationOptions
 	if len(options) > 0 {
@@ -508,6 +513,16 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	scope := convScopeKey(mc, tools, toolChoice, opt.requestScope)
 	conv, prefixLen := convTake(convPrefixKeys(messages, scope, opt.normalizeToolIDs))
 	fresh := conv == nil
+	if !fresh && conv.isLogin {
+		// 会话绑死的号被禁用/删除后不能再往上发：禁用的号发出去要么失败，
+		// 更糟的是在 BrowserTransport=true && BrowserFallbackHTTP=false 下
+		// 绕过常驻浏览器漏出 Go HTTP 指纹。强制冷启动让挑号逻辑重新选健康账号。
+		if a := accountByID(conv.accountID); a == nil || a.Status != "enabled" {
+			logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
+			fresh = true
+			conv = nil
+		}
+	}
 
 	var prompt string
 	if fresh {
@@ -520,7 +535,16 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 		// 通道（tool 结果带 [Tool result for …] 前缀）；mc.TaskMode 必须透传——
 		// Task 模式的工具锚点不收平台「0 remaining」免疫词。
 		prompt = buildPrompt(messages[prefixLen:], nil, nil, mc.TaskMode)
-		logf("[conv] 续接命中 turn=%d，只发 %d 字节（新增 %d 条消息，历史留服务端）", conv.turn, len(prompt), len(messages)-prefixLen)
+		if strings.TrimSpace(prompt) == "" {
+			// 增量拼不出正文（新增消息全空）：发 0 字节 prompt 上游只会报
+			// 一个看不懂的错，回退全量历史冷启动。
+			fresh = true
+			conv = nil
+			prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
+			logf("[conv] 续接增量为空，回退新会话全量发 %d 字节", len(prompt))
+		} else {
+			logf("[conv] 续接命中 turn=%d，只发 %d 字节（新增 %d 条消息，历史留服务端）", conv.turn, len(prompt), len(messages)-prefixLen)
+		}
 	}
 
 	// strict_model 换号只对新会话做：续接的会话绑死在原来的号上，降级了只记冷却、
@@ -596,7 +620,9 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	// 这段回复原样带回来时，convTake 会命中它的前缀键。只发新 head，旧键已消费，
 	// 纯工具回复（text 为空、只有 tool_calls）也能被区分开。
 	keys := convPrefixKeys(conversationMessagesWithReply(messages, text, toolCalls), scope, opt.normalizeToolIDs)
-	if len(keys) > 0 {
+	// 没拿到 cid 的会话不能落库：上游没给 cid 就永远续接不上，存了只会让
+	// 下一路同前缀请求撞进一条死会话（发的续接请求带空 cid）。
+	if len(keys) > 0 && conv.cid != "" {
 		convPut(keys[len(keys)-1], conv)
 	}
 	return text, toolCalls, res, nil

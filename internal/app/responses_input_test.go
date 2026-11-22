@@ -207,6 +207,202 @@ func TestResponsesHandlerToolReplayContinuesConversation(t *testing.T) {
 	}
 }
 
+// 多模态 content 不能被 contentToString 拍平：input_image / input_audio /
+// input_video 拍平后就从 rejectUnsupported / collectImages 眼前消失，匿名
+// 会直接拿到 200、有 cookie 则悄悄丢图。含非文本 part 的数组必须原样保留。
+func TestResponsesInputPreservesMediaParts(t *testing.T) {
+	for label, body := range map[string]string{
+		"mixed image":    `{"input":[{"role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}]}`,
+		"pure image":     `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}]}`,
+		"audio":          `{"input":[{"role":"user","content":[{"type":"input_audio","data":"AAAA"}]}]}`,
+		"video_url":      `{"input":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"https://x/v.mp4"}}]}]}`,
+		"unknown future": `{"input":[{"role":"user","content":[{"type":"input_file","file_url":"https://x/f.pdf"}]}]}`,
+	} {
+		t.Run(label, func(t *testing.T) {
+			messages := responseInputFixture(t, body)
+			if len(messages) != 1 {
+				t.Fatalf("messages=%#v", messages)
+			}
+			parts, ok := messages[0]["content"].([]interface{})
+			if !ok {
+				t.Fatalf("media content must stay a []interface{} for rejectUnsupported/collectImages, got %#v", messages[0]["content"])
+			}
+			if len(parts) == 0 {
+				t.Fatalf("media parts lost: %#v", messages[0])
+			}
+		})
+	}
+	// 纯文本数组仍拍平成字符串（既有行为与下游不变）。
+	text := responseInputFixture(t, `{"input":[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"text","text":"b"}]}]}`)
+	if s, ok := text[0]["content"].(string); !ok || s != "a b" {
+		t.Fatalf("pure-text array must still flatten, got %#v", text[0]["content"])
+	}
+}
+
+// 探针 1A/1B：/v1/responses 的 input_image 匿名要被 rejectUnsupported 拒成
+// 400，input_audio 恒拒 400 —— 绝不能拍平后漏成空 prompt 发 200。
+func TestResponsesHandlerRejectsUnsupportedMedia(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var upstreamPrompts []string
+	stubConversationTestTurn(t, func(_ context.Context, prompt string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		upstreamPrompts = append(upstreamPrompts, prompt)
+		st.cid = "media-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer media-test-caller")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		return w
+	}
+	// 首轮纯文本成功建会话。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[{"role":"user","content":"ready"}]}`); w.Code != 200 {
+		t.Fatalf("text turn status=%d: %s", w.Code, w.Body.String())
+	}
+	// 次轮纯 input_image：无 cookie 必须 400，且不能碰到上游桩。
+	w := post(`{"model":"gemini-3.5-flash-lite","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}]}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "image input needs a Google account cookie") {
+		t.Fatalf("anonymous input_image must be rejected: %d %s", w.Code, w.Body.String())
+	}
+	// input_audio 恒拒。
+	w = post(`{"model":"gemini-3.5-flash-lite","input":[{"role":"user","content":[{"type":"input_audio","data":"AAAA"}]}]}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "audio input not supported") {
+		t.Fatalf("input_audio must be rejected: %d %s", w.Code, w.Body.String())
+	}
+	// 混排里的媒体同样要拦（丢图比报错更糟）。
+	w = post(`{"model":"gemini-3.5-flash-lite","input":[{"role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}]}`)
+	if w.Code != 400 {
+		t.Fatalf("mixed media must be rejected too: %d %s", w.Code, w.Body.String())
+	}
+	// 三次被拒都不能向上游发过任何空 prompt。
+	if len(upstreamPrompts) != 1 {
+		t.Fatalf("rejected requests must not reach upstream: %d calls %#v", len(upstreamPrompts), upstreamPrompts)
+	}
+}
+
+// function_call_output.output 的媒体 part 也要保留供校验（丢 base64 进
+// prompt 或丢图都算回归）。纯文本 output 照旧拍平。
+func TestResponsesInputFunctionCallOutputMedia(t *testing.T) {
+	messages := responseInputFixture(t, `{"input":[
+		{"type":"function_call","call_id":"call_1","name":"see","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}
+	]}`)
+	if len(messages) != 2 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	if _, ok := messages[1]["content"].([]interface{}); !ok {
+		t.Fatalf("tool output media must stay []interface{}: %#v", messages[1]["content"])
+	}
+	// output 含 input_audio 同样保留。
+	audio := responseInputFixture(t, `{"input":[
+		{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_audio","data":"AAAA"}]}
+	]}`)
+	if _, ok := audio[0]["content"].([]interface{}); !ok {
+		t.Fatalf("audio tool output must stay []interface{}: %#v", audio[0]["content"])
+	}
+}
+
+// 合成 call_%d 必须避开显式 call_id：预扫描已经登记了 call_1，缺省 ID 的
+// function_call 不能也叫 call_1，否则 tool_call_id 撞车、归属错乱。
+func TestResponsesInputSyntheticCallIDsAvoidExplicit(t *testing.T) {
+	messages := responseInputFixture(t, `{"input":[
+		{"type":"function_call","call_id":"call_1","name":"beta","arguments":"{}"},
+		{"type":"function_call","name":"alpha","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_1","output":"out"}
+	]}`)
+	if len(messages) != 2 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	calls, ok := messages[0]["tool_calls"].([]interface{})
+	if !ok || len(calls) != 2 {
+		t.Fatalf("want two tool_calls, got %#v", messages[0]["tool_calls"])
+	}
+	id0, id1 := getStr(calls[0].(map[string]interface{}), "id"), getStr(calls[1].(map[string]interface{}), "id")
+	if id0 != "call_1" {
+		t.Fatalf("explicit call_1 must stay on beta, got %q", id0)
+	}
+	if id1 == id0 || id1 == "call_1" {
+		t.Fatalf("synthesized ID must avoid explicit call_1, got %q", id1)
+	}
+	// tool 结果要归 beta（显式 call_1），不是归到 alpha 的合成 ID。
+	if getStr(messages[1], "tool_call_id") != "call_1" || getStr(messages[1], "name") != "beta" {
+		t.Fatalf("function_call_output must resolve to beta via call_1: %#v", messages[1])
+	}
+	// 嵌套进 assistant content 的 function_call 也参与避让。
+	nested := responseInputFixture(t, `{"input":[
+		{"role":"assistant","content":[{"type":"function_call","call_id":"call_0","name":"beta","arguments":"{}"}]},
+		{"type":"function_call","name":"alpha","arguments":"{}"}
+	]}`)
+	nCalls := nested[0]["tool_calls"].([]interface{})
+	if len(nCalls) != 2 || getStr(nCalls[1].(map[string]interface{}), "id") == "call_0" {
+		t.Fatalf("nested explicit call_0 must be avoided by synthesized IDs: %#v", nCalls)
+	}
+}
+
+// 探针 2B：对象形态 function_call.arguments / function_call_output.output
+// 里的大整数不能经 float64 提前舍入 —— 9007199254740993 与 …992 必须得到
+// 不同的会话指纹（否则不同参数串话续接），且 output 里的大整数进 prompt
+// 时保留精确字符串。
+func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var turns []int
+	var prompts []string
+	stubConversationTestTurn(t, func(_ context.Context, prompt string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		prompts = append(prompts, prompt)
+		turns = append(turns, st.turn)
+		st.cid = "bigint-conversation"
+		st.turn++
+		text := "done"
+		if len(prompts) == 1 {
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{\"id\":9007199254740993}}\n```"
+		}
+		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
+	})
+	post := func(body string) int {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer bigint-caller")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		if w.Code != 200 {
+			t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+		}
+		return w.Code
+	}
+	// 请求 1：参数 9007199254740992；请求 2：参数 9007199254740993 ——
+	// 不同参数指纹不同，两次都必须冷启动（turn 0），不能串话。
+	post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call","call_id":"c_a","name":"lookup","arguments":{"id":9007199254740992}},
+		{"type":"function_call_output","call_id":"c_a","output":"r1"},
+		{"role":"user","content":"go"}
+	]}`)
+	post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call","call_id":"c_a","name":"lookup","arguments":{"id":9007199254740993}},
+		{"type":"function_call_output","call_id":"c_a","output":"r1"},
+		{"role":"user","content":"go"}
+	]}`)
+	if len(turns) != 2 || turns[0] != 0 || turns[1] != 0 {
+		t.Fatalf("differing >2^53 argument must cold-start, not continue: turns=%v", turns)
+	}
+	// output 里的大整数对象也要精确进 prompt（不许提前舍入成 ...992）。
+	post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call_output","call_id":"c_b","output":{"id":9007199254740993}},
+		{"role":"user","content":"check"}
+	]}`)
+	if !strings.Contains(prompts[2], "9007199254740993") || strings.Contains(prompts[2], "9007199254740992") {
+		t.Fatalf("large integer output must stay exact in prompt: %q", prompts[2])
+	}
+}
+
 func TestResponsesRequestNamespaceIsolation(t *testing.T) {
 	request := httptest.NewRequest("POST", "/v1/responses", nil)
 	request.Header.Set("Authorization", "Bearer private-test-credential")

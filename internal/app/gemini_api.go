@@ -386,7 +386,7 @@ func parseGeminiRequest(w http.ResponseWriter, r *http.Request) (*geminiAPIReque
 		return nil, nil, nil, nil, false
 	}
 	var req geminiAPIRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalJSONUseNumber(body, &req); err != nil {
 		writeGeminiError(w, 400, "invalid JSON: "+err.Error())
 		return nil, nil, nil, nil, false
 	}
@@ -440,7 +440,7 @@ func callParts(calls []ToolCall) []interface{} {
 	var parts []interface{}
 	for _, tc := range calls {
 		args := map[string]interface{}{}
-		_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+		_ = unmarshalJSONUseNumber([]byte(tc.Function.Arguments), &args)
 		parts = append(parts, map[string]interface{}{"functionCall": map[string]interface{}{
 			"id": tc.ID, "name": tc.Function.Name, "args": args}})
 	}

@@ -254,7 +254,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalJSONUseNumber(body, &req); err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
@@ -507,7 +507,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalJSONUseNumber(body, &req); err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}

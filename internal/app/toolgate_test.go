@@ -687,7 +687,7 @@ func TestChatCompletionsMultiTurnNoContentFrame(t *testing.T) {
 			{"role": "user", "content": probe},
 			{"role": "assistant", "content": mtReply},
 		}, scope); len(keys) > 0 {
-			convTake(keys)
+			convDelete(keys[len(keys)-1])
 		}
 		// 续接轮（若走到落库）head：再追加 assistant 空回复一轮的键。
 		if keys := convPrefixKeys([]map[string]interface{}{
@@ -696,7 +696,7 @@ func TestChatCompletionsMultiTurnNoContentFrame(t *testing.T) {
 			{"role": "user", "content": probe},
 			{"role": "assistant", "content": ""},
 		}, scope); len(keys) > 0 {
-			convTake(keys)
+			convDelete(keys[len(keys)-1])
 		}
 	})
 	since := requestWatermark(t)
