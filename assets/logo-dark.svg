@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72" fill="none">
+  <defs>
+    <linearGradient id="g" x1="18" y1="18" x2="54" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+  <rect width="72" height="72" rx="16" fill="#161b22"/>
+  <!-- Gemini four-pointed star -->
+  <path d="M36 17 L39.6 32.4 L55 36 L39.6 39.6 L36 55 L32.4 39.6 L17 36 L32.4 32.4 Z" fill="url(#g)"/>
+  <!-- API swap arrows: two curved strokes hugging the star -->
+  <g stroke="url(#g)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14.5 27.5 A23.5 23.5 0 0 1 27.5 14.5"/>
+    <polyline points="23,15.5 28.8,13.6 27.6,19.6"/>
+    <path d="M57.5 44.5 A23.5 23.5 0 0 1 44.5 57.5"/>
+    <polyline points="49,56.5 43.2,58.4 44.4,52.4"/>
+  </g>
+</svg>
