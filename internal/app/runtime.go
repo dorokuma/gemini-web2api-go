@@ -81,6 +81,12 @@ type RuntimeConfig struct {
 	// StreamKeepaliveSec 是流式请求连续空闲多少秒就发一次保活（#70），0 = 关（默认）。
 	// 开了之后慢请求会先开流，失败只能在流里报错、HTTP 状态码锁成 200，见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
+	// StreamIdleTimeoutSec 是开流吐字后块间空闲多少秒就掐断重试（借鉴上游 #81），
+	// 0 = 关（默认，全程沿用 request_timeout_sec 的沉默窗口）。首个内容/思考帧到达
+	// 之前不生效——排队期上游约 60 秒一个心跳，由 request_timeout_sec 的沉默窗口
+	// 兜着；开流后若配置且比沉默窗口小，就换它盯帧间卡死。掐断报 errStreamIdle
+	// 走无条件重试（不受 retry_on_timeout 影响），见 gemini.go 的 stallWatch。
+	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
 	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch）。
 	// 默认 false：不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。
 	// 关掉时 saveRuntimeConfig 会异步 shutdownBrowser() 立刻回收内存。见 browser.go。
@@ -134,6 +140,7 @@ func initRuntimeConfig() {
 		StrictModel:            cfg.StrictModel,
 		StrictModelCooldownMin: cfg.StrictModelCooldownMin,
 		StreamKeepaliveSec:     cfg.StreamKeepaliveSec,
+		StreamIdleTimeoutSec:   cfg.StreamIdleTimeoutSec,
 		BrowserTransport:       cfg.BrowserTransport,
 		BrowserFallbackHTTP:    cfg.BrowserFallbackHTTP,
 	}
@@ -188,7 +195,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	for _, r := range []rangeCheck{
 		{"retry_attempts", c.RetryAttempts, 1, 10},
 		{"retry_delay_sec", c.RetryDelaySec, 0, 60},
-		{"request_timeout_sec", c.RequestTimeout, 5, 600},
+		{"request_timeout_sec", c.RequestTimeout, 5, 1200},
 		{"per_ip_concurrent", c.PerIPConcurrent, 0, 1000},
 		{"per_ip_rpm", c.PerIPRPM, 0, 10000},
 		{"per_ip_rph", c.PerIPRPH, 0, 100000},
@@ -197,6 +204,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"max_prompt_bytes", c.MaxPromptBytes, 0, 10000000},
 		{"strict_model_cooldown_min", c.StrictModelCooldownMin, 0, 10080},
 		{"stream_keepalive_sec", c.StreamKeepaliveSec, 0, 300},
+		{"stream_idle_timeout_sec", c.StreamIdleTimeoutSec, 0, 600},
 	} {
 		if r.v < r.min || r.v > r.max {
 			return fmt.Errorf("%s=%d 超出允许范围 [%d, %d]", r.name, r.v, r.min, r.max)

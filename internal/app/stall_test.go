@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +18,13 @@ func withStallLimit(t *testing.T, d time.Duration) {
 	prev := stallLimit
 	stallLimit = func() time.Duration { return d }
 	t.Cleanup(func() { stallLimit = prev })
+}
+
+func withStreamIdleLimit(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := streamIdleLimit
+	streamIdleLimit = func() time.Duration { return d }
+	t.Cleanup(func() { streamIdleLimit = prev })
 }
 
 // 每个用例都在两条路上各跑一遍，假上游的行为一样：代理那条（同 cancel_test：http:// 目标
@@ -175,6 +184,154 @@ func TestStallWatchEndsAnUpstreamThatNeverAnswers(t *testing.T) {
 				t.Fatalf("不回响应头的上游应报 StallError，实际 %v", err)
 			}
 		})
+	}
+}
+
+// 开流吐字后块间沉默超过 stream_idle_timeout_sec 才掐断；没到 idle 上限的缓慢
+// 吐字不被误杀。首个内容帧到达前 idle 不生效（排队心跳仍由 request_timeout_sec
+// 的沉默窗口续着）。
+func TestStallWatchSwitchesToIdleAfterFirstContent(t *testing.T) {
+	withStallLimit(t, 10*time.Second) // 排队窗口够长，肯定不是它掐的
+	withStreamIdleLimit(t, 250*time.Millisecond)
+	for _, p := range upstreamPaths {
+		t.Run(p.name, func(t *testing.T) {
+			content := mkContentLine("c_idle", "r_1", "第一段", "3.6 Flash", nil, "")
+			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+				fl := w.(http.Flusher)
+				fmt.Fprint(w, ")]}'\n"+content+"\n")
+				fl.Flush()
+				// 开流吐字后沉默超过 idle：应被 idle 掐断，而不是等满总窗口。
+				time.Sleep(900 * time.Millisecond)
+				fmt.Fprint(w, content+"\n")
+			}))
+
+			start := time.Now()
+			_, raw, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+				map[string]string{}, proxyURL, func(string) error { return nil }, nil)
+			if !errors.Is(err, errStreamIdle) {
+				t.Fatalf("开流后块间沉默应报 errStreamIdle，实际 %v", err)
+			}
+			if took := time.Since(start); took > 3*time.Second {
+				t.Fatalf("idle 250ms 就该掐断，实际等了 %v", took)
+			}
+			if !strings.Contains(string(raw), "第一段") {
+				t.Fatalf("首帧内容丢了：%q", raw)
+			}
+		})
+	}
+}
+
+// 开流前只发心跳（没有内容帧）时 idle 不生效：沉默窗口仍是 request_timeout_sec，
+// 短 idle 不会在排队期误杀。
+func TestStallWatchIdleDoesNotFireDuringHeartbeatQueue(t *testing.T) {
+	withStallLimit(t, 2*time.Second)
+	withStreamIdleLimit(t, 150*time.Millisecond) // 比心跳间隔短：若误生效会在排队期掐断
+	for _, p := range upstreamPaths {
+		t.Run(p.name, func(t *testing.T) {
+			content := mkContentLine("c_q", "r_1", "answer", "3.6 Flash", nil, "")
+			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+				fl := w.(http.Flusher)
+				w.Write([]byte(")]}'\n"))
+				fl.Flush()
+				for i := 0; i < 3; i++ {
+					time.Sleep(300 * time.Millisecond) // > idle 的心跳间隔
+					w.Write([]byte("heartbeat\n"))
+					fl.Flush()
+				}
+				fmt.Fprint(w, content+"\n")
+			}))
+
+			var got []string
+			_, raw, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+				map[string]string{}, proxyURL, func(line string) error {
+					got = append(got, line)
+					return nil
+				}, nil)
+			if err != nil {
+				t.Fatalf("排队心跳期被 idle 误杀：%v", err)
+			}
+			if !strings.Contains(string(raw), "answer") {
+				t.Fatalf("没等到排队之后的回复：%q", raw)
+			}
+		})
+	}
+}
+
+// idle<=0 或未超总窗口时行为与未配 idle 完全一致：掐断仍报 StallError。
+func TestStallWatchIdleDisabledOrGeLimit(t *testing.T) {
+	withStallLimit(t, 150*time.Millisecond)
+	// idle=0 与 idle>=limit 两种都不收缩窗口：停顿 400ms 触发的是 StallError。
+	for _, idle := range []time.Duration{0, 10 * time.Second} {
+		for _, p := range upstreamPaths {
+			t.Run(fmt.Sprintf("%s/idle=%v", p.name, idle), func(t *testing.T) {
+				withStreamIdleLimit(t, idle)
+				endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(200)
+					w.Write([]byte(")]}'\nfirst frame\n"))
+					w.(http.Flusher).Flush()
+					select {
+					case <-r.Context().Done():
+					case <-time.After(5 * time.Second):
+					}
+				}))
+				_, _, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+					map[string]string{}, proxyURL, nil, nil)
+				var stall *StallError
+				if !errors.As(err, &stall) {
+					t.Fatalf("idle=%v 时不应出现 errStreamIdle，实际 %v", idle, err)
+				}
+			})
+		}
+	}
+}
+
+// errStreamIdle 的重试语义：不能被当成「上游总超时」，否则 retry_on_timeout=关
+// 时会连它一起挡掉。它是瞬时抖动，必须无条件重试（同上游 #81）。
+func TestStreamIdleRetrySemantics(t *testing.T) {
+	if isUpstreamTimeout(errStreamIdle) {
+		t.Error("errStreamIdle 不该算 isUpstreamTimeout（会被 retry_on_timeout=关 一起挡掉）")
+	}
+	if !retryAfterTimeout(errStreamIdle) {
+		t.Error("errStreamIdle 应当总是重试")
+	}
+	// retry_on_timeout 关掉时，真正的总超时（StallError）仍被挡、idle 仍放行。
+	rtMu.Lock()
+	saved := rtVal.RetryOnTimeout
+	rtVal.RetryOnTimeout = false
+	rtMu.Unlock()
+	t.Cleanup(func() { rtMu.Lock(); rtVal.RetryOnTimeout = saved; rtMu.Unlock() })
+	if retryAfterTimeout(&StallError{Limit: time.Second}) {
+		t.Error("retry_on_timeout=关 时 StallError 不该重试")
+	}
+	if !retryAfterTimeout(errStreamIdle) {
+		t.Error("retry_on_timeout=关 时 errStreamIdle 仍应重试")
+	}
+}
+
+// 并发 markStreaming/heard/pause/resume/done 不产生 data race（go test -race 专查）。
+func TestStallWatchConcurrentMarkHeardNoRace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newStallWatchIdle(ctx, 50*time.Millisecond, 20*time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				w.heard()
+				w.markStreaming()
+				w.pause()
+				w.resume()
+			}
+		}()
+	}
+	wg.Wait()
+	w.done()
+	if err := w.explain(context.Canceled); err != context.Canceled {
+		t.Fatalf("done 后 explain 应原样返回，实际 %v", err)
 	}
 }
 

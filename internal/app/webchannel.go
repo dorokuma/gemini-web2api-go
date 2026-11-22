@@ -898,6 +898,11 @@ func doWebChannelRequest(ctx context.Context, r wcRequest, proxyURL string, onLi
 				if ttfb < 0 {
 					ttfb = time.Since(sendAt).Milliseconds()
 				}
+				// 首个内容/思考帧 = 已开流吐字：沉默窗口按 stream_idle_timeout_sec 收缩
+				//（#81 思路；排队期只发 noop 不会到这里）。与老协议同判据。
+				if len(textsInLine(ev.Line)) > 0 || reasoningInLine(ev.Line) != "" {
+					watch.markStreaming()
+				}
 				if stop != nil && stop.Load() {
 					return 200, rawBytes(), ttfb, snapshotCookies(), nil
 				}

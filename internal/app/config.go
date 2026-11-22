@@ -74,6 +74,11 @@ type Config struct {
 	StrictModelCooldownMin int `json:"strict_model_cooldown_min"`
 	// 流式保活间隔（秒），0 = 关（默认）。见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
+	// 开流吐字后块间空闲超时（秒，借鉴上游 #81）：首个内容/思考帧到达后，连续
+	// 这么多秒没有新 chunk 就掐断、当瞬时错误无条件重试。0 = 关（默认，全程沿用
+	// request_timeout_sec 的沉默窗口）。开流前（排队心跳期）不生效，见 gemini.go
+	// 的 stallWatch.markStreaming / streamIdleLimit。
+	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
 
 	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch），
 	// 见 browser.go。默认 false：不主动拉起 Chromium（常驻约 1.45 GB 内存），
@@ -139,6 +144,7 @@ func defaultConfig() Config {
 		FirefoxFingerprint:     false,
 		StrictModel:            false,
 		StrictModelCooldownMin: 300,
+		StreamIdleTimeoutSec:   0,
 		BrowserTransport:       false,
 		BrowserFallbackHTTP:    false,
 		BrowserPath:            "",
