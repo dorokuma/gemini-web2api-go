@@ -55,9 +55,9 @@ var upstreamPaths = []struct {
 // 180 秒时还在写的回复被拦腰掐掉。
 func TestStallWatchKeepsAReplyThatKeepsComing(t *testing.T) {
 	withRequestTimeout(t, 1) // 整次限时的客户端 1 秒就掐，回复要写 1.2 秒
-	// 沉默窗口放宽到 350ms：-race 下 TLS+HTTP/2 握手偶发 >150ms，窗口太短会在
-	// 握手阶段误掐（同 TestStallWatchWaitsThroughHeartbeats）。
-	withStallLimit(t, 350*time.Millisecond)
+	// 沉默窗口放宽到 700ms：-race 下 tls-client 冷 TLS+HTTP/2 握手实测偶发
+	// ~360ms，350ms 窗口仍会在握手阶段误掐（同 TestStallWatchWaitsThroughHeartbeats）。
+	withStallLimit(t, 700*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -92,10 +92,10 @@ func TestStallWatchKeepsAReplyThatKeepsComing(t *testing.T) {
 // 上游让请求排队时只发心跳帧（实测每 60 秒一个），排得比沉默上限还久也要等到出字：
 // 以前整次请求限时，排队超过 180 秒的请求一律被掐掉重发。
 func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
-	// 沉默窗口放宽到 350ms：linux/arm64 + -race 下 tls-client 首次 TLS+HTTP/2 握手
-	// 偶发 ~170ms，150ms 的窗口会在握手阶段就把请求掐掉（假红）。心跳间隔提到
+	// 沉默窗口放宽到 700ms：linux/arm64 + -race 下 tls-client 冷 TLS+HTTP/2 握手
+	// 实测偶发 ~360ms，350ms 窗口仍会在握手阶段就把请求掐掉（假红）。心跳间隔
 	// 180ms 让判据不变：排队心跳总时长（>1s）仍显著大于单次沉默上限。
-	withStallLimit(t, 350*time.Millisecond)
+	withStallLimit(t, 700*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +123,7 @@ func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
 			if len(got) == 0 || got[len(got)-1] != "answer" {
 				t.Fatalf("没等到排队之后的回复：%q", got)
 			}
-			if took := time.Since(start); took < 3*350*time.Millisecond {
+			if took := time.Since(start); took < 700*time.Millisecond {
 				t.Fatalf("测试前提不成立：排队只用了 %v，没比沉默上限长", took)
 			}
 		})
@@ -132,11 +132,11 @@ func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
 
 // 首帧之后就不再出字的上游，沉默满上限就放弃，报 StallError，并真的断开上游连接。
 func TestStallWatchEndsAQuietUpstream(t *testing.T) {
-	// 沉默窗口 350ms：linux/arm64 + -race 下 tls-client 冷 TLS+HTTP/2 握手偶发
-	// ~170ms，150ms 窗口会在握手阶段就掐断请求——服务端 handler 压根没跑到，
+	// 沉默窗口 700ms：linux/arm64 + -race 下 tls-client 冷 TLS+HTTP/2 握手实测
+	// 偶发 ~360ms，350ms 窗口会在握手阶段就掐断请求——服务端 handler 压根没跑到，
 	// upstreamGone 永不关闭，等满 5s 上限报「上游连接没有被关闭」（5.18s 假红，
 	// 与 TestStallWatchWaitsThroughHeartbeats 同类的窗口过短问题）。
-	withStallLimit(t, 350*time.Millisecond)
+	withStallLimit(t, 700*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			upstreamGone := make(chan struct{})
@@ -271,9 +271,9 @@ func TestStallWatchIdleDoesNotFireDuringHeartbeatQueue(t *testing.T) {
 // 调用方带了逐行回调，也不切换 idle 窗口——沉默满上限仍报 StallError。
 // （用真实内容帧 + 非 nil 回调验证：光传 nil 回调测不出「切换被正确跳过」。）
 func TestStallWatchIdleDisabledOrGeLimit(t *testing.T) {
-	// 沉默窗口 350ms：同 TestStallWatchEndsAQuietUpstream，-race 下冷握手偶发
-	// >150ms 会在服务端分发前掐断，内容帧根本到不了回调（假红）。
-	withStallLimit(t, 350*time.Millisecond)
+	// 沉默窗口 700ms：同 TestStallWatchEndsAQuietUpstream，-race 下冷握手实测
+	// 偶发 ~360ms，会在服务端分发前掐断，内容帧根本到不了回调（假红）。
+	withStallLimit(t, 700*time.Millisecond)
 	// idle=0 与 idle>=limit 两种都不收缩窗口：停顿 400ms 触发的是 StallError。
 	for _, idle := range []time.Duration{0, 10 * time.Second} {
 		for _, p := range upstreamPaths {
@@ -456,13 +456,26 @@ func TestStallWatchQueuedExpiryStaysStallError(t *testing.T) {
 		t.Fatalf("heard 把排队计时器误缩成 idle：%v 内被掐断，实际 %v", 4*idle, context.Cause(w.ctx))
 	case <-time.After(4 * idle): // > idle，< limit：误缩成 idle 此刻必然已触发
 	}
-	// 等排队计时器自然到期；再调 markStreaming 模拟首帧恰在到期瞬间到达。
-	time.Sleep(limit)
-	w.markStreaming()
-	if !w.streaming.Load() {
+	// 另起一只 0<idle<limit 的新 watch，等它的排队计时器真实到期、回调已落
+	// 盘后调 markStreaming：CAS 成功并真走 armIdleLocked——后建的 idle 计时器
+	// 改判不了先到期的 *StallError（WithCancelCause 首个 cancel 写死原因）。
+	//（旧写法直接复用 w，streaming 已置位导致 markStreaming 整体 no-op，
+	// 根本测不到这段。）
+	w2 := newStallWatchIdle(context.Background(), 40*time.Millisecond, 10*time.Millisecond)
+	defer w2.done()
+	select {
+	case <-w2.ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("w2 的排队计时器没有按 40ms 上限掐断")
+	}
+	w2.markStreaming()
+	if w2.idle <= 0 {
+		t.Fatalf("w2 的 idle 应生效（0 < idle < limit），实际 %v", w2.idle)
+	}
+	if !w2.streaming.Load() {
 		t.Fatal("markStreaming 后 streaming 应为 true")
 	}
-	cause := context.Cause(w.ctx)
+	cause := context.Cause(w2.ctx)
 	var stall *StallError
 	if !errors.As(cause, &stall) {
 		t.Fatalf("排队到期应报 *StallError，实际 %v", cause)
