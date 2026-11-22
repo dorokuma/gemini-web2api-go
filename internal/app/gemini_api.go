@@ -479,16 +479,17 @@ func geminiCandidate(parts []interface{}, finish string) map[string]interface{} 
 // prepareGemini 是 generateContent / streamGenerateContent 共用的前半段：
 // 解析、选模型、收图、拼 prompt。出错时已经写好响应。
 type geminiCall struct {
-	ctx        context.Context
-	req        *geminiAPIRequest
-	modelName  string
-	modelCfg   ModelConfig
-	messages   []map[string]interface{}
-	tools      []map[string]interface{}
-	toolChoice interface{}
-	images     []pendingUpload
-	prompt     string
-	pc         promptCtx
+	ctx          context.Context
+	req          *geminiAPIRequest
+	modelName    string
+	modelCfg     ModelConfig
+	messages     []map[string]interface{}
+	tools        []map[string]interface{}
+	toolChoice   interface{}
+	images       []pendingUpload
+	prompt       string
+	pc           promptCtx
+	requestScope string
 }
 
 func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*geminiCall, bool) {
@@ -520,13 +521,15 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		return nil, false
 	}
 	return &geminiCall{ctx: r.Context(), req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
-		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc}, true
+		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc,
+		requestScope: conversationRequestScope(r, "", "")}, true
 }
 
 // run 调上游；多轮开关的分流跟 /v1/chat/completions 一致。
 func (g *geminiCall) run(onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
 	if rtCfg().MultiTurn && len(g.images) == 0 && g.modelCfg.Tool == 0 {
-		return callGeminiConv(g.ctx, g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning)
+		return callGeminiConv(g.ctx, g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning,
+			conversationOptions{requestScope: g.requestScope, normalizeToolIDs: true})
 	}
 	return callGemini(g.ctx, g.prompt, g.pc, g.modelCfg, g.tools, g.images, onDelta, onReasoning)
 }
