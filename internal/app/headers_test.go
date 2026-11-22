@@ -292,6 +292,7 @@ func TestBrowserHeaderSnapshotConsistency(t *testing.T) {
 			rtMu.Unlock()
 		}
 	}()
+	defer func() { close(stop); wg.Wait() }()
 
 	uaRe := regexp.MustCompile(`Chrome/(\d+)\.`)
 	hintRe := regexp.MustCompile(`"Google Chrome";v="(\d+)"`)
@@ -316,6 +317,4 @@ func TestBrowserHeaderSnapshotConsistency(t *testing.T) {
 			t.Fatalf("迭代 %d: 单请求混用了两版配置 UA=%q Sec-CH-UA=%q", i, ua, h.Get("Sec-CH-UA"))
 		}
 	}
-	close(stop)
-	wg.Wait()
 }
