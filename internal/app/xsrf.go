@@ -186,6 +186,20 @@ func getUploadTokens(cookie string, authuser int, proxyURL string) (pushID, pctx
 	return e.pushID, e.pctx, nil
 }
 
+// appPageHeaders 是 GET /app 这种「打开网页」请求的 header：浏览器地址栏打开页面是
+// document / navigate，不是页面里发的 XHR（empty / cors）。抓 token 和匿名拿会话都用它，
+// 盖在 writeBrowserHeaders 的 XHR 默认值上面。
+func appPageHeaders() map[string]string {
+	return map[string]string{
+		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"Accept-Language":           "en-US,en;q=0.9",
+		"Upgrade-Insecure-Requests": "1",
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "none",
+	}
+}
+
 // fetchAppPage 抓 gemini.google.com/app 的 HTML。
 // 走跟主请求相同的出口：配了代理走 stdlib，没配走 tls-client，
 // 免得页面里取到的 token 和后续请求来自两个不同 IP。
@@ -201,10 +215,7 @@ func fetchAppPageCtx(ctx context.Context, cookie string, authuser int, proxyURL 
 		ctx = context.Background()
 	}
 	pageURL := geminiBase(authuser) + "/app"
-	headers := map[string]string{
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language": "en-US,en;q=0.9",
-	}
+	headers := appPageHeaders()
 	if cookie != "" {
 		headers["Cookie"] = cookie
 	}
@@ -236,7 +247,7 @@ func fetchAppPageCtx(ctx context.Context, cookie string, authuser int, proxyURL 
 		if err != nil {
 			return nil, err
 		}
-		setChromeHeaders(req.Header)
+		setChromeHeaders(req.Header, req.URL.Hostname())
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}

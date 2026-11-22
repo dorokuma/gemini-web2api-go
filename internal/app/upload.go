@@ -188,7 +188,7 @@ func uploadPostCtxAux(ctx context.Context, url string, headers map[string]string
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	setChromeHeaders(req.Header)
+	setChromeHeaders(req.Header, req.URL.Hostname())
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}

@@ -205,6 +205,9 @@ func getAnonSession(proxyURL string) (string, error) {
 				return nil, nil, nil, err
 			}
 			applyChromeHeaders(r)
+			for k, v := range appPageHeaders() {
+				r.Header.Set(k, v)
+			}
 			resp, err := getStdlibClient(proxyURL).Do(r)
 			if err != nil {
 				return nil, nil, nil, err
@@ -215,7 +218,10 @@ func getAnonSession(proxyURL string) (string, error) {
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		setChromeHeaders(r.Header)
+		applyBrowserFHeaders(r)
+		for k, v := range appPageHeaders() {
+			r.Header.Set(k, v)
+		}
 		resp, err := getTLSClient().Do(r)
 		if err != nil {
 			return nil, nil, nil, err
