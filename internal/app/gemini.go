@@ -1377,7 +1377,6 @@ func (e *StallError) Temporary() bool { return true }
 // 掐断（借鉴上游 #81）。故意不做 Timeout()=true、不被 isUpstreamTimeout 认：开流后
 // 的块间卡死是瞬时抖动（跟空响应 1155 同类，重发通常就有内容），要无条件重试，
 // 而不是被 retry_on_timeout=关 一起挡掉（那是给「等满总超时多半还超时」用的）。
-// 同样不计进代理健康度：首帧已经来过、出口是通的，卡住是上游自己的事。
 var errStreamIdle = errors.New("upstream stream idle timeout (no chunk within stream_idle_timeout_sec)")
 
 // stallWatch 盯着一次 StreamGenerate：上游 limit 这么久一个字节都没来（连上了却迟迟
@@ -1465,9 +1464,11 @@ func (w *stallWatch) heard() {
 }
 
 // limitForLocked 返回当前生效的沉默窗口：开流吐字后 idle>0 时用 idle，否则 limit。
-// 调用方须持 w.mu。
+// 只看锁内字段 timerIdle，不读原子标志 streaming——markStreaming 先 CAS 后置锁
+// 换 idle timer，中间窗口里 heard/resume 若按 streaming 判，会把还在走的排队
+// 计时器误重置成 w.idle。调用方须持 w.mu。
 func (w *stallWatch) limitForLocked() time.Duration {
-	if w.streaming.Load() && w.idle > 0 {
+	if w.timerIdle {
 		return w.idle
 	}
 	return w.limit
@@ -1490,11 +1491,15 @@ func (w *stallWatch) markStreaming() {
 
 // pause 在客户端主动节流等待（如 WebChannel 的 wcPromptGap）期间暂停沉默计时，
 // 避免客户端主动 sleep 被误判为上游沉默；调用方 ctx 取消仍照常立即生效。
+// limit<=0 时 w.timer 为 nil，也要记 paused=true：暂停期的 markStreaming 只记
+// 阶段不建计时器，resume 才能按 timerIdle 把 idle 计时器补回来。
 func (w *stallWatch) pause() {
 	w.mu.Lock()
-	if !w.stopped && !w.paused && w.timer != nil {
+	if !w.stopped && !w.paused {
 		w.paused = true
-		w.timer.Stop()
+		if w.timer != nil {
+			w.timer.Stop()
+		}
 	}
 	w.mu.Unlock()
 }

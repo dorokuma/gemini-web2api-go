@@ -434,14 +434,34 @@ func TestStallWatchExplainKeepsSentinelErrors(t *testing.T) {
 
 // S3：排队期 timer 已到期、回调还没执行时并发 markStreaming，掐断原因必须仍是
 // 排队超时的 *StallError，不能被错挂成 errStreamIdle（阶段由 timer 专属回调决定）。
+// 用 0 < idle < limit：idle 真实生效（旧写法 idle>limit 时 idle 被禁用，测不到
+// 两条窗口并存的路径）；并覆盖 markStreaming 的 CAS 已完成、持锁换 timer 之前的
+// 半发布窗口——期间 heard 绝不能按 streaming 把排队计时器误缩成 idle。
 func TestStallWatchQueuedExpiryStaysStallError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := newStallWatchIdle(ctx, 30*time.Millisecond, 10*time.Second)
+	const idle, limit = 40 * time.Millisecond, 400 * time.Millisecond
+	w := newStallWatchIdle(ctx, limit, idle)
 	defer w.done()
-	// 等排队计时器到期；随即并发 markStreaming（模拟首帧恰在到期瞬间到达）。
-	time.Sleep(80 * time.Millisecond)
+	if w.idle <= 0 {
+		t.Fatalf("idle 应生效（0 < idle < limit），实际 %v", w.idle)
+	}
+	// 半发布窗口：streaming 已置位，当前 timer 仍是排队计时器（timerIdle=false）。
+	// limitForLocked 只看锁内 timerIdle，所以这里的 heard 重置的仍是 limit 窗口，
+	// 不会在 idle 到期时提前掐断。
+	w.streaming.Store(true)
+	w.heard()
+	select {
+	case <-w.ctx.Done():
+		t.Fatalf("heard 把排队计时器误缩成 idle：%v 内被掐断，实际 %v", 4*idle, context.Cause(w.ctx))
+	case <-time.After(4 * idle): // > idle，< limit：误缩成 idle 此刻必然已触发
+	}
+	// 等排队计时器自然到期；再调 markStreaming 模拟首帧恰在到期瞬间到达。
+	time.Sleep(limit)
 	w.markStreaming()
+	if !w.streaming.Load() {
+		t.Fatal("markStreaming 后 streaming 应为 true")
+	}
 	cause := context.Cause(w.ctx)
 	var stall *StallError
 	if !errors.As(cause, &stall) {
@@ -449,6 +469,39 @@ func TestStallWatchQueuedExpiryStaysStallError(t *testing.T) {
 	}
 	if errors.Is(cause, errStreamIdle) {
 		t.Fatalf("排队到期不能报 errStreamIdle，实际 %v", cause)
+	}
+}
+
+// S4b：request_timeout_sec=0（w.timer==nil）时 pause 也要记阶段：暂停期的
+// markStreaming 只记 timerIdle、不建 idle 计时器（暂停期间沉默不计时），
+// resume 才把 idle 计时器补回来；此后沉默满 idle 报 errStreamIdle。
+func TestStallWatchPauseResumeWithNoQueueLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const idle = 80 * time.Millisecond
+	w := newStallWatchIdle(ctx, 0, idle)
+	defer w.done()
+	if w.idle <= 0 {
+		t.Fatalf("idle 应生效，实际 %v", w.idle)
+	}
+	w.pause()
+	// 暂停期间开流：只记阶段（timerIdle=true），不建 idle 计时器。
+	w.markStreaming()
+	// 暂停中沉默不计时：等 >idle 也不能掐断。
+	select {
+	case <-w.ctx.Done():
+		t.Fatalf("暂停期间不应掐断，实际 %v", context.Cause(w.ctx))
+	case <-time.After(2 * idle):
+	}
+	// resume 补上 idle 计时器：此后沉默满 idle 报 errStreamIdle。
+	w.resume()
+	select {
+	case <-w.ctx.Done():
+		if !errors.Is(context.Cause(w.ctx), errStreamIdle) {
+			t.Fatalf("resume 后沉默满 idle 应报 errStreamIdle，实际 %v", context.Cause(w.ctx))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("resume 后 idle 计时器没有生效")
 	}
 }
 

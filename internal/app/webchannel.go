@@ -900,18 +900,20 @@ func doWebChannelRequest(ctx context.Context, r wcRequest, proxyURL string, onLi
 				if ttfb < 0 {
 					ttfb = time.Since(sendAt).Milliseconds()
 				}
-				// 首个有效内容帧 = 已开流吐字：沉默窗口按 stream_idle_timeout_sec 收缩
-				//（#81 思路；排队期只发 noop 不会到这里）。与老协议同判据——清洗后
-				// 的占位帧（生图占位链/纯代码产物）不算开流，见 streamContentInLine。
-				if streamContentInLine(ev.Line) {
-					watch.markStreaming()
-				}
 				if stop != nil && stop.Load() {
 					return 200, rawBytes(), ttfb, snapshotCookies(), nil
 				}
+				// 首个有效内容帧 = 已开流吐字：沉默窗口按 stream_idle_timeout_sec 收缩
+				//（#81 思路；排队期只发 noop 不会到这里）。与老协议同判据——清洗后
+				// 的占位帧（生图占位链/纯代码产物）不算开流，见 streamContentInLine。
+				// 与 gemini.go 对齐：onLine 校验失败的行不算「内容到达」，只有它
+				// 返回 nil 之后才标开流。
 				if onLine != nil {
 					if err := onLine(ev.Line); err != nil {
 						return 200, rawBytes(), ttfb, snapshotCookies(), err
+					}
+					if streamContentInLine(ev.Line) {
+						watch.markStreaming()
 					}
 					if stop != nil && stop.Load() {
 						return 200, rawBytes(), ttfb, snapshotCookies(), nil
@@ -919,6 +921,8 @@ func doWebChannelRequest(ctx context.Context, r wcRequest, proxyURL string, onLi
 					if wctx.Err() != nil {
 						return 0, rawBytes(), ttfb, snapshotCookies(), watch.explain(wctx.Err())
 					}
+				} else if streamContentInLine(ev.Line) {
+					watch.markStreaming()
 				}
 			}
 			if ev.Done && !closing {
