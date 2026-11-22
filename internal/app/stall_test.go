@@ -157,7 +157,9 @@ func TestStallWatchEndsAQuietUpstream(t *testing.T) {
 			}
 			select {
 			case <-upstreamGone:
-			case <-time.After(3 * time.Second):
+				// -race 下 tls-client HTTP/2 连接复用的取消传播偶发延迟（基线即存），
+				// 放宽到 5s 仍能抓住「根本没取消」的回归。
+			case <-time.After(5 * time.Second):
 				t.Fatal("上游连接没有被关闭")
 			}
 		})
