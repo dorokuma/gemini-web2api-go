@@ -80,7 +80,13 @@ func upstreamFrameStats(raw string) (frames int, content bool, model string) {
 	return frames, content, model
 }
 
-func diagHint(reason string) string {
+// diagHint 按 reason 码给人话提示。err 可空：errStreamIdle 虽归
+// upstream_timeout，但窗口是 stream_idle_timeout_sec（开流后块间沉默），
+// hint 要指向它，不是总窗口 request_timeout_sec。
+func diagHint(reason string, err error) string {
+	if reason == reasonUpstreamTimeout && err != nil && errors.Is(err, errStreamIdle) {
+		return "开流后块间沉默超过 stream_idle_timeout_sec：可开大该值或检查代理出口（上游排队/首帧未到的长沉默才归 request_timeout_sec）"
+	}
 	switch reason {
 	case reasonNoContentFrame:
 		return "上游没有返回正文内容：可能是该账号无此模型权限、登录已过期，或模型名/协议已变更"
@@ -116,7 +122,9 @@ func upstreamReason(err error) string {
 		return reasonFailureReply
 	case errors.Is(err, errEmptyContent):
 		return reasonEmptyContent
-	case errors.As(err, &se), isUpstreamTimeout(err):
+	case errors.As(err, &se), errors.Is(err, errStreamIdle), isUpstreamTimeout(err):
+		// errStreamIdle 也是「等满配置窗口被掐断」的超时类，归 upstream_timeout
+		//（hint 同样适用：可开大窗口或换出口），不落泛化 upstream_error。
 		return reasonUpstreamTimeout
 	case strings.Contains(err.Error(), "no content frame"):
 		return reasonNoContentFrame
@@ -193,7 +201,7 @@ func upstreamErrorJSON(err error, res *StreamResult) map[string]interface{} {
 			d.UpstreamModel = "unknown"
 		}
 	}
-	d.Hint = diagHint(d.Reason)
+	d.Hint = diagHint(d.Reason, err)
 	return map[string]interface{}{
 		"message":        "upstream error: " + err.Error(),
 		"type":           "upstream_error",

@@ -884,8 +884,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	t0 := time.Now()
 
 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
-	lh := newLineHandler(onDelta, onReasoning, stopWhen, strictCheck)
-	tracker, rtracker := lh.tracker, lh.rtracker
+	// tracker/rtracker 始终指向本轮 lineHandler 的已发/已推增量记账（重试判断
+	// 与结果回填都读它）；每轮重建 lh 后必须同步重指，不能拿旧轮的脏状态。
+	var tracker, rtracker *deltaTracker
 
 	retryWait := func() error {
 		return sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second)
@@ -937,6 +938,12 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		var ttfb int64
 		var setCookie []string
 		var err error
+		// lineHandler 必须在重试循环内全新构造：watch（非流式增量盯梢）、
+		// deltaTracker 与 stop 都是每轮请求的脏状态，Attempt 0 里 stop 一旦
+		// 被工具收尾置位、tracker 一旦累计过增量，Attempt 1 若复用就会首帧
+		// 提前 EOF 或把「已吐过」错带进本轮的重试判断。
+		lh := newLineHandler(onDelta, onReasoning, stopWhen, strictCheck)
+		tracker, rtracker = lh.tracker, lh.rtracker
 		reqEndpoint := endpoint
 		if useWC {
 			reqEndpoint = wcEndpoint
@@ -983,6 +990,8 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 出错话术不记进代理健康度：匿名直连也一样出，跟出口无关，算进去会误熔断。
 			// 浏览器自身错误（browser_unavailable）同理：那是本地浏览器层的问题，
 			// 跟出口质量无关，也不该算 cookie 的错。
+			// errStreamIdle 正常记：开流后断流/黑洞的坏代理该累计失败次数，
+			// 否则半路卡死的脏出口永远熔断不掉、账号也迁不走。
 			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
 				recordProxyResult(picked.ID, false, err.Error())
 			}
@@ -1350,6 +1359,10 @@ func (s stopReader) Read(p []byte) (int, error) {
 // （同客户端 Timeout 的 0）。测试里换短。
 var stallLimit = func() time.Duration { return time.Duration(rtCfg().RequestTimeout) * time.Second }
 
+// streamIdleLimit 是开流吐字之后帧与帧之间最多能沉默多久：stream_idle_timeout_sec，
+// 0 = 关（沿用 stallLimit）。测试里换短。
+var streamIdleLimit = func() time.Duration { return time.Duration(rtCfg().StreamIdleTimeoutSec) * time.Second }
+
 // StallError 说上游沉默了 Limit 这么久，这次请求被 stallWatch 掐掉了。
 type StallError struct{ Limit time.Duration }
 
@@ -1359,6 +1372,12 @@ func (e *StallError) Error() string {
 
 func (e *StallError) Timeout() bool   { return true }
 func (e *StallError) Temporary() bool { return true }
+
+// errStreamIdle 标记开流吐字后块间沉默超过 stream_idle_timeout_sec 被 stallWatch
+// 掐断（借鉴上游 #81）。故意不做 Timeout()=true、不被 isUpstreamTimeout 认：开流后
+// 的块间卡死是瞬时抖动（跟空响应 1155 同类，重发通常就有内容），要无条件重试，
+// 而不是被 retry_on_timeout=关 一起挡掉（那是给「等满总超时多半还超时」用的）。
+var errStreamIdle = errors.New("upstream stream idle timeout (no chunk within stream_idle_timeout_sec)")
 
 // stallWatch 盯着一次 StreamGenerate：上游 limit 这么久一个字节都没来（连上了却迟迟
 // 不回、或者回复写到一半停住）就取消这次请求，没出字的照常重试。计的是沉默，不是整次
@@ -1371,51 +1390,132 @@ func (e *StallError) Temporary() bool { return true }
 // 计时，心跳就让排队的请求一直等下去，只有连心跳都断了（limit 默认 180 秒，等于连着
 // 丢三个）才算卡住。
 type stallWatch struct {
-	ctx     context.Context
-	limit   time.Duration
-	mu      sync.Mutex
-	timer   *time.Timer
-	stopped bool
-	paused  bool
-	cancel  context.CancelCauseFunc
+	ctx   context.Context
+	limit time.Duration
+	mu    sync.Mutex
+	timer *time.Timer // 当前生效的沉默计时器；阶段切换时整体换成专属回调的新 timer
+	// timerIdle 标记当前 timer 是开流后的 idle 计时器（true）还是排队期计时器
+	//（false）；暂停只停止计时、不清阶段，resume 按它恢复对应窗口。
+	timerIdle bool
+	stopped   bool
+	paused    bool
+	// streaming = 已开流吐字（首个有效内容帧已见）。idle>0 时沉默窗口从 limit
+	// 收缩为 idle；被掐时报 errStreamIdle 而不是 StallError（两段超时的分界，
+	// 见 markStreaming）。CompareAndSwap 保证只切一次：阶段由 timer 的专属回调
+	// 决定——排队期 timer 回调永远报 StallError、idle timer 回调永远报
+	// errStreamIdle，到期回调不再读这个标志，杜绝「排队计时器已到期、回调还没
+	// 跑，中途 markStreaming 把 StallError 错挂成 errStreamIdle」的竞争。
+	streaming atomic.Bool
+	idle      time.Duration
+	cancel    context.CancelCauseFunc
 }
 
 func newStallWatch(ctx context.Context, limit time.Duration) *stallWatch {
+	return newStallWatchIdle(ctx, limit, 0)
+}
+
+// newStallWatchIdle 同 newStallWatch，另带开流吐字后的块间沉默窗口 idle
+// （stream_idle_timeout_sec，#81 思路）。idle<=0 或（limit>0 且 idle>=limit）
+// 时行为与 newStallWatch 完全一致：窗口不收缩，掐断仍报 StallError。
+// limit<=0 时不建排队计时器，但 idle>0 时开流后仍会由 markStreaming 建 idle
+// 计时器（沉默窗口 = idle）。
+func newStallWatchIdle(ctx context.Context, limit, idle time.Duration) *stallWatch {
 	ctx, cancel := context.WithCancelCause(ctx)
 	w := &stallWatch{ctx: ctx, limit: limit, cancel: cancel}
+	if idle > 0 && (limit <= 0 || idle < limit) {
+		w.idle = idle
+	}
 	if limit > 0 {
-		w.timer = time.AfterFunc(limit, func() { cancel(&StallError{Limit: limit}) })
+		// 排队期计时器的回调闭包永远只报 StallError：到期即 cancel，不进锁，
+		// timer 一旦被触发就是真实超时，pause/done 早一步持锁不该把这次掐断吞掉。
+		// 即使回调真正跑起来时已经开流，报的仍是排队超时的真实原因。
+		w.timer = time.AfterFunc(limit, func() {
+			w.cancel(&StallError{Limit: w.limit})
+		})
 	}
 	return w
 }
 
-// heard 说上游又来了数据，沉默从现在重新算。
+// armIdleLocked 换上一只专属 idle 计时器（回调永远报 errStreamIdle）。调用方
+// 须持 w.mu 且 !w.stopped；暂停期间只记阶段（timerIdle=true），由 resume 启动。
+func (w *stallWatch) armIdleLocked() {
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	if w.paused {
+		w.timerIdle = true
+		return
+	}
+	w.timer = time.AfterFunc(w.idle, func() {
+		w.cancel(errStreamIdle)
+	})
+	w.timerIdle = true
+}
+
+// heard 说上游又来了数据，沉默从现在重新算。已开流后按 idle 窗口计；
+// 暂停中或已结束时不重启计时器。
 func (w *stallWatch) heard() {
 	w.mu.Lock()
 	if !w.stopped && !w.paused && w.timer != nil {
-		w.timer.Reset(w.limit)
+		w.timer.Reset(w.limitForLocked())
+	}
+	w.mu.Unlock()
+}
+
+// limitForLocked 返回当前生效的沉默窗口：开流吐字后 idle>0 时用 idle，否则 limit。
+// 只看锁内字段 timerIdle，不读原子标志 streaming——markStreaming 先 CAS 后置锁
+// 换 idle timer，中间窗口里 heard/resume 若按 streaming 判，会把还在走的排队
+// 计时器误重置成 w.idle。调用方须持 w.mu。
+func (w *stallWatch) limitForLocked() time.Duration {
+	if w.timerIdle {
+		return w.idle
+	}
+	return w.limit
+}
+
+// markStreaming 声明上游已开流吐字（首个有效内容帧到达，见 streamContentInLine）。
+// 此后沉默窗口收缩为 idle（若配了 stream_idle_timeout_sec），被掐断报 errStreamIdle
+// 走无条件重试。idle<=0 时是 no-op。CompareAndSwap 保证只切一次：后续重复调用
+// 无副作用（计时器由 heard 续期，阶段不回头）。
+func (w *stallWatch) markStreaming() {
+	if w.idle <= 0 || !w.streaming.CompareAndSwap(false, true) {
+		return
+	}
+	w.mu.Lock()
+	if !w.stopped {
+		w.armIdleLocked()
 	}
 	w.mu.Unlock()
 }
 
 // pause 在客户端主动节流等待（如 WebChannel 的 wcPromptGap）期间暂停沉默计时，
 // 避免客户端主动 sleep 被误判为上游沉默；调用方 ctx 取消仍照常立即生效。
+// limit<=0 时 w.timer 为 nil，也要记 paused=true：暂停期的 markStreaming 只记
+// 阶段不建计时器，resume 才能按 timerIdle 把 idle 计时器补回来。
 func (w *stallWatch) pause() {
 	w.mu.Lock()
-	if !w.stopped && w.timer != nil {
+	if !w.stopped && !w.paused {
 		w.paused = true
-		w.timer.Stop()
+		if w.timer != nil {
+			w.timer.Stop()
+		}
 	}
 	w.mu.Unlock()
 }
 
-// resume 恢复沉默计时并重开一个完整的 limit 窗口。
+// resume 恢复沉默计时：按当前阶段重开一个完整窗口——已开流换专属 idle
+// 计时器（markStreaming 在暂停期间只记了阶段），未开流重置排队计时器。
 func (w *stallWatch) resume() {
 	w.mu.Lock()
 	if !w.stopped && w.paused {
 		w.paused = false
-		if w.timer != nil {
-			w.timer.Reset(w.limit)
+		if w.timerIdle && w.timer == nil {
+			w.timer = time.AfterFunc(w.idle, func() {
+				w.cancel(errStreamIdle)
+			})
+		} else if w.timer != nil {
+			w.timer.Reset(w.limitForLocked())
 		}
 	}
 	w.mu.Unlock()
@@ -1432,14 +1532,90 @@ func (w *stallWatch) done() {
 	w.cancel(nil)
 }
 
-// explain 把被 stallWatch 掐掉的请求报的 context canceled 换成 StallError；
-// 别的错误（包括客户端断开）原样返回。
-func (w *stallWatch) explain(err error) error {
-	var stall *StallError
-	if err != nil && errors.As(context.Cause(w.ctx), &stall) {
-		return stall
+// stallWatchSentinel 说 err 是应用层业务/协议哨兵错误（strict_model 降级、
+// Argon 身份校验、出错话术、超长帧），不是 stallWatch 掐断的产物。explain
+// 对它一律原样返回，绝不能覆写成超时原因——哨兵错决定上层走换号/重试/报错的
+// 哪条路，被换成 errStreamIdle 会把「明确失败」错当「瞬时抖动」。
+func stallWatchSentinel(err error) bool {
+	var mde *ModelDowngradedError
+	var aie *argonIdentityError
+	switch {
+	case errors.As(err, &mde), errors.As(err, &aie),
+		errors.Is(err, errArgonIdentityMissing),
+		errors.Is(err, errUpstreamFailureReply),
+		errors.Is(err, bufio.ErrTooLong):
+		return true
 	}
-	return err
+	return false
+}
+
+// explain 把被 stallWatch 掐掉的请求报的 context canceled 换回掐断原因：
+// 排队沉默报 *StallError，开流后块间沉默报 errStreamIdle。
+//
+// 两类输入绝不覆写：
+//   - 应用层业务/协议哨兵错（*ModelDowngradedError、*argonIdentityError、
+//     errArgonIdentityMissing、errUpstreamFailureReply、bufio.ErrTooLong）：
+//     它们可能恰好赶在 stallWatch 掐断的同一刻返回，但语义是「上游明确给的
+//     业务结论」，不是超时，原样返回；
+//   - 与本次掐断无关的普通错误（客户端断开、onLine 回调主动中断等）：
+//     只有 err 本身是 ctx 取消/读中断一类（errors.Is Canceled / DeadlineExceeded /
+//     io.ErrClosedPipe / net.Error 等）且 context.Cause(w.ctx) 是 stallWatch 的
+//     掐断原因时，才换成对应的超时原因。
+func (w *stallWatch) explain(err error) error {
+	if err == nil {
+		return nil
+	}
+	if stallWatchSentinel(err) {
+		return err
+	}
+	cause := context.Cause(w.ctx)
+	isStall := errors.Is(cause, errStreamIdle)
+	var stall *StallError
+	if !isStall {
+		isStall = errors.As(cause, &stall)
+	}
+	if !isStall {
+		return err
+	}
+	// 掐断确实发生了，但只有读路径/等待路径被这个 ctx 掐出来的错误才换原因；
+	// 普通应用层错误（哪怕不是哨兵）照旧原样，避免把无关失败错挂成超时。
+	if !stallWatchReadInterrupt(err) {
+		return err
+	}
+	if errors.Is(cause, errStreamIdle) {
+		return errStreamIdle
+	}
+	return stall
+}
+
+// stallWatchReadInterrupt 说 err 是「ctx 取消顺着读/写/等路径炸出来的」那类错误：
+// context.Canceled/DeadlineExceeded、io.ErrClosedPipe、或 net.Error（网络读被
+// 取消时 stdlib/tls-client 报的就是它）。stallWatch 掐断后 explain 只对这类错误
+// 换超时原因。
+func stallWatchReadInterrupt(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne)
+}
+
+// streamContentInLine 说这一帧带有效内容：清洗后的真实正文非空，或有思考链。
+// 用 renderedTextsInLine + cleanGeminiText 判——生图占位链
+// （http://googleusercontent.com/image_generation_content/…）和纯代码执行产物
+// 占位帧会被剥成空串，它们不算「开流吐字」：占位列在生图阶段会静止 180s 级，
+// 拿它开 idle 窗口会把生成中的请求提前掐断、重试重复生图烧额度（#S5）。
+func streamContentInLine(line string) bool {
+	if reasoningInLine(line) != "" {
+		return true
+	}
+	for _, t := range renderedTextsInLine(line, false) {
+		if cleanGeminiText(t) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // heardReader 每读到数据就告诉 stallWatch 一声。
@@ -1467,9 +1643,33 @@ func doGeminiRequestStop(ctx context.Context, endpoint, body string, headers map
 func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, headers map[string]string, proxyURL string,
 	onLine func(string) error, stop *atomic.Bool, taskMode bool) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
-	watch := newStallWatch(ctx, stallLimit())
+	watch := newStallWatchIdle(ctx, stallLimit(), streamIdleLimit())
 	defer watch.done()
 	ctx = watch.ctx
+	// 首个有效内容帧到达时标记「已开流吐字」：沉默窗口从 request_timeout_sec
+	// 收缩为 stream_idle_timeout_sec（若配了且更短），开流后的块间卡死按 idle 掐断
+	// 走无条件重试（见 stallWatch.markStreaming / errStreamIdle）。排队期只发心跳
+	// 不触发切换，长排队仍按总窗口等。判据是清洗后的有效内容（streamContentInLine）：
+	// 生图占位链、纯代码执行产物帧不算开流，免得把生成中的请求提前掐断重试烧额度。
+	//
+	// onLine 为 nil（非流式调用方）也要包一层：不逐行推增量，但有效内容帧照样
+	// 标记开流——常规非流式请求首帧之后卡住，一样按 stream_idle_timeout_sec 掐断
+	// 并安全重试（未吐过任何增量）。onLine 非 nil 时先跑 inner 的业务校验
+	//（strictCheck、出错话术拦截），校验过了才标开流：校验失败的行不是「内容到达」。
+	if watch.idle > 0 {
+		inner := onLine
+		onLine = func(line string) error {
+			if inner != nil {
+				if err := inner(line); err != nil {
+					return err
+				}
+			}
+			if streamContentInLine(line) {
+				watch.markStreaming()
+			}
+			return nil
+		}
+	}
 	// 常驻真实浏览器传输层：开着时一律走页内 fetch——浏览器的意义就是指纹一致，
 	// 有代理也照走（流量经 browserProxyBridge 的 CONNECT 隧道转给当前上游代理）。
 	if shouldUseBrowserTransport() {
@@ -1730,7 +1930,12 @@ func isUpstreamTimeout(err error) bool {
 
 // retryAfterTimeout 返回超时后还要不要再发（retry_on_timeout，#70）。上游等满
 // request_timeout_sec 都没回完时，重发通常还是超时，关掉可省下几轮等待、尽快报错。
+// errStreamIdle 不受这个开关管：开流后块间卡死是瞬时抖动（跟空响应 1155 同类），
+// 无条件重试（同上游 #81）。
 func retryAfterTimeout(err error) bool {
+	if errors.Is(err, errStreamIdle) {
+		return true
+	}
 	return rtCfg().RetryOnTimeout || !isUpstreamTimeout(err)
 }
 

@@ -1986,7 +1986,7 @@ func TestBrowserUnavailable502(t *testing.T) {
 	if upstreamReason(err) != reasonBrowserUnavailable {
 		t.Fatalf("reason = %q, want %q", upstreamReason(err), reasonBrowserUnavailable)
 	}
-	if h := diagHint(reasonBrowserUnavailable); !strings.Contains(h, "browser_path") {
+	if h := diagHint(reasonBrowserUnavailable, nil); !strings.Contains(h, "browser_path") {
 		t.Fatalf("hint missing actionable guidance: %q", h)
 	}
 }

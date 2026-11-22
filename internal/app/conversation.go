@@ -440,6 +440,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			}
 			// 出错话术跟出口无关，不记进代理健康度；浏览器自身错误
 			// （browser_unavailable）同理——那是本地浏览器层的问题。
+			// errStreamIdle 正常记：开流后断流/黑洞的坏代理该累计失败次数
+			// 触发熔断与迁离（见 gemini.go）。
 			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
 				recordProxyResult(p.ID, false, lastErr.Error())
 			}
