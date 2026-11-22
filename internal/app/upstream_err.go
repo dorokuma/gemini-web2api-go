@@ -116,7 +116,9 @@ func upstreamReason(err error) string {
 		return reasonFailureReply
 	case errors.Is(err, errEmptyContent):
 		return reasonEmptyContent
-	case errors.As(err, &se), isUpstreamTimeout(err):
+	case errors.As(err, &se), errors.Is(err, errStreamIdle), isUpstreamTimeout(err):
+		// errStreamIdle 也是「等满配置窗口被掐断」的超时类，归 upstream_timeout
+		//（hint 同样适用：可开大窗口或换出口），不落泛化 upstream_error。
 		return reasonUpstreamTimeout
 	case strings.Contains(err.Error(), "no content frame"):
 		return reasonNoContentFrame

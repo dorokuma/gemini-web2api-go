@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -130,7 +132,11 @@ func TestStallWatchWaitsThroughHeartbeats(t *testing.T) {
 
 // 首帧之后就不再出字的上游，沉默满上限就放弃，报 StallError，并真的断开上游连接。
 func TestStallWatchEndsAQuietUpstream(t *testing.T) {
-	withStallLimit(t, 150*time.Millisecond)
+	// 沉默窗口 350ms：linux/arm64 + -race 下 tls-client 冷 TLS+HTTP/2 握手偶发
+	// ~170ms，150ms 窗口会在握手阶段就掐断请求——服务端 handler 压根没跑到，
+	// upstreamGone 永不关闭，等满 5s 上限报「上游连接没有被关闭」（5.18s 假红，
+	// 与 TestStallWatchWaitsThroughHeartbeats 同类的窗口过短问题）。
+	withStallLimit(t, 350*time.Millisecond)
 	for _, p := range upstreamPaths {
 		t.Run(p.name, func(t *testing.T) {
 			upstreamGone := make(chan struct{})
@@ -153,7 +159,7 @@ func TestStallWatchEndsAQuietUpstream(t *testing.T) {
 				t.Fatalf("沉默的上游应报 StallError，实际 %v", err)
 			}
 			if took := time.Since(start); took > 3*time.Second {
-				t.Fatalf("沉默 150ms 就该放弃，实际等了 %v", took)
+				t.Fatalf("沉默 350ms 就该放弃，实际等了 %v", took)
 			}
 			select {
 			case <-upstreamGone:
@@ -261,28 +267,42 @@ func TestStallWatchIdleDoesNotFireDuringHeartbeatQueue(t *testing.T) {
 	}
 }
 
-// idle<=0 或未超总窗口时行为与未配 idle 完全一致：掐断仍报 StallError。
+// idle<=0 或未超总窗口时行为与未配 idle 完全一致：即使首个**有效内容帧**已到、
+// 调用方带了逐行回调，也不切换 idle 窗口——沉默满上限仍报 StallError。
+// （用真实内容帧 + 非 nil 回调验证：光传 nil 回调测不出「切换被正确跳过」。）
 func TestStallWatchIdleDisabledOrGeLimit(t *testing.T) {
-	withStallLimit(t, 150*time.Millisecond)
+	// 沉默窗口 350ms：同 TestStallWatchEndsAQuietUpstream，-race 下冷握手偶发
+	// >150ms 会在服务端分发前掐断，内容帧根本到不了回调（假红）。
+	withStallLimit(t, 350*time.Millisecond)
 	// idle=0 与 idle>=limit 两种都不收缩窗口：停顿 400ms 触发的是 StallError。
 	for _, idle := range []time.Duration{0, 10 * time.Second} {
 		for _, p := range upstreamPaths {
 			t.Run(fmt.Sprintf("%s/idle=%v", p.name, idle), func(t *testing.T) {
 				withStreamIdleLimit(t, idle)
+				content := mkContentLine("c_idle", "r_1", "first", "3.6 Flash", nil, "")
 				endpoint, proxyURL := p.start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(200)
-					w.Write([]byte(")]}'\nfirst frame\n"))
+					w.Write([]byte(")]}'\n" + content + "\n"))
 					w.(http.Flusher).Flush()
 					select {
 					case <-r.Context().Done():
 					case <-time.After(5 * time.Second):
 					}
 				}))
+				var sawContent bool
 				_, _, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
-					map[string]string{}, proxyURL, nil, nil)
+					map[string]string{}, proxyURL, func(line string) error {
+						if strings.Contains(line, "first") {
+							sawContent = true
+						}
+						return nil
+					}, nil)
 				var stall *StallError
 				if !errors.As(err, &stall) {
 					t.Fatalf("idle=%v 时不应出现 errStreamIdle，实际 %v", idle, err)
+				}
+				if !sawContent {
+					t.Fatalf("idle=%v 时内容帧没到回调，前提不成立", idle)
 				}
 			})
 		}
@@ -312,11 +332,14 @@ func TestStreamIdleRetrySemantics(t *testing.T) {
 	}
 }
 
-// 并发 markStreaming/heard/pause/resume/done 不产生 data race（go test -race 专查）。
+// 并发 markStreaming/heard/pause/resume/done 不产生 data race（go test -race 专查），
+// 且所有 goroutine 各自跑完循环、真实交错（不是恒真断言）。
 func TestStallWatchConcurrentMarkHeardNoRace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := newStallWatchIdle(ctx, 50*time.Millisecond, 20*time.Millisecond)
+	w := newStallWatchIdle(ctx, 5*time.Second, 200*time.Millisecond) // 窗口足够长，不会在循环中到期
+	// Add 必须先于 goroutine 启动全部完成，主 goroutine 再 Wait——
+	// Add 与 Wait 并发是 WaitGroup 自身的 data race（-race 必现）。
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -330,13 +353,261 @@ func TestStallWatchConcurrentMarkHeardNoRace(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("并发循环没在限定时间内跑完（疑似死锁）")
+	}
+	if !w.streaming.Load() {
+		t.Fatal("markStreaming 已被调用，streaming 应为 true")
+	}
 	w.done()
-	// 并发窗口里 timer 可能已在 done 前到期（那是真实掐断，不该被当成 bug）；
-	// done 后再 explain 时 cause 只能是 nil / StallError / errStreamIdle / Canceled
-	// 里的一个——这里只断言不会 panic、explain 返回一个确定的错。
-	if err := w.explain(context.Canceled); err == nil {
-		t.Fatal("done 后 explain 应返回非 nil（ctx 已取消）")
+	if err := w.explain(context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("done 后 explain 对无关错误应原样返回 context.Canceled，实际 %v", err)
+	}
+}
+
+// M1：onLine 为 nil 的非流式请求，首个有效内容帧之后卡住也要按
+// stream_idle_timeout_sec 掐断（此前 onLine==nil 时根本不会标开流）。
+func TestStallWatchIdleAppliesWhenOnLineNil(t *testing.T) {
+	withStallLimit(t, 10*time.Second) // 排队窗口够长，肯定不是它掐的
+	withStreamIdleLimit(t, 200*time.Millisecond)
+	content := mkContentLine("c_nil", "r_1", "第一段", "3.6 Flash", nil, "")
+	endpoint, proxyURL := upstreamPaths[0].start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, ")]}'\n"+content+"\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	_, _, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+		map[string]string{}, proxyURL, nil, nil)
+	if !errors.Is(err, errStreamIdle) {
+		t.Fatalf("onLine=nil 的开流后沉默应报 errStreamIdle，实际 %v", err)
+	}
+}
+
+// M2：应用层业务哨兵错（*ModelDowngradedError、*argonIdentityError 等）哪怕正好
+// 赶在 stallWatch 掐断的同一刻返回，也不能被 explain 覆写成超时原因。
+func TestStallWatchExplainKeepsSentinelErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newStallWatchIdle(ctx, 50*time.Millisecond, 10*time.Millisecond)
+	defer w.done()
+	// 排队期先掐断，制造 context.Cause = *StallError 的现场。
+	time.Sleep(120 * time.Millisecond)
+	mde := &ModelDowngradedError{Requested: "gemini-4-carbon", Reported: "3.6 Flash"}
+	if got := w.explain(mde); got != mde {
+		t.Fatalf("*ModelDowngradedError 不能被覆写，实际 %v", got)
+	}
+	aie := &argonIdentityError{name: "4 Carbon", id: "x"}
+	if got := w.explain(aie); got != aie {
+		t.Fatalf("*argonIdentityError 不能被覆写，实际 %v", got)
+	}
+	if got := w.explain(errArgonIdentityMissing); !errors.Is(got, errArgonIdentityMissing) {
+		t.Fatalf("errArgonIdentityMissing 不能被覆写，实际 %v", got)
+	}
+	if got := w.explain(errUpstreamFailureReply); !errors.Is(got, errUpstreamFailureReply) {
+		t.Fatalf("errUpstreamFailureReply 不能被覆写，实际 %v", got)
+	}
+	if got := w.explain(bufio.ErrTooLong); !errors.Is(got, bufio.ErrTooLong) {
+		t.Fatalf("bufio.ErrTooLong 不能被覆写，实际 %v", got)
+	}
+	// 读路径被掐出来的 context.Canceled 才换掐断原因。
+	var stall *StallError
+	if got := w.explain(context.Canceled); !errors.As(got, &stall) {
+		t.Fatalf("ctx 取消类错误应换回 StallError，实际 %v", got)
+	}
+	// 与掐断无关的普通错误原样返回。
+	plain := errors.New("some application error")
+	if got := w.explain(plain); got != plain {
+		t.Fatalf("无关错误不能被覆写成超时，实际 %v", got)
+	}
+}
+
+// S3：排队期 timer 已到期、回调还没执行时并发 markStreaming，掐断原因必须仍是
+// 排队超时的 *StallError，不能被错挂成 errStreamIdle（阶段由 timer 专属回调决定）。
+func TestStallWatchQueuedExpiryStaysStallError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newStallWatchIdle(ctx, 30*time.Millisecond, 10*time.Second)
+	defer w.done()
+	// 等排队计时器到期；随即并发 markStreaming（模拟首帧恰在到期瞬间到达）。
+	time.Sleep(80 * time.Millisecond)
+	w.markStreaming()
+	cause := context.Cause(w.ctx)
+	var stall *StallError
+	if !errors.As(cause, &stall) {
+		t.Fatalf("排队到期应报 *StallError，实际 %v", cause)
+	}
+	if errors.Is(cause, errStreamIdle) {
+		t.Fatalf("排队到期不能报 errStreamIdle，实际 %v", cause)
+	}
+}
+
+// S4：request_timeout_sec=0（不限总窗口）但配了 idle 时，首个有效内容帧到达后
+// 沉默超过 idle 仍按 errStreamIdle 掐断（此前 w.timer==nil 让 idle 静默失效）。
+func TestStallWatchIdleWithNoQueueLimit(t *testing.T) {
+	withStallLimit(t, 0) // 排队不限时：stallWatch 不建排队计时器
+	withStreamIdleLimit(t, 200*time.Millisecond)
+	content := mkContentLine("c_nolimit", "r_1", "第一段", "3.6 Flash", nil, "")
+	endpoint, proxyURL := upstreamPaths[0].start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, ")]}'\n"+content+"\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	_, _, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+		map[string]string{}, proxyURL, func(string) error { return nil }, nil)
+	if !errors.Is(err, errStreamIdle) {
+		t.Fatalf("limit=0 且开流后沉默应报 errStreamIdle，实际 %v", err)
+	}
+}
+
+// S5：生图占位链（image_generation_content/…）和纯代码执行产物占位帧不算
+// 开流——它们清洗后是空串，不能把沉默窗口缩成 stream_idle_timeout_sec。
+func TestStallWatchPlaceholderFramesDoNotMarkStreaming(t *testing.T) {
+	withStallLimit(t, 500*time.Millisecond) // 排队窗口 < 占位帧后的沉默，得是它掐的
+	withStreamIdleLimit(t, 100*time.Millisecond)
+	imgPlaceholder := mkContentLine("c_img", "r_1",
+		"http://googleusercontent.com/image_generation_content/0_480\n", "3.6 Flash", nil, "")
+	codeOnly := mkContentLine("c_code", "r_1",
+		"```text?code_stdout&code_event_index=1\nstdout stuff\n```\n", "3.6 Flash", nil, "")
+	for name, frame := range map[string]string{"image_placeholder": imgPlaceholder, "code_artifact": codeOnly} {
+		t.Run(name, func(t *testing.T) {
+			endpoint, proxyURL := upstreamPaths[0].start(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+				fmt.Fprint(w, ")]}'\n"+frame+"\n")
+				w.(http.Flusher).Flush()
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+				}
+			}))
+			_, _, _, _, err := doGeminiRequestStop(context.Background(), endpoint, "f.req=x",
+				map[string]string{}, proxyURL, func(string) error { return nil }, nil)
+			var stall *StallError
+			if !errors.As(err, &stall) {
+				t.Fatalf("%s 占位帧后沉默应报 *StallError（未开流），实际 %v", name, err)
+			}
+			if errors.Is(err, errStreamIdle) {
+				t.Fatalf("%s 占位帧不该触发 idle 掐断，实际 %v", name, err)
+			}
+		})
+	}
+}
+
+// S1：lineHandler（stop/watch/deltaTracker）每轮重试都要全新构造——Attempt 0
+// 已经用闭合 tool_call 触发过 stopWhen、或把失败帧增量计进 watch 之后，
+// Attempt 1 若复用脏 lh 会首帧提前 EOF 或直接漏掉 stopWhen 判定。
+//
+// 端到端走真实路径：假 RoundTripper 第 1 次请求回「半截 tool_call 帧 + 一条坏帧」
+// 掐出 EOF 触发重试，第 2 次回完整 tool_call 帧——只有 stop 生效才会让请求在
+// 「tail」帧到达前结束。
+func TestStreamGenerateRetryRebuildsLineHandler(t *testing.T) {
+	seedXSRFAndRetry(t, 3)
+	fence := "```tool_call\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n```"
+	complete := mkContentLine("c_ok", "r_1", fence, "3.6 Flash", nil, "")
+	// inner[31]=true 是上游出错话术标记（见 failureReplyInLine）：非流式路径
+	// 由 hasFailureReply 补判、走重试，能稳定制造 Attempt 0 失败。
+	failFrame := mkContentLine("c_f", "r_1", "I seem to be encountering an error", "3.6 Flash", true, "")
+	var calls int32
+	secondReads := make(chan int, 8) // Attempt 1 响应体每次 Read 报数
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/app":
+			return respJSON(req, 200, fakeAppTokens), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			if atomic.AddInt32(&calls, 1) == 1 {
+				// Attempt 0：完整 tool_call 帧（非流式下 watch 记住这段并
+				// stopWhen→stop 置位）+ 带 inner[31]=true 的出错话术帧，
+				// 上层补判走重试。lh 若跨轮复用，Attempt 1 会带着已置位的
+				// stop 进 readBody——首帧前就被 stopReader 掐成 EOF。
+				return respJSON(req, 200, ")]}'\n"+complete+"\n"+failFrame+"\n"), nil
+			}
+			// Attempt 1：交付完整 tool_call 帧后挂住，直到请求 ctx 被取消
+			//（std lib 关 body）才 EOF。干净的 lh：帧边界 stopWhen→stop
+			// 置位 → stopReader 下一次 Read 返回 EOF → resp.Body.Close →
+			// 挂住的 Read 解除，本轮立刻收尾。脏 lh：stop 残留 → 首帧
+			// 提前 EOF（本轮没内容帧、失败）；或 watch 带上轮 fence →
+			// stopWhen 不触发 → Read 一直挂到 stall 窗口掐断。
+			return &http.Response{
+				StatusCode: 200, Status: "200",
+				Header:  http.Header{},
+				Body:    &stallGateBody{prefix: ")]}'\n" + complete + "\n", reads: secondReads, req: req},
+				Request: req,
+			}, nil
+		}
+		return respJSON(req, 404, ""), nil
+	})
+	fakeUpstreamServer(t, rt)
+	withStallLimit(t, 5*time.Second) // 真卡住时兜底掐断，不拖死测试
+
+	start := time.Now()
+	_, err := streamGenerateOnce(context.Background(), "run ls", promptCtx{Latest: "run ls"},
+		ModelConfig{HexID: hexFlash36, Mode: 1}, nil, nil, nil,
+		toolCallComplete(toolsFixture("bash")), map[int64]bool{})
+	if err != nil {
+		t.Fatalf("重试后应按 stopWhen 正常收尾，实际 err=%v", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("应发了 2 次上游请求，实际 %d", n)
+	}
+	// 干净的 lh：stopWhen 在帧边界就置位，挂住的 Read 立刻被关、本轮远早于
+	// stall 窗口收尾；脏 lh 要么失败要么被 5s stall 窗口掐断。
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("stopWhen 未生效：挂着的上游没有被提前掐断，等了 %v", took)
+	}
+	// 至少见过一次 Read 交付 prefix（否则根本没读到帧，前提不成立）。
+	select {
+	case <-secondReads:
+	default:
+		t.Fatal("Attempt 1 的响应体一次都没被读到")
+	}
+}
+
+// stallGateBody 先吐一段 prefix，之后每次 Read 挂到请求 ctx 取消才 EOF，
+// 并把每次 Read 报给 reads：测试用它确认「帧已交付、挂起被请求取消解开」。
+type stallGateBody struct {
+	prefix string
+	sent   bool
+	reads  chan int
+	req    *http.Request
+}
+
+func (b *stallGateBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		n := copy(p, b.prefix)
+		select {
+		case b.reads <- n:
+		default:
+		}
+		return n, nil
+	}
+	<-b.req.Context().Done()
+	return 0, io.EOF
+}
+
+func (b *stallGateBody) Close() error { return nil }
+
+// S6：errStreamIdle 要归到 upstream_timeout（超时类诊断），不落泛化 upstream_error。
+func TestUpstreamReasonClassifiesStreamIdle(t *testing.T) {
+	if got := upstreamReason(errStreamIdle); got != reasonUpstreamTimeout {
+		t.Fatalf("errStreamIdle 应归 %q，实际 %q", reasonUpstreamTimeout, got)
+	}
+	if got := upstreamReason(&StallError{Limit: time.Second}); got != reasonUpstreamTimeout {
+		t.Fatalf("StallError 应归 %q，实际 %q", reasonUpstreamTimeout, got)
 	}
 }
 

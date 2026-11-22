@@ -1029,7 +1029,7 @@ const RT_GROUPS = [
       { k: 'stream_keepalive_sec', label: '流式保活（秒）', type: 'int', min: 0, max: 300,
         hint: '流式请求连续这么多秒没往客户端写东西，就发一次保活，防止前面的 nginx / Cloudflare / newapi 等中间层因连接空闲回 504。建议 15。代价：保活要先开流（HTTP 200），之后再失败只能在流里报错、拿不到 502/429 状态码，依赖状态码换渠道的客户端会受影响；秒级就失败的请求不受影响。非流式请求无效。0=关（默认）' },
       { k: 'stream_idle_timeout_sec', label: '流式空闲超时（秒）', type: 'int', min: 0, max: 600,
-        hint: '开流吐字后连续这么多秒一个 chunk 都不来，就掐断当瞬时错误重试（不受「超时后重试」开关影响）。首个内容帧到达之前不生效——排队期上游约 60 秒一个心跳，仍按上面「上游超时」的沉默窗口等；开流后块间卡死专补这个缺口，让卡住的请求几十秒就换一次而不是干等。「上游超时」管的是全程沉默上限，这个只盯开流后帧间间隔，建议 60；设太小会误伤思考型慢回复（思考链首帧也慢）。0=关（默认）' },
+        hint: '开流吐字后连续这么多秒一个 chunk 都不来，就掐断当瞬时错误处理（不受「超时后重试」开关影响）。仅当 0 < 本项 且（<「上游超时」或「上游超时」=0）时生效。掐断后仅在尚未向客户端发出正文/思考增量时才自动重试；已发过增量的请求改为流内快速失败报错。首个有效内容帧到达之前不生效——排队期上游约 60 秒一个心跳，仍按上面「上游超时」的沉默窗口等；开流后块间卡死专补这个缺口，让卡住的请求几十秒就换一次而不是干等。建议 60；设太小会误伤思考型慢回复（思考链首帧也慢）。0=关（默认）' },
     ],
   },
   {
@@ -2307,8 +2307,8 @@ const I18N_EN = {
   '重试间隔（秒）': 'Retry interval (s)',
   '上游超时（秒）': 'Upstream timeout (s)',
   '流式空闲超时（秒）': 'Stream idle timeout (s)',
-  '开流吐字后连续这么多秒一个 chunk 都不来，就掐断当瞬时错误重试（不受「超时后重试」开关影响）。首个内容帧到达之前不生效——排队期上游约 60 秒一个心跳，仍按上面「上游超时」的沉默窗口等；开流后块间卡死专补这个缺口，让卡住的请求几十秒就换一次而不是干等。「上游超时」管的是全程沉默上限，这个只盯开流后帧间间隔，建议 60；设太小会误伤思考型慢回复（思考链首帧也慢）。0=关（默认）':
-    'After streaming starts, if no chunk arrives for this many seconds the connection is cut and retried as a transient error (not gated by "retry on timeout"). It does not apply before the first content frame — during queueing upstream sends a heartbeat roughly every 60 s and the full "upstream timeout" silence window still applies; once streaming begins this fills the gap of inter-chunk stalls so a stuck request retries in tens of seconds instead of waiting it out. "Upstream timeout" is the whole-request silence cap; this only watches the gap between chunks after streaming has started. Suggested 60; too small hurts slow thinking replies (the first reasoning frame is slow too). 0 = off (default)',
+  '开流吐字后连续这么多秒一个 chunk 都不来，就掐断当瞬时错误处理（不受「超时后重试」开关影响）。仅当 0 < 本项 且（<「上游超时」或「上游超时」=0）时生效。掐断后仅在尚未向客户端发出正文/思考增量时才自动重试；已发过增量的请求改为流内快速失败报错。首个有效内容帧到达之前不生效——排队期上游约 60 秒一个心跳，仍按上面「上游超时」的沉默窗口等；开流后块间卡死专补这个缺口，让卡住的请求几十秒就换一次而不是干等。建议 60；设太小会误伤思考型慢回复（思考链首帧也慢）。0=关（默认）':
+    'After streaming starts, if no chunk arrives for this many seconds the connection is cut and treated as a transient error (not gated by "retry on timeout"). Only effective when 0 < this value and (less than "upstream timeout" or "upstream timeout" = 0). After a cutoff the request is retried automatically only while no body/thinking delta has been sent to the client yet; once deltas have been emitted it fails fast inside the stream instead. It does not apply before the first effective content frame — during queueing upstream sends a heartbeat roughly every 60 s and the full "upstream timeout" silence window still applies; once streaming begins this fills the gap of inter-chunk stalls so a stuck request retries in tens of seconds instead of waiting it out. Suggested 60; too small hurts slow thinking replies (the first reasoning frame is slow too). 0 = off (default)',
   '默认模型': 'Default model',
   'Prompt 字节上限': 'Prompt byte limit',
   'TLS 指纹': 'TLS fingerprint',

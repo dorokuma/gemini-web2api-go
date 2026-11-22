@@ -74,10 +74,13 @@ type Config struct {
 	StrictModelCooldownMin int `json:"strict_model_cooldown_min"`
 	// 流式保活间隔（秒），0 = 关（默认）。见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
-	// 开流吐字后块间空闲超时（秒，借鉴上游 #81）：首个内容/思考帧到达后，连续
-	// 这么多秒没有新 chunk 就掐断、当瞬时错误无条件重试。0 = 关（默认，全程沿用
-	// request_timeout_sec 的沉默窗口）。开流前（排队心跳期）不生效，见 gemini.go
-	// 的 stallWatch.markStreaming / streamIdleLimit。
+	// 开流吐字后块间空闲超时（秒，借鉴上游 #81）：首个有效内容帧到达后，连续
+	// 这么多秒没有新 chunk 就掐断。仅当 0 < stream_idle_timeout_sec 且
+	//（< request_timeout_sec 或 request_timeout_sec == 0）时生效，0 = 关（默认，
+	// 全程沿用 request_timeout_sec 的沉默窗口）。掐断后仅在尚未向客户端发出
+	// 正文/思考增量时才自动重试；已发过增量的请求在流内快速失败报错（已发的
+	// 增量收不回）。开流前（排队心跳期）不生效，见 gemini.go 的
+	// stallWatch.markStreaming / streamIdleLimit。
 	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
 
 	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch），

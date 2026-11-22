@@ -81,11 +81,14 @@ type RuntimeConfig struct {
 	// StreamKeepaliveSec 是流式请求连续空闲多少秒就发一次保活（#70），0 = 关（默认）。
 	// 开了之后慢请求会先开流，失败只能在流里报错、HTTP 状态码锁成 200，见 keepalive.go。
 	StreamKeepaliveSec int `json:"stream_keepalive_sec"`
-	// StreamIdleTimeoutSec 是开流吐字后块间空闲多少秒就掐断重试（借鉴上游 #81），
-	// 0 = 关（默认，全程沿用 request_timeout_sec 的沉默窗口）。首个内容/思考帧到达
-	// 之前不生效——排队期上游约 60 秒一个心跳，由 request_timeout_sec 的沉默窗口
-	// 兜着；开流后若配置且比沉默窗口小，就换它盯帧间卡死。掐断报 errStreamIdle
-	// 走无条件重试（不受 retry_on_timeout 影响），见 gemini.go 的 stallWatch。
+	// StreamIdleTimeoutSec 是开流吐字后块间空闲多少秒就掐断（借鉴上游 #81），
+	// 0 = 关（默认，全程沿用 request_timeout_sec 的沉默窗口）。仅当
+	// 0 < stream_idle_timeout_sec 且（< request_timeout_sec 或 request_timeout_sec == 0）
+	// 时生效。首个有效内容帧到达之前不生效——排队期上游约 60 秒一个心跳，由
+	// request_timeout_sec 的沉默窗口兜着；开流后若配置且比沉默窗口小，就换它盯
+	// 帧间卡死。掐断报 errStreamIdle：仅在尚未向客户端发出正文/思考增量时自动
+	// 重试（不受 retry_on_timeout 影响）；已发过增量的请求流内快速失败报错，
+	// 见 gemini.go 的 stallWatch。
 	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
 	// BrowserTransport 启用常驻真实浏览器传输层（Chromium CDP + 页内流式 fetch）。
 	// 默认 false：不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。
