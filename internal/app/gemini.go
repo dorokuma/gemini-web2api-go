@@ -1543,7 +1543,7 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 	if err != nil {
 		return 0, nil, 0, nil, err
 	}
-	setChromeHeaders(req.Header)
+	setChromeHeaders(req.Header, req.URL.Hostname())
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -1970,7 +1970,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 			res.Diagnostic = "构建请求失败: " + e.Error()
 			return res
 		}
-		setChromeHeaders(req.Header)
+		setChromeHeaders(req.Header, req.URL.Hostname())
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}

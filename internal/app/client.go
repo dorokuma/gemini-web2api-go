@@ -253,6 +253,12 @@ const ChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 // Firefox_147），不报更高的 157——UA 报的大版本跟 TLS 握手指纹对不上反而更可疑。
 const FirefoxUA = "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0"
 
+// isFirefoxImpersonate 是 impersonate 字符串本身的 Firefox 判据（老用法，向后兼容）。
+func isFirefoxImpersonate(imp string) bool {
+	p := strings.ToLower(imp)
+	return strings.HasPrefix(p, "firefox") || p == "zen"
+}
+
 // isFirefoxProfile 判断这次该不该走 Firefox 指纹。两个来源，任一成立即是：
 //  1. firefox_fingerprint 实验开关打开（设置页里显式 opt-in，见 config.go）；
 //  2. impersonate 字符串本身就填成了 firefox*/zen（老用法，向后兼容）。
@@ -260,58 +266,134 @@ const FirefoxUA = "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Fire
 // TLS profile（getTLSClient→effectiveImpersonate）和应用层 header（applyBrowserHeaders）
 // 认的是同一个判据，两层不会错位成「Firefox UA + Chrome 握手」。
 func isFirefoxProfile() bool {
-	if rtCfg().FirefoxFingerprint {
-		return true
-	}
-	p := strings.ToLower(rtCfg().Impersonate)
-	return strings.HasPrefix(p, "firefox") || p == "zen"
+	c := rtCfg()
+	return c.FirefoxFingerprint || isFirefoxImpersonate(c.Impersonate)
 }
 
 // effectiveImpersonate 是真正拿去 resolveProfile 的指纹名。开着 Firefox 实验开关时强制
 // firefox_147（跟 FirefoxUA 的大版本对齐），否则用用户配的 impersonate（默认 chrome_146）。
 func effectiveImpersonate() string {
-	if rtCfg().FirefoxFingerprint {
+	c := rtCfg()
+	if c.FirefoxFingerprint {
 		return "firefox_147"
 	}
-	return rtCfg().Impersonate
+	return c.Impersonate
+}
+
+// impersonateFor 是从一份已取出的配置快照算 effectiveImpersonate，不重新读 rtVal。
+func impersonateFor(c RuntimeConfig) string {
+	if c.FirefoxFingerprint {
+		return "firefox_147"
+	}
+	return c.Impersonate
+}
+
+// chromeMajorFor 是给定指纹名实际用的 Chrome 大版本，直接读 tls-client profile 的名字
+// （"Chrome-133"）。跟 resolveProfile 是同一个来源：impersonate 填了表里没有的名字
+// （如 chrome_157）会落到 146，这里也跟着报 146，UA / Sec-CH-UA 不会报一个握手里没有
+// 的版本。非 Chrome profile 返回 "146"。
+func chromeMajorFor(imp string) string {
+	s := resolveProfile(imp).GetClientHelloStr()
+	if v, ok := strings.CutPrefix(s, "Chrome-"); ok && v != "" {
+		return v
+	}
+	return "146"
+}
+
+// chromeMajor 是当前配置下 TLS 指纹实际用的 Chrome 大版本，见 chromeMajorFor。
+func chromeMajor() string {
+	return chromeMajorFor(effectiveImpersonate())
+}
+
+// chromeClientHintKeys 是 Chrome 指纹下要带的三个 Sec-CH-UA 头的名字；Firefox 不发这组，
+// 用来把调用方/上一版配置留下的同名头清掉。
+var chromeClientHintKeys = []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"}
+
+// chromeHintsFor 按 Chrome 大版本拼三个 Sec-CH-UA 头。
+// GREASE 那一项（"Not?A_Brand";v="24"）真 Chrome 每个版本不一样，这里没按版本细分。
+func chromeHintsFor(v string) map[string]string {
+	return map[string]string{
+		"Sec-CH-UA":          `"Chromium";v="` + v + `", "Google Chrome";v="` + v + `", "Not?A_Brand";v="24"`,
+		"Sec-CH-UA-Mobile":   "?0",
+		"Sec-CH-UA-Platform": `"Windows"`,
+	}
+}
+
+// chromeClientHints 是 Chrome 指纹下要带的三个 Sec-CH-UA 头；Firefox 不发这组。版本跟 chromeMajor。
+func chromeClientHints() map[string]string {
+	return chromeHintsFor(chromeMajor())
+}
+
+// browserHeaderSnap 是一次请求要发的浏览器身份头快照：UA、Firefox 判据、Sec-CH-UA
+// 全部从同一次 rtCfg() 读取派生。rtVal 可热更新（PUT /admin/api/config 随时改
+// impersonate / firefox_fingerprint），分次读会把两版配置拼进同一个请求——Chrome/133
+// 的 UA 配 v=146 的 Sec-CH-UA，或 Firefox UA 配 Chrome hints——比普通的不一致更可疑。
+type browserHeaderSnap struct {
+	firefox bool
+	ua      string
+	hints   map[string]string // nil = 该请求不发这组头（Firefox）
+}
+
+// snapshotBrowserHeaders 读一次 rtCfg()，把当次请求的 UA / Firefox 判据 / Sec-CH-UA 定下来。
+func snapshotBrowserHeaders() browserHeaderSnap {
+	c := rtCfg()
+	snap := browserHeaderSnap{firefox: c.FirefoxFingerprint || isFirefoxImpersonate(c.Impersonate)}
+	if snap.firefox {
+		snap.ua = FirefoxUA
+		return snap
+	}
+	v := chromeMajorFor(impersonateFor(c))
+	snap.ua = strings.Replace(ChromeUA, "Chrome/146.", "Chrome/"+v+".", 1)
+	snap.hints = chromeHintsFor(v)
+	return snap
 }
 
 func currentBrowserUA() string {
-	if isFirefoxProfile() {
-		return FirefoxUA
-	}
-	return ChromeUA
+	return snapshotBrowserHeaders().ua
 }
 
-var chromeHeaders = [][2]string{
-	{"User-Agent", ChromeUA},
-	{"Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`},
-	{"Sec-CH-UA-Mobile", "?0"},
-	{"Sec-CH-UA-Platform", `"Windows"`},
-	{"Sec-Fetch-Dest", "empty"},
-	{"Sec-Fetch-Mode", "cors"},
-	{"Sec-Fetch-Site", "same-origin"},
+// fetchSite 按目标主机算 Sec-Fetch-Site：所有请求都假定由 gemini.google.com 页面发起。
+// 浏览器的规则是同源 same-origin、同一可注册域（google.com）same-site、其余 cross-site。
+// 以前一律写 same-origin，发往 accounts / clients6（同站）和 lh3.googleusercontent.com、
+// content-push.googleapis.com、用户给的外部图片（跨站）的请求都跟真浏览器对不上。
+func fetchSite(host string) string {
+	host = strings.ToLower(host)
+	switch {
+	case host == "gemini.google.com":
+		return "same-origin"
+	case host == "google.com" || strings.HasSuffix(host, ".google.com"):
+		return "same-site"
+	default:
+		return "cross-site"
+	}
+}
+
+// writeBrowserHeaders 是浏览器应用层 header 的唯一来源，stdlib 和 fhttp 两种请求都经它写入，
+// 两条传输路径不会再各写一份、改一处漏一处。host 是请求的目标主机，用来算 Sec-Fetch-Site。
+func writeBrowserHeaders(host string, set func(k, v string), del func(k string)) {
+	snap := snapshotBrowserHeaders()
+	set("User-Agent", snap.ua)
+	if snap.firefox {
+		for _, k := range chromeClientHintKeys {
+			del(k)
+		}
+	} else {
+		for k, v := range snap.hints {
+			set(k, v)
+		}
+	}
+	set("Sec-Fetch-Dest", "empty")
+	set("Sec-Fetch-Mode", "cors")
+	set("Sec-Fetch-Site", fetchSite(host))
 }
 
 // setChromeHeaders 把对应 impersonate 配置的应用层 header 填进 net/http 或 fhttp 的 Header。
-// 调用方之后再写自己的 header，同名的以调用方为准。
+// host 是请求的目标主机（Sec-Fetch-Site 按它算）。调用方之后再写自己的 header，同名的以调用方为准。
 func setChromeHeaders(h interface {
 	Set(key, value string)
 	Del(key string)
-}) {
-	if isFirefoxProfile() {
-		h.Set("User-Agent", FirefoxUA)
-		h.Del("Sec-CH-UA")
-		h.Del("Sec-CH-UA-Mobile")
-		h.Del("Sec-CH-UA-Platform")
-		h.Set("Sec-Fetch-Dest", "empty")
-		h.Set("Sec-Fetch-Mode", "cors")
-		h.Set("Sec-Fetch-Site", "same-origin")
-		return
-	}
-	for _, kv := range chromeHeaders {
-		h.Set(kv[0], kv[1])
-	}
+}, host string) {
+	writeBrowserHeaders(host, h.Set, h.Del)
 }
 
 // applyChromeHeaders 给 stdlib 请求填上应用层 header（根据 impersonate 配置自动适配 Chrome 或 Firefox）。
@@ -321,5 +403,10 @@ func applyChromeHeaders(req *http.Request) {
 
 // applyBrowserHeaders 给 stdlib 请求填上对应 impersonate 配置的应用层 header。
 func applyBrowserHeaders(req *http.Request) {
-	setChromeHeaders(req.Header)
+	writeBrowserHeaders(req.URL.Hostname(), req.Header.Set, req.Header.Del)
+}
+
+// applyBrowserFHeaders 给 fhttp (tls-client 直连) 请求填上对应 impersonate 配置的应用层 header。
+func applyBrowserFHeaders(req *fhttp.Request) {
+	writeBrowserHeaders(req.URL.Hostname(), req.Header.Set, req.Header.Del)
 }

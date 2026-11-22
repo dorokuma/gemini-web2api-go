@@ -376,14 +376,15 @@ func rotateDo(method, url string, headers map[string]string, body []byte, proxyU
 	if body != nil {
 		rdr = strings.NewReader(string(body))
 	}
+	// 同一发请求的 UA / Firefox 判据 / Sec-CH-UA 从同一份配置快照出（rtVal 可热更新，
+	// 分次读会把两版配置拼进一个请求）。快照只读内存，不持锁跨网络调用。
+	snap := snapshotBrowserHeaders()
 	merged := map[string]string{
-		"User-Agent":      currentBrowserUA(),
+		"User-Agent":      snap.ua,
 		"Accept-Language": "en-US,en;q=0.9",
 	}
-	if !isFirefoxProfile() {
-		merged["Sec-CH-UA"] = `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`
-		merged["Sec-CH-UA-Mobile"] = "?0"
-		merged["Sec-CH-UA-Platform"] = `"Windows"`
+	for k, v := range snap.hints {
+		merged[k] = v
 	}
 	for k, v := range headers {
 		merged[k] = v

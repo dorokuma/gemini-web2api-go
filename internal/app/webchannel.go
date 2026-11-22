@@ -419,6 +419,7 @@ func wcSendWith(ctx context.Context, method, u, body, cookie, proxyURL string, s
 	if err != nil {
 		return nil, wcRedactErr(err)
 	}
+	applyBrowserFHeaders(req)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
