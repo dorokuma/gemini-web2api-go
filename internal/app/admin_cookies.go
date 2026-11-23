@@ -105,6 +105,12 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("账号序号要在 0..%d 之间", maxAuthUser)})
 			return
 		}
+		// ProxyID 手动指定绑定的出口（#80）：>0 必须指向存在的代理，不存在直接 400——
+		// 必须在 accountAdd 之前拦，否则 400 出去了库里却留下一条没绑定的号。
+		if p.ProxyID != nil && (*p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
+			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
+			return
+		}
 		id, err := accountAdd(p.Label, p.Cookie, p.Note)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -116,7 +122,7 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if p.ProxyID != nil && *p.ProxyID >= 0 {
+		if p.ProxyID != nil {
 			bindAccountProxy(id, *p.ProxyID)
 		}
 		logf("[cookies] 新增账号 #%d label=%q authuser=%d", id, strings.TrimSpace(p.Label), p.AuthUser)
@@ -209,16 +215,24 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"status": next})
 	case http.MethodPatch:
 		var p struct {
-			Label    *string `json:"label"`
-			Note     *string `json:"note"`
-			Status   *string `json:"status"`
-			ProxyID  *int64  `json:"proxy_id"`
-			AuthUser *int    `json:"authuser"`
+			Label  *string `json:"label"`
+			Note   *string `json:"note"`
+			Status *string `json:"status"`
+			// ProxyID 手动指定绑定的出口（#80），0 = 清掉绑定，下次用到哪个出口再自动绑。
+			ProxyID  *int64 `json:"proxy_id"`
+			AuthUser *int   `json:"authuser"`
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &p); err != nil {
 			writeJSON(w, 400, map[string]string{"error": "bad json"})
 			return
+		}
+		if p.ProxyID != nil {
+			if *p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID)) {
+				writeJSON(w, 400, map[string]string{"error": "proxy not found"})
+				return
+			}
+			bindAccountProxy(id, *p.ProxyID)
 		}
 		if p.AuthUser != nil {
 			if err := accountSetAuthUser(id, *p.AuthUser); err != nil {
@@ -231,9 +245,6 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, 400, map[string]string{"error": err.Error()})
 				return
 			}
-		}
-		if p.ProxyID != nil && *p.ProxyID >= 0 {
-			bindAccountProxy(id, *p.ProxyID)
 		}
 		if p.Label != nil || p.Note != nil {
 			// 只改传了的字段：没传的沿用当前值。

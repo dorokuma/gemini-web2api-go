@@ -34,6 +34,8 @@ type Config struct {
 	ProxyCooldownMin int `json:"proxy_cooldown_min"`
 	// 代理池无可用出口时是否退回直连。默认 false。
 	FallbackDirect bool `json:"fallback_direct"`
+	// 账号绑定的代理不可用时是否只换号、不换出口。默认 false。
+	StrictProxyBinding bool `json:"strict_proxy_binding"`
 	// cookie 失效时是否降级成匿名继续跑。默认 false。
 	FallbackAnon bool `json:"fallback_anon"`
 	// 是否自动从 /app 页面抓最新 bl 版本号。默认 true。
@@ -131,10 +133,11 @@ func defaultConfig() Config {
 		PerIPRPM:        30,
 		PerIPRPH:        80,
 		// 实测被拦的出口 106-121 分钟自动恢复，冷却取 120 分钟。
-		ProxyCooldownMin: 120,
-		FallbackDirect:   false,
-		FallbackAnon:     false,
-		GeminiBLAuto:     true,
+		ProxyCooldownMin:   120,
+		FallbackDirect:     false,
+		StrictProxyBinding: false,
+		FallbackAnon:       false,
+		GeminiBLAuto:       true,
 		// 实测上游的墙在约 13 万 UTF-8 字节：129,950 字节中英文各 3/3 过，
 		// 135,990 字节各 1/3，141,920 字节各 1/3。取 128000 留一点余量。
 		MaxPromptBytes:         128000,

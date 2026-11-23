@@ -245,7 +245,9 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	}
 	p, slotOK, slotErr := acquireSlot(conv.proxyID)
 	if !slotOK {
-		return &StreamResult{}, slotErr
+		// AccountID 带上会话绑的号：strict_proxy_binding 的 Bound 错误要靠它
+		// 把这个号并进外层 exclude 换号（见 retryOnAnotherAccount）。
+		return &StreamResult{AccountID: conv.accountID}, slotErr
 	}
 	defer releaseSlot(p.ID)
 	proxyURL := p.URL

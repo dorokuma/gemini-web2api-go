@@ -107,6 +107,16 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool) (*CookieAccount
 // retryOnAnotherAccount 判断一次降级要不要换号重来，要的话先把这个号记进冷却和 exclude。
 // 匿名降级没号可换；已经吐过内容的不能重来（客户端会收到两遍）。
 func retryOnAnotherAccount(res *StreamResult, err error, mc ModelConfig, exclude map[int64]bool) bool {
+	// strict_proxy_binding：会话绑的号因绑定出口受限出不去（Bound 429）时，把它并进
+	// exclude 再换号——多轮续接的换号循环调本函数。它是「这个号这次用不了」而不是
+	// 模型降级，不记 strict_model 冷却；browser_transport 的 stickyResidentAccountFor
+	// 读的也是同一个 exclude，不并进的话受阻驻留号会被反复挑回（M1 死循环）。
+	var rle *RateLimitError
+	if errors.As(err, &rle) && rle.Bound && res != nil && res.AccountID > 0 {
+		exclude[res.AccountID] = true
+		logf("[strict_proxy_binding] 账号 #%d 绑定出口 #%d 不可用，换下一个号", res.AccountID, rle.ProxyID)
+		return res.Emitted == "" && res.EmittedReasoning == ""
+	}
 	var mde *ModelDowngradedError
 	if !errors.As(err, &mde) || mde.AccountID == 0 {
 		return false
