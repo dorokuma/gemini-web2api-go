@@ -309,7 +309,7 @@ func contentToString(content interface{}) string {
 				continue
 			}
 			t := getStr(cm, "type")
-			if t == "text" || t == "input_text" {
+			if t == "text" || t == "input_text" || t == "output_text" {
 				bits = append(bits, getStr(cm, "text"))
 			}
 		}

@@ -8,10 +8,39 @@ import (
 // textPartTypes 是 content/output 数组里算纯文本的 part 类型。
 var textPartTypes = map[string]bool{"text": true, "input_text": true, "output_text": true}
 
-// nonTextParts 判断 content/output 数组里是否带非纯文本 part（input_image /
-// image_url / input_video / video_url / input_audio 等）。这种数组必须保留
-// []interface{} 形态交给 rejectUnsupported 与 collectImages：用 contentToString
-// 拍平会把媒体悄悄丢掉，绕开匿名校验还把 base64 塞进 prompt 文本。
+// mediaPartTypes 是 content/output 数组里算媒体 part 的已知类型，跟
+// rejectUnsupported / collectImages 的 case 名单一致。判不准的后果要么把
+// 媒体数组拍平丢图（绕过匿名校验），要么把普通 JSON 数据数组误当媒体保留，
+// 让 function_call_output 的内容被拍成空串。
+var mediaPartTypes = map[string]bool{
+	"image_url": true, "input_image": true,
+	"video_url": true, "input_video": true,
+	"input_audio": true,
+}
+
+// hasMediaParts 只认已知媒体 part：数组里出现 image_url / input_image /
+// video_url / input_video / input_audio 才算媒体。普通字符串/数字/对象元素
+// 与未知 type 都不是媒体，交给各自的序列化/拍平分支处理。
+func hasMediaParts(content interface{}) bool {
+	parts, ok := content.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, c := range parts {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if mediaPartTypes[getStr(cm, "type")] {
+			return true
+		}
+	}
+	return false
+}
+
+// nonTextParts 判断 content 数组里是否带非纯文本 part（含媒体与未知类型）。
+// 仅用于用户 content：未知 part（input_file 等未来类型）也要保留数组形态，
+// 免得拍平成空串后悄悄丢数据、还绕过 rejectUnsupported。
 func nonTextParts(content interface{}) bool {
 	parts, ok := content.([]interface{})
 	if !ok {
@@ -24,6 +53,22 @@ func nonTextParts(content interface{}) bool {
 		}
 	}
 	return false
+}
+
+// allTextParts 判断数组是否全部是 map 形态的纯文本 part（text / input_text /
+// output_text）。空数组返回 false —— 空数组按普通数据走序列化，不当纯文本。
+func allTextParts(content interface{}) bool {
+	parts, ok := content.([]interface{})
+	if !ok || len(parts) == 0 {
+		return false
+	}
+	for _, c := range parts {
+		cm, ok := c.(map[string]interface{})
+		if !ok || !textPartTypes[getStr(cm, "type")] {
+			return false
+		}
+	}
+	return true
 }
 
 // responsesToMessages normalizes output items replayed through Responses input
@@ -116,6 +161,30 @@ func responsesToMessages(req map[string]interface{}) []map[string]interface{} {
 			assistant["tool_calls"] = append(existing, calls...)
 		}
 	}
+	// appendAssistantMedia 处理含媒体 part 的 assistant 消息：媒体 part 必须保留
+	// []interface{} 形态（含文本 part），否则拍平成文本后就从 rejectUnsupported
+	// / collectImages 眼前消失。content 已是数组（上一轮保留过媒体）时往上追加；
+	// 是字符串时把非空文本包成 text part 一并保留，不丢字也不覆盖已保留的媒体。
+	appendAssistantMedia := func(media []interface{}, calls []interface{}) {
+		var assistant map[string]interface{}
+		if len(messages) > 0 && getStr(messages[len(messages)-1], "role") == "assistant" {
+			assistant = messages[len(messages)-1]
+		} else {
+			assistant = map[string]interface{}{"role": "assistant", "content": ""}
+			messages = append(messages, assistant)
+		}
+		existing, _ := assistant["content"].([]interface{})
+		if existing == nil {
+			if text := getStr(assistant, "content"); text != "" {
+				existing = []interface{}{map[string]interface{}{"type": "text", "text": text}}
+			}
+		}
+		assistant["content"] = append(existing, media...)
+		if len(calls) > 0 {
+			existingCalls, _ := assistant["tool_calls"].([]interface{})
+			assistant["tool_calls"] = append(existingCalls, calls...)
+		}
+	}
 
 	for _, raw := range input {
 		if text, ok := raw.(string); ok {
@@ -137,21 +206,24 @@ func responsesToMessages(req map[string]interface{}) []map[string]interface{} {
 			if name == "" && id != "" {
 				name = callNames[id]
 			}
-			// 含媒体 part 的 output 保留数组形态交给 rejectUnsupported /
-			// collectImages 校验收图；纯文本照旧拍平成字符串。
+			// 媒体 output 保留数组形态交给 rejectUnsupported / collectImages
+			// 校验收图；纯文本 part 数组照旧拍平成字符串；其余一切（普通 JSON
+			// 数据数组、对象、标量、空数组）json.Marshal 序列化成精确字符串——
+			// 误判成媒体会丢掉数据（拍平成 ""→"无输出"，还撞同一份会话指纹）。
 			var content interface{}
-			if nonTextParts(item["output"]) {
-				content = item["output"]
-			} else {
-				text := contentToString(item["output"])
-				if text == "" && item["output"] != nil {
-					if _, isText := item["output"].(string); !isText {
-						if encoded, err := json.Marshal(item["output"]); err == nil {
-							text = string(encoded)
-						}
+			switch out := item["output"]; {
+			case hasMediaParts(out):
+				content = out
+			case allTextParts(out):
+				content = contentToString(out)
+			default:
+				if _, isText := out.(string); isText {
+					content = out
+				} else {
+					if encoded, err := json.Marshal(out); err == nil {
+						content = string(encoded)
 					}
 				}
-				content = text
 			}
 			messages = append(messages, map[string]interface{}{
 				"role": "tool", "tool_call_id": id, "name": name, "content": content,
@@ -164,6 +236,27 @@ func responsesToMessages(req map[string]interface{}) []map[string]interface{} {
 		}
 		role := getStr(item, "role")
 		if role == "assistant" {
+			// content 带媒体 part（input_audio 等）时不能按文本拍平：拍平会把媒体
+			// 丢掉，绕过 rejectUnsupported。整组保留 []interface{} 让校验与
+			// collectImages 看得见。
+			if hasMediaParts(item["content"]) {
+				parts, _ := item["content"].([]interface{})
+				var calls []interface{}
+				var media []interface{}
+				for _, rawPart := range parts {
+					part, ok := rawPart.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					if getStr(part, "type") == "function_call" {
+						calls = append(calls, toolCall(part))
+						continue
+					}
+					media = append(media, part)
+				}
+				appendAssistantMedia(media, calls)
+				continue
+			}
 			text := getStr(item, "content")
 			var calls []interface{}
 			parts, _ := item["content"].([]interface{})
@@ -188,8 +281,9 @@ func responsesToMessages(req map[string]interface{}) []map[string]interface{} {
 			}
 			role = "user"
 		}
-		// 图文混排等含非文本 part 的 content 保留数组形态，让 rejectUnsupported
-		// 与 collectImages 生效；纯文本数组照旧拍平成字符串。
+		// 图文混排与未知 part 的 content 保留数组形态：拍平会把媒体/未来类型
+		// part 悄悄丢掉，让 rejectUnsupported / collectImages 看不到（丢图、漏拦
+		// 不支持类型）。纯文本数组照旧拍平成字符串。
 		var content interface{}
 		if nonTextParts(item["content"]) {
 			content = item["content"]

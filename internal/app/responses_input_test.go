@@ -345,10 +345,10 @@ func TestResponsesInputSyntheticCallIDsAvoidExplicit(t *testing.T) {
 	}
 }
 
-// 探针 2B：对象形态 function_call.arguments / function_call_output.output
-// 里的大整数不能经 float64 提前舍入 —— 9007199254740993 与 …992 必须得到
-// 不同的会话指纹（否则不同参数串话续接），且 output 里的大整数进 prompt
-// 时保留精确字符串。
+// 探针 2B：多轮回放里 function_call_output.output 对象的大整数不能经
+// float64 提前舍入 —— 9007199254740993 与 …992 在续接前缀指纹里必须不同。
+// 若解码/序列化丢了精度（output 数组被误当媒体保留除外），两条不同历史的
+// 前缀会撞同一份指纹导致串话续接；精度保住时对照组命中续接、变异组冷启动。
 func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 	resetConversationTestState(t)
 	rtMu.Lock()
@@ -361,43 +361,66 @@ func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 		turns = append(turns, st.turn)
 		st.cid = "bigint-conversation"
 		st.turn++
-		text := "done"
+		text := "ok"
 		if len(prompts) == 1 {
-			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{\"id\":9007199254740993}}\n```"
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{}}\n```"
 		}
 		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
 	})
-	post := func(body string) int {
+	firstUser := map[string]interface{}{"role": "user", "content": "go"}
+	req := map[string]interface{}{
+		"model":            "gemini-3.5-flash-lite",
+		"prompt_cache_key": "bigint-session",
+		"input":            []interface{}{firstUser},
+		"tools": []interface{}{map[string]interface{}{
+			"type": "function", "name": "lookup", "parameters": map[string]interface{}{"type": "object"},
+		}},
+	}
+	call := func() map[string]interface{} {
 		t.Helper()
-		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		body, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(body))
 		r.Header.Set("Authorization", "Bearer bigint-caller")
 		w := httptest.NewRecorder()
 		handleResponses(w, r)
 		if w.Code != 200 {
 			t.Fatalf("status=%d: %s", w.Code, w.Body.String())
 		}
-		return w.Code
+		var completed map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &completed); err != nil {
+			t.Fatalf("response: %s", w.Body.String())
+		}
+		return completed
 	}
-	// 请求 1：参数 9007199254740992；请求 2：参数 9007199254740993 ——
-	// 不同参数指纹不同，两次都必须冷启动（turn 0），不能串话。
-	post(`{"model":"gemini-3.5-flash-lite","input":[
-		{"type":"function_call","call_id":"c_a","name":"lookup","arguments":{"id":9007199254740992}},
-		{"type":"function_call_output","call_id":"c_a","output":"r1"},
-		{"role":"user","content":"go"}
-	]}`)
-	post(`{"model":"gemini-3.5-flash-lite","input":[
-		{"type":"function_call","call_id":"c_a","name":"lookup","arguments":{"id":9007199254740993}},
-		{"type":"function_call_output","call_id":"c_a","output":"r1"},
-		{"role":"user","content":"go"}
-	]}`)
-	if len(turns) != 2 || turns[0] != 0 || turns[1] != 0 {
-		t.Fatalf("differing >2^53 argument must cold-start, not continue: turns=%v", turns)
+	// 首轮：真实工具往返建会话。回放 handler 输出的 function_call item 原样
+	// （带真实 call_id），head=[user go, assistant(tool_calls)]。
+	first := call()
+	output, _ := first["output"].([]interface{})
+	if len(output) == 0 || getStr(output[0].(map[string]interface{}), "type") != "function_call" {
+		t.Fatalf("first turn must emit a function_call output item: %#v", first["output"])
 	}
-	// output 里的大整数对象也要精确进 prompt（不许提前舍入成 ...992）。
-	post(`{"model":"gemini-3.5-flash-lite","input":[
-		{"type":"function_call_output","call_id":"c_b","output":{"id":9007199254740993}},
-		{"role":"user","content":"check"}
-	]}`)
+	callID := output[0].(map[string]interface{})["call_id"]
+	replay := func(id string) []interface{} {
+		return []interface{}{firstUser, output[0],
+			map[string]interface{}{"type": "function_call_output", "call_id": callID,
+				"output": map[string]interface{}{"id": json.Number(id)}},
+			map[string]interface{}{"role": "user", "content": "again"}}
+	}
+	// 对照组次轮：回放首轮 + 真实 function_call + output 大整数 …992 + 新 user ——
+	// 与 head 同前缀，必须命中续接（turn 1）。
+	req["input"] = replay("9007199254740992")
+	call()
+	// 变异组第三轮：其余完全相同，仅 output 大整数改为 …993 —— 前缀指纹不同必须
+	// 冷启动（turn 0）；若 output 被提前舍入或拍平，两组撞同指纹会错误续接。
+	req["input"] = replay("9007199254740993")
+	call()
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
+		t.Fatalf("identical replay must continue, >2^53 mutation must cold-start: turns=%v", turns)
+	}
+	// output 里的大整数也要以精确字符串进上游 prompt（不许舍成 …992）。
 	if !strings.Contains(prompts[2], "9007199254740993") || strings.Contains(prompts[2], "9007199254740992") {
 		t.Fatalf("large integer output must stay exact in prompt: %q", prompts[2])
 	}
@@ -423,5 +446,247 @@ func TestResponsesRequestNamespaceIsolation(t *testing.T) {
 		if scope == base {
 			t.Errorf("different %s must not share a request namespace", label)
 		}
+	}
+}
+
+// Must-Fix 1：req["n"] 经 UseNumber 解成 json.Number 后 n>1 仍要 400 —— 旧断言只认
+// float64，两个 OpenAI 入口的 n>1 会静默漏过、让客户端错拿单候选回复。
+func TestRejectUnsupportedNAboveOneUseNumber(t *testing.T) {
+	for label, path := range map[string]string{
+		"chat completions": "/v1/chat/completions",
+		"responses":        "/v1/responses",
+	} {
+		for _, n := range []string{"3", "2.5", "1e20"} {
+			t.Run(label+" n="+n, func(t *testing.T) {
+				var body string
+				if path == "/v1/chat/completions" {
+					body = `{"model":"gemini-3.5-flash-lite","n":` + n + `,"messages":[{"role":"user","content":"hi"}]}`
+				} else {
+					body = `{"model":"gemini-3.5-flash-lite","n":` + n + `,"input":"hi"}`
+				}
+				r := httptest.NewRequest("POST", path, strings.NewReader(body))
+				r.Header.Set("Authorization", "Bearer n-reject-caller")
+				w := httptest.NewRecorder()
+				if path == "/v1/chat/completions" {
+					handleChatCompletions(w, r)
+				} else {
+					handleResponses(w, r)
+				}
+				if w.Code != 400 {
+					t.Fatalf("n=%s must be rejected before upstream: %d %s", n, w.Code, w.Body.String())
+				}
+				if !strings.Contains(w.Body.String(), "not supported") {
+					t.Fatalf("rejection must explain single-candidate limit: %s", w.Body.String())
+				}
+			})
+		}
+	}
+	// n=1 与缺省仍放行；Gemini 入口的 float64 candidateCount 同样照拒。
+	if err := rejectUnsupported(map[string]interface{}{"n": json.Number("1")}, nil); err != nil {
+		t.Fatalf("n=1 must be accepted: %v", err)
+	}
+	if err := rejectUnsupported(map[string]interface{}{}, nil); err != nil {
+		t.Fatalf("missing n must be accepted: %v", err)
+	}
+	if err := rejectUnsupported(map[string]interface{}{"n": float64(3)}, nil); err == nil {
+		t.Fatal("float64 n=3 (Gemini candidateCount path) must still be rejected")
+	}
+}
+
+// Must-Fix 2A：function_call_output.output 里的普通 JSON 数据数组不是媒体 part，
+// 不能被拍平丢字 —— 对象数组与字符串数组都要 json.Marshal 成精确字符串进 prompt，
+// 不许变成「无输出」。混排媒体 output 仍保留 []interface{} 交给 rejectUnsupported。
+func TestResponsesInputFunctionCallOutputDataArrays(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var prompts []string
+	stubConversationTestTurn(t, func(_ context.Context, prompt string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		prompts = append(prompts, prompt)
+		st.cid = "data-output-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "ok")}, nil
+	})
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer data-output-caller")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		return w
+	}
+	// 对象数组 output：大整数 id 与字段值必须精确进 prompt。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call","call_id":"c1","name":"list","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"id":9007199254740993,"name":"alice"}]},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 200 {
+		t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+	}
+	// 字符串数组 output 同理。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call","call_id":"c2","name":"list","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c2","output":["a.go","b.go"]},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 200 {
+		t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+	}
+	// 数字数组 output 也走序列化，不拍平。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call_output","call_id":"c3","output":[1,2,3]},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 200 {
+		t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+	}
+	if len(prompts) != 3 {
+		t.Fatalf("upstream prompts=%v", prompts)
+	}
+	for i, want := range []string{"9007199254740993", "a.go", "1,2,3"} {
+		if !strings.Contains(prompts[i], want) {
+			t.Errorf("prompt %d lost exact tool output %q: %s", i, want, prompts[i])
+		}
+		if strings.Contains(prompts[i], "无输出") {
+			t.Errorf("prompt %d must not claim empty tool output: %s", i, prompts[i])
+		}
+	}
+	// 混排媒体 output 仍保留数组形态，input_audio 被 rejectUnsupported 拒成 400。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call_output","call_id":"c4","output":[{"type":"output_text","text":"see"},{"type":"input_audio","data":"AAAA"}]},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 400 || !strings.Contains(w.Body.String(), "audio input not supported") {
+		t.Fatalf("mixed media tool output must be rejected: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// Must-Fix 2B：回放里 function_call_output.output 数据数组改了内容就必须冷启动
+// —— 旧实现把数组当媒体保留，contentToString 全拍成空串，两份不同 output 撞同
+// 一份指纹串话续接。对照组保持 alpha 必须命中续接。
+func TestResponsesInputFunctionCallOutputFingerprint(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var turns []int
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		st.cid = "data-fingerprint-conversation"
+		st.turn++
+		text := "ok"
+		if len(turns) == 1 {
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{}}\n```"
+		}
+		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
+	})
+	firstUser := map[string]interface{}{"role": "user", "content": "go"}
+	req := map[string]interface{}{
+		"model":            "gemini-3.5-flash-lite",
+		"prompt_cache_key": "data-session",
+		"input":            []interface{}{firstUser},
+		"tools": []interface{}{map[string]interface{}{
+			"type": "function", "name": "lookup", "parameters": map[string]interface{}{"type": "object"},
+		}},
+	}
+	call := func() map[string]interface{} {
+		t.Helper()
+		body, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(body))
+		r.Header.Set("Authorization", "Bearer data-fingerprint-caller")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		if w.Code != 200 {
+			t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+		}
+		var completed map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &completed); err != nil {
+			t.Fatalf("response: %s", w.Body.String())
+		}
+		return completed
+	}
+	// 首轮建会话，head=[user go, assistant(tool_calls)]。
+	first := call()
+	output, _ := first["output"].([]interface{})
+	if len(output) == 0 || getStr(output[0].(map[string]interface{}), "type") != "function_call" {
+		t.Fatalf("first turn must emit a function_call output item: %#v", first["output"])
+	}
+	callID := output[0].(map[string]interface{})["call_id"]
+	replay := func(val string) []interface{} {
+		return []interface{}{firstUser, output[0],
+			map[string]interface{}{"type": "function_call_output", "call_id": callID,
+				"output": []interface{}{map[string]interface{}{"id": 1, "val": val}}},
+			map[string]interface{}{"role": "user", "content": "again"}}
+	}
+	// 对照组次轮：回放首轮 + 真实 function_call + output alpha + 新 user —— 与
+	// head 同前缀，必须命中续接（turn 1）。
+	req["input"] = replay("alpha")
+	call()
+	// 变异组第三轮：其余完全相同，仅 output 数据数组内容改 beta —— 数据数组若被
+	// 拍平成空串，两组指纹相同会错误续接；序列化保住内容则前缀不同必须冷启动。
+	req["input"] = replay("beta")
+	call()
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
+		t.Fatalf("identical replay must continue, changed data output must cold-start: turns=%v", turns)
+	}
+}
+
+// Must-Fix 3：assistant 消息 content 里回放的媒体 part（input_audio）不能被
+// 拍平丢掉 —— 拍平后 rejectUnsupported 看不到它，匿名会拿到 200 上游悄悄丢图。
+// 纯文本 assistant 回放照旧拍平成字符串。
+func TestResponsesInputAssistantMediaRejects(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var upstream int
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		upstream++
+		st.cid = "assistant-media-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "ok")}, nil
+	})
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer assistant-media-caller")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		return w
+	}
+	// assistant content 数组含 input_audio：恒拒，且不能碰到上游。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"role":"assistant","content":[{"type":"output_text","text":"listening"},{"type":"input_audio","data":"AAAA"}]},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 400 || !strings.Contains(w.Body.String(), "audio input not supported") {
+		t.Fatalf("assistant input_audio must be rejected: %d %s", w.Code, w.Body.String())
+	}
+	if upstream != 0 {
+		t.Fatalf("rejected request must not reach upstream: %d calls", upstream)
+	}
+	// 纯文本 assistant content 数组照旧拍平，走正常续接路径。
+	messages := responseInputFixture(t, `{"input":[
+		{"role":"assistant","content":[{"type":"output_text","text":"hello "},{"type":"text","text":"there"}]}
+	]}`)
+	if len(messages) != 1 || getStr(messages[0], "content") != "hello there" {
+		t.Fatalf("pure-text assistant replay must still flatten: %#v", messages)
+	}
+}
+
+// Should-Fix 5：contentToString 与 textPartTypes 对 output_text 口径一致 ——
+// 非 assistant 消息与 function_call_output 里的 output_text 不再静默丢字。
+func TestResponsesInputOutputTextPartsFlatten(t *testing.T) {
+	messages := responseInputFixture(t, `{"input":[
+		{"role":"user","content":[{"type":"output_text","text":"hello"}]}
+	]}`)
+	if len(messages) != 1 || getStr(messages[0], "content") != "hello" {
+		t.Fatalf("user output_text must produce text: %#v", messages)
+	}
+	messages = responseInputFixture(t, `{"input":[
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"a"},{"type":"output_text","text":"b"}]}
+	]}`)
+	if len(messages) != 1 || getStr(messages[0], "content") != "a b" {
+		t.Fatalf("mixed text parts in tool output must flatten in order: %#v", messages)
 	}
 }

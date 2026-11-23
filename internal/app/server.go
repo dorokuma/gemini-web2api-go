@@ -101,8 +101,17 @@ func buildUsageWithReasoning(prompt, text, reasoning string, responsesAPI bool) 
 // 让模型答非所问。采样类参数（temperature/top_p/max_tokens/...）上游根本
 // 没有对应旋钮，收下忽略即可，报错反而会挡住正常客户端。
 func rejectUnsupported(req map[string]interface{}, messages []map[string]interface{}) error {
-	if n, ok := req["n"].(float64); ok && n > 1 {
-		return fmt.Errorf("n=%d not supported: upstream returns a single candidate", int(n))
+	// OpenAI 入口用 UseNumber() 解码，req["n"] 是 json.Number；Gemini 入口
+	// 直接传 float64（见 prepareGemini）。两种都要认，否则 n>1 静默漏过。
+	switch n := req["n"].(type) {
+	case float64:
+		if n > 1 {
+			return fmt.Errorf("n=%v not supported: upstream returns a single candidate", n)
+		}
+	case json.Number:
+		if v, err := n.Float64(); err == nil && v > 1 {
+			return fmt.Errorf("n=%v not supported: upstream returns a single candidate", n)
+		}
 	}
 	for _, m := range messages {
 		parts, ok := m["content"].([]interface{})

@@ -83,6 +83,31 @@ func TestCanonicalMessagesDoesNotMergeAssistantReplay(t *testing.T) {
 	if got := normalizeConversationMessages(split); len(got) != 2 {
 		t.Fatalf("adjacent assistant messages must stay separate: %#v", got)
 	}
+	// 相邻两条 assistant 是合法的 Chat 历史边界（比如客户端拼接的续写）。
+	// 归一化无条件合并会把 ["first","second"] 和 ["firstsecond"] 变成同一份指纹，
+	// 让两段真实不同的对话互相续接 —— 指纹必须保留消息边界。
+	splitText := []map[string]interface{}{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": "first"},
+		{"role": "assistant", "content": "second"},
+		{"role": "user", "content": "next"},
+	}
+	merged := []map[string]interface{}{
+		{"role": "user", "content": "question"},
+		{"role": "assistant", "content": "firstsecond"},
+		{"role": "user", "content": "next"},
+	}
+	if canonicalMessages(splitText) == canonicalMessages(merged) {
+		t.Fatal("adjacent assistant messages must keep their boundary, not collapse into one")
+	}
+	if got := normalizeConversationMessages(splitText); len(got) != 4 {
+		t.Fatalf("split assistant messages must not be merged: %#v", got)
+	}
+	// 冷启动 prompt 也要带两条独立的 [Assistant] 行，不是拼接后的一条。
+	prompt := buildPrompt(splitText, nil, nil, false)
+	if !strings.Contains(prompt, "[Assistant]: first\n\n[Assistant]: second") {
+		t.Fatalf("prompt must keep two separate assistant turns: %q", prompt)
+	}
 }
 
 func resetConversationTestState(t *testing.T) {
@@ -523,34 +548,6 @@ func TestCallGeminiConvTaskModeContinuationKeepsScopeAndMode(t *testing.T) {
 	}
 	if turns[len(turns)-1] != 0 {
 		t.Fatalf("chat-mode request must cold-start, not reuse task conversation: %v", turns)
-	}
-}
-
-// 相邻两条 assistant 是合法的 Chat 历史边界（比如客户端拼接的续写）。归一化
-// 无条件合并会把 ["first","second"] 和 ["firstsecond"] 变成同一份指纹，
-// 让两段真实不同的对话互相续接 —— 指纹必须保留消息边界。
-func TestNormalizeConversationKeepsAssistantBoundaries(t *testing.T) {
-	split := []map[string]interface{}{
-		{"role": "user", "content": "question"},
-		{"role": "assistant", "content": "first"},
-		{"role": "assistant", "content": "second"},
-		{"role": "user", "content": "next"},
-	}
-	merged := []map[string]interface{}{
-		{"role": "user", "content": "question"},
-		{"role": "assistant", "content": "firstsecond"},
-		{"role": "user", "content": "next"},
-	}
-	if canonicalMessages(split) == canonicalMessages(merged) {
-		t.Fatal("adjacent assistant messages must keep their boundary, not collapse into one")
-	}
-	if got := normalizeConversationMessages(split); len(got) != 4 {
-		t.Fatalf("split assistant messages must not be merged: %#v", got)
-	}
-	// 冷启动 prompt 也要带两条独立的 [Assistant] 行，不是拼接后的一条。
-	prompt := buildPrompt(split, nil, nil, false)
-	if !strings.Contains(prompt, "[Assistant]: first\n\n[Assistant]: second") {
-		t.Fatalf("prompt must keep two separate assistant turns: %q", prompt)
 	}
 }
 

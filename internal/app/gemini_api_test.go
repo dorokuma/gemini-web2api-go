@@ -364,8 +364,9 @@ func TestV1GeminiAction(t *testing.T) {
 }
 
 // 探针 2A：generateContent 入口的 functionCall.args 大整数不能经 float64
-// 提前舍入。9007199254740993 与 …992 在 canonicalToolArguments 里是不同参数，
-// 入口若先用普通 Unmarshal 解成 float64 就都成 …992，串话续接成同一会话。
+// 提前舍入。多轮续接前缀里，9007199254740992 与 …993 在 canonicalToolArguments
+// 里是不同参数：入口若先解成 float64 就都成 …992，变异历史会撞同一份前缀
+// 指纹错误续接。对照组回放相同历史必须命中续接，变异组必须冷启动。
 func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
 	resetConversationTestState(t)
 	rtMu.Lock()
@@ -376,15 +377,16 @@ func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
 		turns = append(turns, st.turn)
 		st.cid = "bigint-gemini-conversation"
 		st.turn++
-		return &StreamResult{Raw: conversationTestRaw(t, "done")}, nil
+		text := "ok"
+		if len(turns) == 1 {
+			// 首轮回 tool_call 围栏，存 head 的逻辑回复是 assistant(tool_calls)。
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{\"id\":9007199254740992}}\n```"
+		}
+		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
 	})
-	post := func(id string) {
+	tools := `,"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}}]}]`
+	post := func(body string) map[string]interface{} {
 		t.Helper()
-		body := `{"contents":[` +
-			`{"role":"user","parts":[{"text":"look it up"}]},` +
-			`{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"id":` + id + `}}}]},` +
-			`{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"result":"r1"}}}]}` +
-			`],"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}}]}]}`
 		r := httptest.NewRequest("POST", "/v1beta/models/gemini-3.5-flash-lite:generateContent", strings.NewReader(body))
 		r.Header.Set("Authorization", "Bearer gemini-bigint")
 		w := httptest.NewRecorder()
@@ -392,11 +394,48 @@ func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
 		if w.Code != 200 {
 			t.Fatalf("status=%d: %s", w.Code, w.Body.String())
 		}
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("response: %s", w.Body.String())
+		}
+		return resp
 	}
-	post("9007199254740992")
-	post("9007199254740993")
-	if len(turns) != 2 || turns[0] != 0 || turns[1] != 0 {
-		t.Fatalf(">2^53 arguments must not share a conversation, turns=%v", turns)
+	// 首轮：带 tools 的 user 请求，stub 回围栏，head=[user, assistant(tool_calls)]。
+	first := post(`{"contents":[{"role":"user","parts":[{"text":"look it up"}]}]` + tools + `}`)
+	// 从响应里取真实的 functionCall.id（客户端回放会带上它）。
+	cands, _ := first["candidates"].([]interface{})
+	if len(cands) == 0 {
+		t.Fatalf("first response must have candidates: %v", first)
+	}
+	parts, _ := cands[0].(map[string]interface{})["content"].(map[string]interface{})["parts"].([]interface{})
+	var fcID string
+	for _, p := range parts {
+		if fc, ok := p.(map[string]interface{})["functionCall"].(map[string]interface{}); ok {
+			fcID = getStr(fc, "id")
+		}
+	}
+	if fcID == "" {
+		t.Fatalf("first turn must emit a functionCall with an id: %v", first)
+	}
+	// 对照组次轮：回放首轮 + 含同一份 …992 functionCall（带真实 id）与
+	// functionResponse 的 model/user 轮 + 新 user —— 与首轮 head 同前缀，必须
+	// 命中续接（turn 1）。
+	post(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"look it up"}]},` +
+		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740992}}}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
+		`{"role":"user","parts":[{"text":"again"}]}` +
+		`]` + tools + `}`)
+	// 变异组第三轮：其余完全相同，仅 args.id 改为 …993 —— 前缀指纹不同必须冷
+	// 启动（turn 0）；若入口把 args 解成 float64，两组撞同指纹会错误续接。
+	post(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"look it up"}]},` +
+		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740993}}}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
+		`{"role":"user","parts":[{"text":"again"}]}` +
+		`]` + tools + `}`)
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
+		t.Fatalf("identical replay must continue, >2^53 args mutation must cold-start: turns=%v", turns)
 	}
 }
 
