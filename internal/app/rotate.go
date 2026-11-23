@@ -58,8 +58,6 @@ var (
 // 第一个参数是这个会话的标识，最后一个是下次轮转的间隔秒数。
 var rotateInitRe = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[^)]*?([0-9.]+)\s*\)`)
 
-// rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
-// 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
 // rotateProxyURL 为保活决定出口（fail-closed，绝不退回静默直连泄漏 JP/US Cookie）：
 //   - a.ProxyID == proxyIDDirect（-1 锁定直连）：允许 proxyURL="" 直连；
 //   - a.ProxyID > 0：必须查到存在且 Enabled 的代理 URL，代理被删/禁用直接
@@ -103,6 +101,8 @@ func firstUsableProxyURL() string {
 	return ""
 }
 
+// rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
+// 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
 func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	proxyURL, err := rotateProxyURL(a)
 	if err != nil {

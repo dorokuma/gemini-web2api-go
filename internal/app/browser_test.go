@@ -67,6 +67,8 @@ type fakeCDPServer struct {
 
 	holdReplies atomic.Bool
 	muteFetch   atomic.Bool
+	// cookiesJSON 非 nil 时 Network.getCookies 返回它（测试注入持久 Jar）。
+	cookiesJSON atomic.Value // json.RawMessage
 }
 
 type cdpCall struct {
@@ -201,6 +203,15 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	call := cdpCall{id: m.ID, sessionID: m.SessionID, method: m.Method, params: m.Params}
 	s.gotCalls <- call
 
+	// Network.* 域必须走 page session：sessionID="" 的浏览器顶层连接没有
+	// Network 域，真实 Chromium 会报 -32601——测试必须拦住这个回归。
+	if strings.HasPrefix(m.Method, "Network.") && m.SessionID == "" {
+		go s.sendText([]byte(fmt.Sprintf(
+			`{"id":%d,"error":{"code":-32601,"message":%q}}`,
+			m.ID, "'"+m.Method+"' wasn't found (empty sessionId)")))
+		return
+	}
+
 	if s.holdReplies.Load() || m.Method == "Never.Returns" {
 		return
 	}
@@ -212,13 +223,21 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	case "Target.attachToTarget":
 		result = json.RawMessage(`{"sessionId":"fake-session-1"}`)
 	case "Runtime.evaluate":
-		if strings.Contains(string(m.Params), "typeof __gwPush") {
+		switch {
+		case strings.Contains(string(m.Params), "typeof __gwPush"):
 			result = json.RawMessage(`{"result":{"type":"string","value":"function/object"}}`)
-		} else {
+		case strings.Contains(string(m.Params), "document.readyState"):
+			// waitPageLoad 的轮询：直接报已加载，免得测试等 loadEventFired 超时。
+			result = json.RawMessage(`{"result":{"type":"string","value":"complete"}}`)
+		default:
 			s.handleEvaluate(m.Params)
 		}
 	case "Network.getCookies":
-		result = json.RawMessage(`{"cookies":[]}`)
+		if v := s.cookiesJSON.Load(); v != nil {
+			result = v.(json.RawMessage)
+		} else {
+			result = json.RawMessage(`{"cookies":[]}`)
+		}
 	}
 	reply := fmt.Sprintf(`{"id":%d,"result":%s}`, m.ID, result)
 	go s.sendText([]byte(reply))
@@ -3300,6 +3319,201 @@ func TestBrowserProxyCheckTargetRejectsUnspecified(t *testing.T) {
 		if err := b.checkTarget(target); err == nil {
 			t.Fatalf("checkTarget(%q) returned nil, want refused (unspecified/loopback bypass reaches local ports = SSRF)", target)
 		}
+	}
+}
+
+// ─── alignColdStartJar / alignResidentAndNavigate 回归（R2 补齐）───────────
+//
+// M2：冷启动/重建标签页的 Jar 对齐必须 fail-closed——读 Jar 出错、Jar 里有
+// 匹配不到启用账号的 Cookie、清 Jar 失败，都绝不带着残留身份去导航；
+// 且全部 Network.* 走 page session（fake 断言空 session 的 Network.* 报
+// -32601，所以走到这段代码本身就验证了 session 接线）。
+
+func newTestClientAndBridge(t *testing.T, srv *fakeCDPServer) (*cdpClient, *browserProxyBridge) {
+	t.Helper()
+	conn, err := dialCDPWebsocket(context.Background(), srv.wsURL)
+	if err != nil {
+		t.Fatalf("dial fake cdp: %v", err)
+	}
+	client := newCDPClient(conn)
+	t.Cleanup(func() { client.Close(); conn.Close() })
+	bridge, err := newBrowserProxyBridge()
+	if err != nil {
+		t.Fatalf("newBrowserProxyBridge: %v", err)
+	}
+	t.Cleanup(func() { bridge.Shutdown(context.Background()) })
+	return client, bridge
+}
+
+// 陌生 Cookie（匹配不到启用账号）→ 清 Jar + 按匿名首航出口导航。
+func TestAlignColdStartJarUnknownCookieCleared(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, bridge := newTestClientAndBridge(t, srv)
+	// Jar 里有一份不属于任何启用账号的 Cookie。
+	srv.cookiesJSON.Store(json.RawMessage(
+		`{"cookies":[{"name":"SAPISID","value":"alien"},{"name":"__Secure-1PSID","value":"alienp"}]}`))
+	m := &browserManager{}
+	res := &startResult{seed: browserSeedState{AccountID: 42}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.alignColdStartJar(ctx, client, "fake-session-1", bridge, "", res); err != nil {
+		t.Fatalf("alignColdStartJar: %v", err)
+	}
+	// 必须见过 clearBrowserCookies（fail-closed）。
+	sawClear, sawNav := false, false
+	for {
+		select {
+		case c := <-srv.gotCalls:
+			if c.method == "Network.clearBrowserCookies" {
+				sawClear = true
+				if c.sessionID != "fake-session-1" {
+					t.Fatalf("clearBrowserCookies 没带 page session：%q", c.sessionID)
+				}
+			}
+			if c.method == "Page.navigate" {
+				sawNav = true
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if !sawClear {
+		t.Fatal("陌生 Cookie 未触发 clearBrowserCookies")
+	}
+	if !sawNav {
+		t.Fatal("清 Jar 后未导航 /app")
+	}
+	if res.seed.AccountID != 0 {
+		t.Fatalf("清 Jar 后 seed 应复位，得到 %+v", res.seed)
+	}
+}
+
+// Jar Cookie 匹配到启用账号 → 不清 Jar、seed 同步为匹配到的账号。
+func TestAlignColdStartJarMatchedKeeps(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, bridge := newTestClientAndBridge(t, srv)
+	cookie := "SAPISID=sa; __Secure-1PSID=ps; SID=x"
+	id := addTestAccount(t, "coldMatch")
+	// accountAdd 存的 cookie 与 Jar 一致 → cookieIdentity 相同。
+	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`, cookie, id)
+	srv.cookiesJSON.Store(json.RawMessage(
+		`{"cookies":[{"name":"SAPISID","value":"sa"},{"name":"__Secure-1PSID","value":"ps"}]}`))
+	m := &browserManager{}
+	res := &startResult{seed: browserSeedState{AccountID: 0}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.alignColdStartJar(ctx, client, "fake-session-1", bridge, "", res); err != nil {
+		t.Fatalf("alignColdStartJar: %v", err)
+	}
+	for {
+		select {
+		case c := <-srv.gotCalls:
+			if c.method == "Network.clearBrowserCookies" {
+				t.Fatal("匹配账号的 Jar 不该清")
+			}
+		default:
+			goto done2
+		}
+	}
+done2:
+	if res.seed.AccountID != id {
+		t.Fatalf("seed 应同步为匹配账号 #%d，得到 %+v", id, res.seed)
+	}
+}
+
+// 匹配到账号但绑定出口已失效 → 清 Jar fail-closed。
+func TestAlignColdStartJarBoundDeadClears(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, bridge := newTestClientAndBridge(t, srv)
+	cookie := "SAPISID=sa2; __Secure-1PSID=ps2; SID=x"
+	id := addTestAccount(t, "coldDeadBound")
+	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`, cookie, id)
+	bindAccountProxy(id, 424242) // 绑定不存在的代理 → coldStartUpstreamForAccount 报错
+	srv.cookiesJSON.Store(json.RawMessage(
+		`{"cookies":[{"name":"SAPISID","value":"sa2"},{"name":"__Secure-1PSID","value":"ps2"}]}`))
+	m := &browserManager{}
+	res := &startResult{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.alignColdStartJar(ctx, client, "fake-session-1", bridge, "", res); err != nil {
+		t.Fatalf("alignColdStartJar: %v", err)
+	}
+	sawClear := false
+	for {
+		select {
+		case c := <-srv.gotCalls:
+			if c.method == "Network.clearBrowserCookies" {
+				sawClear = true
+			}
+		default:
+			goto done3
+		}
+	}
+done3:
+	if !sawClear {
+		t.Fatal("绑定失效未触发 clearBrowserCookies")
+	}
+}
+
+// alignResidentAndNavigate：驻留号已删除 → 清 Jar 后才导航；bridgeMu 下的
+// bridgeActiveURL/bridgeActiveDirect 必须与 SetUpstream 的实际出口一致。
+func TestAlignResidentAndNavigateDeadSeed(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	bridge, err := newBrowserProxyBridge()
+	if err != nil {
+		t.Fatalf("newBrowserProxyBridge: %v", err)
+	}
+	defer bridge.Shutdown(context.Background())
+	cleanup := wireTestBrowserBridge(t, srv, bridge)
+	defer cleanup()
+	m := browserMgr
+	m.mu.Lock()
+	client := m.client
+	m.seed = browserSeedState{AccountID: 987654} // 库里不存在
+	m.bridgeActiveURL, m.bridgeActiveDirect = "http://stale:1", false
+	m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.alignResidentAndNavigate(ctx, client, "fake-session-1")
+	sawClear, sawNav := false, false
+	for {
+		select {
+		case c := <-srv.gotCalls:
+			if c.method == "Network.clearBrowserCookies" {
+				sawClear = true
+				if c.sessionID != "fake-session-1" {
+					t.Fatalf("clearBrowserCookies 没带 page session：%q", c.sessionID)
+				}
+			}
+			if c.method == "Page.navigate" {
+				sawNav = true
+				if !sawClear {
+					t.Fatal("导航发生在清 Jar 之前")
+				}
+			}
+		default:
+			goto done4
+		}
+	}
+done4:
+	if !sawClear {
+		t.Fatal("驻留号已删未触发 clearBrowserCookies")
+	}
+	if !sawNav {
+		t.Fatal("未导航 /app")
+	}
+	m.bridgeMu.Lock()
+	url, direct := m.bridgeActiveURL, m.bridgeActiveDirect
+	m.bridgeMu.Unlock()
+	wantURL, wantDirect := initialBridgeUpstream()
+	if url != wantURL || direct != wantDirect {
+		t.Fatalf("bridgeActive* 与实际出口不一致：got(%q,%v) want(%q,%v)",
+			url, direct, wantURL, wantDirect)
 	}
 }
 

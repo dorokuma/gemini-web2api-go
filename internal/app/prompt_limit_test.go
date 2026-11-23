@@ -1,6 +1,7 @@
 package app
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -108,5 +109,30 @@ func TestPromptLimitCountsToolDefs(t *testing.T) {
 
 	if p, _ := messagesToPrompt(msgs, tools, nil, false); len(p) <= 5000 {
 		t.Errorf("工具定义应该把 prompt 撑到 5000 字节以上，实际 %d", len(p))
+	}
+}
+
+// /v1/responses 流式：开流前 deterministic 超长预检必须在 WriteHeader(200)
+// 之前回 400 + context_length_exceeded——否则超长请求会以 200 + response.failed
+// 报出，客户端看不到真实的拒绝原因。
+func TestResponsesStreamOverflowPrecheck(t *testing.T) {
+	withBudget(t, 2000) // MaxPromptBytes
+	withContextCfg(t, 1500, "error")
+	_, _ = getDB().Exec(`DELETE FROM accounts`) // 无 cookie：超 budget 即 PTL
+
+	big := strings.Repeat("超", 5000)
+	body := `{"model":"gemini-3.5-flash-lite","stream":true,"input":[{"role":"user","content":"` + big + `"}]}`
+	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer overflow-caller")
+	w := httptest.NewRecorder()
+	handleResponses(w, r)
+	if w.Code != 400 {
+		t.Fatalf("流式超长应 400 而非开流，得到 %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "context_length_exceeded") {
+		t.Fatalf("缺 context_length_exceeded：%s", w.Body.String())
+	}
+	if strings.HasPrefix(w.Body.String(), "event:") || strings.Contains(w.Body.String(), "response.created") {
+		t.Fatal("400 路径不该先发出 SSE 事件")
 	}
 }

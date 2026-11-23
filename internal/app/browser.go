@@ -889,38 +889,10 @@ func coldStartUpstreamForAccount(a *CookieAccount) (string, bool, error) {
 func (m *browserManager) alignColdStartJar(ctx context.Context, client *cdpClient,
 	sess string, bridge *browserProxyBridge, profileDir string, res *startResult) error {
 
-	getCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	var jarRes struct {
-		Cookies []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		} `json:"cookies"`
-	}
-	if err := client.Call(getCtx, "", "Network.getCookies",
-		map[string]interface{}{"urls": []string{
-			"https://gemini.google.com", "https://google.com"}},
-		&jarRes); err != nil {
-		logf("[browser] 冷启动读 Jar 失败（按匿名处理）: %v", err)
-	}
-	var jarLines []string
-	for _, c := range jarRes.Cookies {
-		jarLines = append(jarLines, c.Name+"="+c.Value)
-	}
-	jarCookie := strings.Join(jarLines, "; ")
+	jarCookie, jarErr, jarEmpty := readColdStartJar(ctx, client, sess)
 	jarID := cookieIdentity(jarCookie)
 
-	var matched *CookieAccount
-	if jarID != "" && jarID != "|" {
-		for _, a := range accountList() {
-			if a.Status != "enabled" || cookieIdentity(a.Cookie) != jarID {
-				continue
-			}
-			cp := a
-			matched = &cp
-			break
-		}
-	}
+	matched := matchJarAccount(jarID, jarErr, res.seed.AccountID)
 
 	upstream, allowDirect := "", true
 	var upErr error
@@ -935,29 +907,32 @@ func (m *browserManager) alignColdStartJar(ctx context.Context, client *cdpClien
 	default:
 		upstream, allowDirect = initialBridgeUpstream()
 	}
-	// 匹配到账号但绑定失效、或有 Cookie 却匹配不到任何启用账号：
-	// 先在 about:blank 把 Jar 清空，再按匿名首航出口导航——不清的话
-	// /app 首航会把这份未知身份的 Cookie 从默认出口发出去。
-	if (matched == nil && jarID != "" && jarID != "|") || upErr != nil {
+	// 读 Jar 失败（jarErr）/ Jar 含任何非空 Cookie 但匹配不到合法启用账号 /
+	// 匹配到账号但绑定失效：全部 fail-closed——先清 Jar 再按匿名首航出口导航，
+	// 清失败直接中止冷启动（残留 Cookie 绝不从未经确认的出口发出）。
+	clearJar := (jarErr != nil || !jarEmpty) && (matched == nil || upErr != nil)
+	if jarErr != nil {
+		logf("[browser] 冷启动读 Jar 失败（fail-closed，清 Jar 后按匿名首航）: %v", jarErr)
+		upstream, allowDirect = initialBridgeUpstream()
+	} else if matched != nil && upErr == nil {
+		// 匹配成功：同步校正陈旧/缺失的 seed（同 cookieIdentity 多 authuser
+		// 消歧后，驻留身份登记为实际匹配到的号）。
+		if res.seed.AccountID != matched.ID {
+			res.seed.AccountID = matched.ID
+			res.seed.CookieIdentity = jarID
+			res.seed.SeededAt = time.Now().Unix()
+		}
+	}
+	if clearJar {
 		if upErr != nil {
 			logf("[browser] 冷启动 Jar 账号绑定失效（%v），清空 Jar 后按匿名首航", upErr)
 		} else {
 			logf("[browser] 冷启动 Jar Cookie 匹配不到启用账号，清空后按匿名首航")
 		}
-		clrCtx, clrCancel := context.WithTimeout(ctx, 8*time.Second)
-		if err := client.Call(clrCtx, "", "Network.clearBrowserCookies", nil, nil); err != nil {
-			clrCancel()
-			return browserErr("clearBrowserCookies (cold start): %w", err)
+		if err := clearJarAndResetSeed(ctx, client, sess, profileDir, res); err != nil {
+			return err
 		}
-		clrCancel()
-		matched = nil
 		upstream, allowDirect = initialBridgeUpstream()
-		res.seed = browserSeedState{}
-		// 持久 seed-state 也复位，免得下次启动又拿旧身份去匹配。
-		if profileDir != "" {
-			_ = os.WriteFile(filepath.Join(profileDir, "seed-state.json"),
-				[]byte(`{"account_id":0,"cookie_identity":"","seeded_at":0}`), 0o600)
-		}
 	}
 
 	if err := bridge.SetUpstream(upstream, allowDirect); err != nil {
@@ -968,6 +943,87 @@ func (m *browserManager) alignColdStartJar(ctx context.Context, client *cdpClien
 	if err := client.Call(navCtx, sess, "Page.navigate",
 		map[string]interface{}{"url": "https://gemini.google.com/app"}, nil); err != nil {
 		logf("[browser] 冷启动导航 /app 失败: %v", err)
+		return nil
+	}
+	// 导航返回后等页面真正加载完再把 Tab 交出去：about:blank 上 waitPageLoad
+	// 是秒回，真正切 origin 的是这次导航——不等的话首条页内 fetch 还在
+	// about:blank origin 上发，被 CORS 拦成 TypeError: Failed to fetch。
+	m.waitPageLoad(navCtx, client, sess)
+	return nil
+}
+
+// readColdStartJar 读持久 Jar 并拼成 cookie 串。Network.* 必须传 page
+// session（sess）：浏览器顶层连接（sessionID=""）没有 Network 域，真实
+// Chromium 对根连接调 getCookies 恒报 -32601。
+// 返回 (cookie串, 读jar错误, jar是否为空)。
+func readColdStartJar(ctx context.Context, client *cdpClient, sess string) (string, error, bool) {
+	getCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	var jarRes struct {
+		Cookies []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"cookies"`
+	}
+	err := client.Call(getCtx, sess, "Network.getCookies",
+		map[string]interface{}{"urls": []string{
+			"https://gemini.google.com", "https://google.com"}},
+		&jarRes)
+	var jarLines []string
+	for _, c := range jarRes.Cookies {
+		jarLines = append(jarLines, c.Name+"="+c.Value)
+	}
+	return strings.Join(jarLines, "; "), err, len(jarRes.Cookies) == 0
+}
+
+// matchJarAccount 按 cookieIdentity 在启用账号里找匹配者：同 cookieIdentity
+// 可能多 authuser，优先按 seedID（res.seed.AccountID）消歧，找不着再取第一个
+// 匹配的启用号。jarErr 或非登录身份（空 / "|"）直接返回 nil。
+func matchJarAccount(jarID string, jarErr error, seedID int64) *CookieAccount {
+	if jarErr != nil || jarID == "" || jarID == "|" {
+		return nil
+	}
+	if a := firstEnabledWithIdentity(jarID, seedID); a != nil {
+		return a
+	}
+	if seedID != 0 {
+		return firstEnabledWithIdentity(jarID, 0)
+	}
+	return nil
+}
+
+// firstEnabledWithIdentity 返回第一个 cookieIdentity 匹配且（seedID 非 0 时）
+// ID 等于 seedID 的启用账号。
+func firstEnabledWithIdentity(jarID string, seedID int64) *CookieAccount {
+	for _, a := range accountList() {
+		if a.Status != "enabled" || cookieIdentity(a.Cookie) != jarID {
+			continue
+		}
+		if seedID != 0 && a.ID != seedID {
+			continue
+		}
+		cp := a
+		return &cp
+	}
+	return nil
+}
+
+// clearJarAndResetSeed 在 about:blank 清空 Jar 并把 res.seed 与持久
+// seed-state 一起复位。清失败返回错误（调用方中止冷启动——残留 Cookie
+// 绝不从未经确认的出口发出）。
+func clearJarAndResetSeed(ctx context.Context, client *cdpClient, sess string,
+	profileDir string, res *startResult) error {
+	clrCtx, clrCancel := context.WithTimeout(ctx, 8*time.Second)
+	err := client.Call(clrCtx, sess, "Network.clearBrowserCookies", nil, nil)
+	clrCancel()
+	if err != nil {
+		return browserErr("clearBrowserCookies (cold start): %w", err)
+	}
+	res.seed = browserSeedState{}
+	// 持久 seed-state 也复位，免得下次启动又拿旧身份去匹配。
+	if profileDir != "" {
+		_ = os.WriteFile(filepath.Join(profileDir, "seed-state.json"),
+			[]byte(`{"account_id":0,"cookie_identity":"","seeded_at":0}`), 0o600)
 	}
 	return nil
 }
@@ -1394,7 +1450,14 @@ func (m *browserManager) recreateTab() {
 		m.mu.Unlock()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 先判死在飞流：旧 Tab 的流在重建面前不可能成功，先唤醒它们别挂到
+	// 清 Jar+导航（最长 ~35s）结束才被错误覆盖；也保证在飞流归零后
+	// 对齐桥出口不与在飞出口并发交错。
+	m.failAllStreams(browserErr("tab recreated; previous streams aborted"))
+
+	// ctx 预算要盖过 清 Jar(8s) + SetUpstream + 导航(25s)：10s 会在
+	// alignResidentAndNavigate 的 25s 导航子窗口内提前截断。
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	if oldTarget != "" {
 		_ = client.Call(ctx, "", "Target.closeTarget",
@@ -1437,7 +1500,6 @@ func (m *browserManager) recreateTab() {
 	// 驻留账号绑定出口重对齐后再导航 /app（桥当前出口可能已被并发请求
 	// 切走；绑定失效则导航匿名 /app 前已在上面对齐函数里清 Jar）。
 	m.alignResidentAndNavigate(ctx, client, attached.SessionID)
-	m.failAllStreams(browserErr("tab recreated; previous streams aborted"))
 }
 
 // alignResidentAndNavigate 是 recreateTab 用的轻量对齐：按当前驻留账号
@@ -1471,21 +1533,36 @@ func (m *browserManager) alignResidentAndNavigate(ctx context.Context,
 	}
 	if clearJar {
 		clrCtx, clrCancel := context.WithTimeout(ctx, 8*time.Second)
-		if err := client.Call(clrCtx, "", "Network.clearBrowserCookies", nil, nil); err != nil {
-			logf("[browser] recreate 清 Jar 失败: %v", err)
+		// Network.* 传 page session（sess）；清 Jar 失败绝不继续导航——残留
+		// Cookie 会从未经确认的出口发出。
+		if err := client.Call(clrCtx, sess, "Network.clearBrowserCookies", nil, nil); err != nil {
+			clrCancel()
+			logf("[browser] recreate 清 Jar 失败（中止导航）: %v", err)
+			return
 		}
 		clrCancel()
 	}
+	// 桥出口切换必须经过 bridgeMu 协调并同步登记 bridgeActiveURL/
+	// bridgeActiveDirect：裸 SetUpstream 会让「记账出口」与「实际出口」
+	// 分裂——并发请求命中快速路径时拿着旧登记把流量发往错误出口。
+	// 在飞流已在 recreateTab 开头判死，这里直接登记新出口。
 	if err := bridge.SetUpstream(upstream, allowDirect); err != nil {
 		logf("[browser] recreate SetUpstream 失败: %v", err)
 		return
 	}
+	m.bridgeMu.Lock()
+	m.bridgeActiveURL = upstream
+	m.bridgeActiveDirect = allowDirect
+	m.bridgeMu.Unlock()
 	navCtx, navCancel := context.WithTimeout(ctx, 25*time.Second)
 	defer navCancel()
 	if err := client.Call(navCtx, sess, "Page.navigate",
 		map[string]interface{}{"url": "https://gemini.google.com/app"}, nil); err != nil {
 		logf("[browser] recreate 导航 /app 失败: %v", err)
+		return
 	}
+	// 同冷启动：导航后等页面加载完，防 about:blank origin 的首航 CORS 回归。
+	m.waitPageLoad(navCtx, client, sess)
 }
 
 // ─── Page 域与桥注入 ────────────────────────────────────────────────────────

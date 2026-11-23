@@ -320,19 +320,34 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// context_overflow_mode=compact：在结构化 messages[] 层裁掉最早的
 	// 原子消息组再重拼 prompt；裁不动时 err 是 *PromptTooLongError。
-	if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
-		var ptl *PromptTooLongError
-		if errors.As(cerr, &ptl) {
-			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
-				"message": ptl.Error(), "type": "invalid_request_error",
-				"code": "context_length_exceeded"}})
+	// MultiTurn 续接与 anonFirstEligible 匿名路径跳过：改了 messages 会破坏
+	// convPrefixKeys 前缀指纹（每轮退化为全量冷启动），续接轮次也不发全量
+	// prompt，compact 不适用。
+	multiTurnEligible := rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0
+	anonEligible := anonFirstEligible(modelCfg, len(images) > 0)
+	if !multiTurnEligible && !anonEligible {
+		if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
+			var ptl *PromptTooLongError
+			if errors.As(cerr, &ptl) {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": ptl.Error(), "type": "invalid_request_error",
+					"code": "context_length_exceeded"}})
+				return
+			}
+			writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
 			return
+		} else if ok {
+			messages = cm
+			prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+			// 裁掉的历史消息可能带图：compact 之后重收图片，已丢轮次的图
+			// 不再幽灵上传。
+			images, err = collectImages(messages, "")
+			if err != nil {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": err.Error(), "type": "invalid_request_error"}})
+				return
+			}
 		}
-		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
-		return
-	} else if ok {
-		messages = cm
-		prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	}
 
 	stream, _ := req["stream"].(bool)
@@ -367,7 +382,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+	if multiTurnEligible {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
 		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
@@ -599,19 +614,30 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// context_overflow_mode=compact：同 handleChatCompletions 的结构化裁剪。
-	if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
-		var ptl *PromptTooLongError
-		if errors.As(cerr, &ptl) {
-			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
-				"message": ptl.Error(), "type": "invalid_request_error",
-				"code": "context_length_exceeded"}})
+	// MultiTurn 续接与 anonFirstEligible 匿名路径同样跳过（保护 convPrefixKeys）。
+	multiTurnEligible := rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0
+	anonEligible := anonFirstEligible(modelCfg, len(images) > 0)
+	if !multiTurnEligible && !anonEligible {
+		if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
+			var ptl *PromptTooLongError
+			if errors.As(cerr, &ptl) {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": ptl.Error(), "type": "invalid_request_error",
+					"code": "context_length_exceeded"}})
+				return
+			}
+			writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
 			return
+		} else if ok {
+			messages = cm
+			prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+			images, err = collectImages(messages, "")
+			if err != nil {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": err.Error(), "type": "invalid_request_error"}})
+				return
+			}
 		}
-		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
-		return
-	} else if ok {
-		messages = cm
-		prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	}
 
 	stream, _ := req["stream"].(bool)
@@ -638,8 +664,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		// 开流前的确定性超长预检：命中后 WriteHeader 还没发，可以直接回
 		// 400——否则流式请求的超长会在 response.failed 里以 200 报，客户端
 		// 看不到 context_length_exceeded。MultiTurn 不发完整 prompt 不适用。
-		if ptlErr := responsesContextOverflowCheck(prompt, pc,
-			rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0); ptlErr != nil {
+		if ptlErr := responsesContextOverflowCheck(prompt, pc, multiTurnEligible,
+			anonEligible); ptlErr != nil {
 			var ptl *PromptTooLongError
 			if errors.As(ptlErr, &ptl) {
 				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
@@ -723,7 +749,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+	if multiTurnEligible {
 		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
 		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, nil)

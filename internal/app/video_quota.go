@@ -103,7 +103,7 @@ func viaSlot(a *CookieAccount, fn func(proxyURL string) error) error {
 	// 直连是它的合法承诺，落到槽位 0 纯属正常，不许当成「绑定漂移」改掉。
 	if a.ID > 0 && p.ID > 0 && p.ID != a.ProxyID && a.ProxyID != proxyIDDirect {
 		if !rtCfg().StrictProxyBinding {
-			bindAccountProxy(a.ID, p.ID)
+			autoBindAccountProxy(a.ID, p.ID)
 		}
 		a.ProxyID = p.ID
 	}

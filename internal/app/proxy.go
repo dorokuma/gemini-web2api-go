@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// proxyIDDirect（-1 锁定直连）三条核心不变量（分散实现易复发，统一在此固化）：
+//  1. 库值优先于快照：任何 acct.ProxyID/conv.proxyID 快照都可能陈旧，
+//     判出口归属必须先按 claimMu/核库读 accounts.proxy_id 当前值；
+//  2. 自动写绑绝不覆写 -1：非管理员写绑一律走 autoBindAccountProxy，
+//     它在 claimMu 锁内重查——库里 -1 / 已删 / proxyID<=0 / 已有有效绑定
+//     都绝不写；管理员写绑走 bindAccountProxy；
+//  3. 直连槽 0 的语义随池态变化：hasProxyPool() && !FallbackDirect 时
+//     slots[0] 只归锁定直连号（cur==proxyIDDirect），其它账号/匿名借用
+//     即泄漏本机 IP；池空或 fallback 开时按普通直连语义。
 type Proxy struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`

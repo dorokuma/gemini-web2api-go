@@ -520,6 +520,29 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, "contents is empty")
 		return nil, false
 	}
+	// context_overflow_mode=compact：Google 原生入口同 OpenAI 两入口接入结构化
+	// 裁剪；MultiTurn / anonFirstEligible 同样跳过（保护 convPrefixKeys 指纹）。
+	multiTurnEligible := rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0
+	anonEligible := anonFirstEligible(modelCfg, len(images) > 0)
+	if !multiTurnEligible && !anonEligible {
+		if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
+			var ptl *PromptTooLongError
+			if errors.As(cerr, &ptl) {
+				writeGeminiError(w, 400, ptl.Error())
+				return nil, false
+			}
+			writeGeminiError(w, 500, cerr.Error())
+			return nil, false
+		} else if ok {
+			messages = cm
+			prompt, pc = messagesToPrompt(messages, tools, toolChoice, modelCfg.TaskMode)
+			images, err = collectImages(messages, "")
+			if err != nil {
+				writeGeminiError(w, 400, err.Error())
+				return nil, false
+			}
+		}
+	}
 	return &geminiCall{ctx: r.Context(), req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
 		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc,
 		requestScope: conversationRequestScope(r, "", "")}, true

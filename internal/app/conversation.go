@@ -292,7 +292,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	// conv.proxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
 	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID && conv.proxyID != proxyIDDirect {
 		if !rtCfg().StrictProxyBinding {
-			bindAccountProxy(conv.accountID, p.ID)
+			autoBindAccountProxy(conv.accountID, p.ID)
 		}
 		conv.proxyID = p.ID
 	}
@@ -303,12 +303,9 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
 	// 账号锁定 proxyIDDirect 时不许用 p.ID（0=未绑语义的直连槽值）覆写绑定记忆——
 	// -1 是「永不走代理」的显式承诺，落了 0 下一轮就丢了这个承诺。
+	// p.ID == 0（直连槽）且库中实为锁定直连时同样核库保持 -1，不用 0 误落。
 	if conv.turn == 0 {
-		if conv.isLogin && conv.accountID > 0 && prefer == proxyIDDirect {
-			conv.proxyID = proxyIDDirect
-		} else {
-			conv.proxyID = p.ID
-		}
+		conv.proxyID = resolveFirstTurnProxyID(conv, prefer, p.ID)
 		conv.proxyURL = proxyURL
 		// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
 		if conv.cookie == "" && !conv.isLogin {
@@ -565,6 +562,66 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	return failRes(), lastErr
 }
 
+// resolveFirstTurnProxyID 决定首轮会话记哪个出口（turn==0 时调一次）：
+// 登录账号以库中实锤为准——锁定直连的号即便手上的槽是 0 也记 -1（-1 是
+// 「永不走代理」的显式承诺，落了 0 下一轮就丢了）；库中值已被改回代理或
+// prefer 已核成 -1 之外的值时按 prefer/picked 记。
+func resolveFirstTurnProxyID(conv *convState, prefer, pickedID int64) int64 {
+	if conv.isLogin && conv.accountID > 0 {
+		if a := accountByID(conv.accountID); a != nil && a.ProxyID == proxyIDDirect {
+			return proxyIDDirect
+		}
+		if prefer == proxyIDDirect {
+			return proxyIDDirect
+		}
+	}
+	return pickedID
+}
+
+// convMustColdStart 判断登录会话是否必须作废回冷启动：
+//   - 会话绑死的号被禁用/删除：再往上发要么失败，更糟的是在
+//     BrowserTransport=true && BrowserFallbackHTTP=false 下绕过常驻浏览器
+//     漏出 Go HTTP 指纹——强制冷启动让挑号逻辑重新选健康账号；
+//   - 锁定直连参与改绑（任一侧是 -1）：无论 strict_proxy_binding 开不开都
+//     必须冷启动——-1 的「绝不走代理/绝不直连」承诺不靠开关兑现，带着旧
+//     出口的 cid/rid/rcid 续接等于从错误出口把会话推下去；
+//   - 严格绑定下绑定出口变了：新绑定的出口才是这个号的合法出口，会话
+//     记忆里那个旧出口（含直连 0）绝不能再外发。
+func convMustColdStart(conv *convState) bool {
+	a := accountByID(conv.accountID)
+	switch {
+	case a == nil || a.Status != "enabled":
+		logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
+		return true
+	case (a.ProxyID == proxyIDDirect || conv.proxyID == proxyIDDirect) &&
+		a.ProxyID != conv.proxyID:
+		logf("[conv] 账号 #%d 锁定直连绑定出口已从 #%d 改为 #%d，回退冷启动",
+			conv.accountID, conv.proxyID, a.ProxyID)
+		return true
+	case rtCfg().StrictProxyBinding && a.ProxyID != conv.proxyID &&
+		(a.ProxyID > 0 || a.ProxyID == proxyIDDirect || conv.proxyID == proxyIDDirect):
+		logf("[conv] 账号 #%d 绑定出口已从 #%d 改为 #%d，回退冷启动",
+			conv.accountID, conv.proxyID, a.ProxyID)
+		return true
+	}
+	return false
+}
+
+// strictOrLockedPool 决定 Bound 换号预算要不要放宽到全池：严格绑定开着，
+// 或池里存在启用中的锁定直连（-1）账号（直连槽满时它们彼此互堵，第 4+
+// 个锁定直连号也该被试到）。
+func strictOrLockedPool() bool {
+	if rtCfg().StrictProxyBinding {
+		return true
+	}
+	for _, a := range accountList() {
+		if a.ProxyID == proxyIDDirect && a.Status == "enabled" {
+			return true
+		}
+	}
+	return false
+}
+
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
 //   - 命中已知历史前缀 → 发全部新增消息（user 或 tool 结果），历史留服务端（绕开字节墙）。
 //   - 没命中 → 新建会话，首轮发全量拼接的历史（含 tools 指令，把当前上下文交给服务端）。
@@ -599,21 +656,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	}
 	fresh := conv == nil
 	if !fresh && conv.isLogin {
-		a := accountByID(conv.accountID)
-		switch {
-		case a == nil || a.Status != "enabled":
-			// 会话绑死的号被禁用/删除后不能再往上发：禁用的号发出去要么失败，
-			// 更糟的是在 BrowserTransport=true && BrowserFallbackHTTP=false 下
-			// 绕过常驻浏览器漏出 Go HTTP 指纹。强制冷启动让挑号逻辑重新选健康账号。
-			logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
-			fresh = true
-			conv = nil
-		case rtCfg().StrictProxyBinding && a.ProxyID != conv.proxyID &&
-			(a.ProxyID > 0 || a.ProxyID == proxyIDDirect || conv.proxyID == proxyIDDirect):
-			// 账号绑定出口变了（管理员改绑、或并发首绑仲裁后落库）：新绑定的出口
-			// 才是这个号的合法出口，会话记忆里那个旧出口（含直连 0）绝不能再外发
-			//（严格绑定的核心承诺）。强制冷启动，不能带着旧出口的会话记忆续接。
-			logf("[conv] 账号 #%d 绑定出口已从 #%d 改为 #%d，回退冷启动", conv.accountID, conv.proxyID, a.ProxyID)
+		if convMustColdStart(conv) {
 			fresh = true
 			conv = nil
 		}
@@ -656,7 +699,9 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	// 大小（绑定出口不可用不是降级，第 N 个号绑在空闲出口上就该被试到）。
 	// 分开计数互不放大：Bound 次数不能用来延长降级预算，反之亦然。
 	boundBudget := maxCookieTries
-	if rtCfg().StrictProxyBinding {
+	// 严格绑定或池里存在锁定直连（-1）账号时，Bound 受阻换号放宽到全池账号数：
+	// 直连槽满时第 4+ 个锁定直连号也该被试到（与 streamGenerateOnce 扫全池一致）。
+	if strictOrLockedPool() {
 		if total, _ := accountCount(); total > boundBudget {
 			boundBudget = total
 		}

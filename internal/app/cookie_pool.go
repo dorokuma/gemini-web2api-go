@@ -601,7 +601,7 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	// 严格绑定下绑定仲裁已在 acquireClaimedSlot 里完成：这里再无条件覆写会把
 	// 已仲裁出的胜者改成本次挑到的出口。非严格模式保留原写库语义（首次绑定/失效重绑）。
 	if !rtCfg().StrictProxyBinding && picked.ID > 0 && a.ProxyID != picked.ID {
-		bindAccountProxy(a.ID, picked.ID)
+		autoBindAccountProxy(a.ID, picked.ID)
 	}
 	detail := "登录态有效"
 	if extractSAPISID(a.Cookie) == "" {
@@ -645,6 +645,31 @@ func bindAccountProxy(accountID, proxyID int64) {
 	}
 	claimMu.Lock()
 	defer claimMu.Unlock()
+	bindAccountProxyLocked(accountID, proxyID)
+}
+
+// autoBindAccountProxy 是**非管理员自动写绑**的统一入口：在 claimMu 锁内先
+// 重查 DB 当前绑定，绝不拿锁外陈旧快照决定写不写——管理员在 getXSRF 等
+// 网络 I/O 期间刚把账号锁成 proxyIDDirect（-1）时，这里能拦下不覆写。
+//
+// 绝不覆写的情形：
+//   - 账号已删（a == nil）或库里已锁 proxyIDDirect；
+//   - proxyID <= 0（自动写绑只认真实代理出口，不写 -1/0 哨兵）；
+//   - 库里已有仍有效的启用代理绑定（a.ProxyID > 0 且 proxyUsableByID）——
+//     粘性不能拿本轮撞到的别的出口打散。
+func autoBindAccountProxy(accountID, proxyID int64) {
+	if accountID <= 0 || proxyID <= 0 {
+		return
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	a := accountByID(accountID)
+	if a == nil || a.ProxyID == proxyIDDirect {
+		return // 已删 / 锁定直连：绝不覆写
+	}
+	if a.ProxyID > 0 && proxyUsableByID(a.ProxyID) {
+		return // 已有仍有效的启用代理绑定：不打散粘性
+	}
 	bindAccountProxyLocked(accountID, proxyID)
 }
 

@@ -66,6 +66,52 @@
   分类（`PromptTooLongError` → `invalid_request_error` /
   `context_length_exceeded`，`RateLimitError` → `rate_limit_exceeded` /
   `ip_slot_full`）。
+- **R2 审查复核修复（Oracle M1–M7 / S1–S4）**：
+  - `acquireClaimedSlot` 全环闭合锁定直连语义：库中值先于陈旧 prefer
+    快照（`resolvePreferProxy`），拿到槽后按库中实锤纠偏手上的出口
+    （`reconcileHeldSlot`），严格模式直连槽仲裁抽成 `directSlotGuard`
+    ——库里查不到账号（已删）手持直连槽一律 fail-closed 报错，绝不
+    直连外发；`xsrfExitConflict` 把 XSRF 换号循环的双向隔离判据抽成
+    纯函数（锁定直连号撞代理槽 / 池非空关 fallback 时非锁定号撞直连槽
+    / 严格绑定下 picked 与仲裁胜者不一致均判冲突）。
+  - `autoBindAccountProxy` 统一非管理员自动写绑入口：`claimMu` 内重查
+    DB，绝不覆写 `-1`、不写非正 proxyID、不打散仍有效的粘性绑定；
+    `checkAccountCookie`/`streamGenerateOnce`/`streamGenerateConv`/
+    `viaSlot` 四处锁外 `bindAccountProxy` 全部改走它。
+  - `RateLimitError.Error` 先判 `AllProxiesFull` 再判 `ProxyID==0`——
+    全池限流（ProxyID 零值）不再误报 "direct IP slot full"；锁定直连
+    Bound 报 "locked direct exit unavailable"；`classifyError` 收录
+    `locked direct exit unavailable`/`bound proxy` → `rate_limited_local`。
+  - Admin 连通性测试严格出口隔离：`compatibleProbeAccount` 在池非空且
+    `fallback_direct` 关时测直连只接受锁定直连号（未绑定号借本机 IP
+    同样是串出口）；`probeGeminiWithAccount` 新增 `allowPoolFallback`
+    形参，探测路径绝不 `loadCookie()` 退到任意账号；无匹配号走匿名。
+  - 浏览器冷启动/重建 CDP 会话与桥状态一致：`alignColdStartJar`/
+    `alignResidentAndNavigate` 全部 `Network.*` 走 page session（根连接
+    无 Network 域）；Jar 读错、含陌生 Cookie、绑定失效一律先
+    `clearBrowserCookies` 再导航（清失败中止）；同 `cookieIdentity`
+    多 authuser 按 `seed.AccountID` 消歧并回写校正 seed；`recreateTab`
+    开头先 `failAllStreams` 再清 Jar/导航，`SetUpstream` 后经
+    `bridgeMu` 同步 `bridgeActiveURL`/`bridgeActiveDirect` 记账出口；
+    `/app` 导航后 `waitPageLoad` 等页面加载完再交回 Tab（防
+    about:blank origin 的首航 CORS）。
+  - compact 精度复核：触发条件改按 `planContextFile` 规划出的真实
+    history 长度判（不再拿 messages 渲染长度误触发）；`compactMessages`
+    改 pinned 原位标记（必保集合不挪位、不重排）；`[System note]`
+    字节在丢组循环内计入预算；`msgBytes`/`renderedHistoryBytes` 按
+    `formatToolResult`/tool_call 围栏真实渲染计账；多模态
+    `[]interface{}` tool 结果的非文本 part 原样保留；UTF-8 边界
+    截断改 O(1)（`utf8BoundaryUp`/`utf8BoundaryDown` ≤3 字节微调）；
+    `applyCompactIfNeeded` 的 inlineOverhead 只在 `stripToolProtocol`
+    失败（Head+Tail 真留在 history）时计入；`responsesContextOverflowCheck`
+    无条件做 planContextFile 校验；`handleChatCompletions`/`handleResponses`/
+    `prepareGemini` 接线统一：MultiTurn 与 anonFirstEligible 跳过
+    compact，裁剪成功后重建 `messages`/`prompt`/`pc` 并重新 `collectImages`。
+  - `wrbPayloadsInLine` 统一单行全部 `wrb.fr` 条目遍历（去掉
+    `len(line)<200` 启发式）：`textsInLine`/`reasoningInLine`/
+    `failureReplyInLine` 共用，元信息帧与内容帧同行的行不再漏判；
+    `streamGenerateOnce` 的 `t0` 提到重试循环起点，循环前早退的
+    归属（如拿不到出口）不再伪造 0ms 的 TotalMs。
 
 ## 6.4.0 - 2026-11-23
 
