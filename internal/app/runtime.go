@@ -50,6 +50,15 @@ type RuntimeConfig struct {
 	// 单位是字节不是 token：实测上游的墙按字节走，跟语言无关，见 messages.go。
 	// 0 = 关掉检查（原样发出，由上游从尾部静默截断）。
 	MaxPromptBytes int `json:"max_prompt_bytes"`
+	// MaxContextFileBytes 是历史转文本附件（message.txt）的附件字节上限：
+	// 实测模型能读到的附件总量约 16 万字节，默认 150000。0 = 不限。
+	// 超限按 ContextOverflowMode 处理（见下）。
+	MaxContextFileBytes int `json:"max_context_file_bytes"`
+	// ContextOverflowMode 是附件超限的处置："error"（默认）直接 400
+	// context_length_exceeded；"compact" 在结构化 messages[] 层裁掉最早的
+	// 原子消息组（带 tool_calls 的 assistant 与其 tool 结果不可拆分）再转附件；
+	// "" 等同 "error"。默认不裁：静默丢历史比明确报错害处更大。
+	ContextOverflowMode string `json:"context_overflow_mode"`
 	// MultiTurn 开启后走 Gemini 原生 conversation_id 服务端多轮：按历史前缀识别续接，
 	// 命中就只发最新一句、历史留服务端，绕开单请求字节墙。匿名/登录都行，见 conversation.go。
 	// 默认 false（保持现有"每轮拼全量 prompt"行为）。实测多轮不放大上下文窗口，只让长
@@ -131,13 +140,15 @@ func initRuntimeConfig() {
 		Impersonate:     cfg.Impersonate,
 		GeminiBL:        cfg.GeminiBL,
 
-		ProxyCooldownMin:   cfg.ProxyCooldownMin,
-		FallbackDirect:     cfg.FallbackDirect,
-		StrictProxyBinding: cfg.StrictProxyBinding,
-		FallbackAnon:       cfg.FallbackAnon,
-		GeminiBLAuto:       cfg.GeminiBLAuto,
-		MaxPromptBytes:     cfg.MaxPromptBytes,
-		MultiTurn:          cfg.MultiTurn,
+		ProxyCooldownMin:    cfg.ProxyCooldownMin,
+		FallbackDirect:      cfg.FallbackDirect,
+		StrictProxyBinding:  cfg.StrictProxyBinding,
+		FallbackAnon:        cfg.FallbackAnon,
+		GeminiBLAuto:        cfg.GeminiBLAuto,
+		MaxPromptBytes:      cfg.MaxPromptBytes,
+		MaxContextFileBytes: cfg.MaxContextFileBytes,
+		ContextOverflowMode: cfg.ContextOverflowMode,
+		MultiTurn:           cfg.MultiTurn,
 
 		AutoDeleteConversation: cfg.AutoDeleteConversation,
 		AnonFirst:              cfg.AnonFirst,
@@ -210,6 +221,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"retention_days", c.RetentionDays, 1, 3650},
 		{"proxy_cooldown_min", c.ProxyCooldownMin, 0, 10080},
 		{"max_prompt_bytes", c.MaxPromptBytes, 0, 10000000},
+		{"max_context_file_bytes", c.MaxContextFileBytes, 0, 10000000},
 		{"strict_model_cooldown_min", c.StrictModelCooldownMin, 0, 10080},
 		{"stream_keepalive_sec", c.StreamKeepaliveSec, 0, 300},
 		{"stream_idle_timeout_sec", c.StreamIdleTimeoutSec, 0, 600},
@@ -226,6 +238,11 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	}
 	if c.GeminiBL == "" {
 		return fmt.Errorf("gemini_bl 不能为空")
+	}
+	switch c.ContextOverflowMode {
+	case "", "error", "compact":
+	default:
+		return fmt.Errorf("context_overflow_mode 只接受 \"error\" 或 \"compact\"，收到 %q", c.ContextOverflowMode)
 	}
 	return nil
 }

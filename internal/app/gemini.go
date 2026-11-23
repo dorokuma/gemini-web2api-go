@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -387,17 +388,31 @@ type StreamResult struct {
 	CanRestoreConvHead bool
 }
 
+// proxyIDDirect 是账号绑定表里的「锁定本机直连」哨兵（#proxyIDDirect）：
+//
+//	-1 = 锁定直连（永远只走 slots[0]，绝不进代理池、也绝不因 FallbackDirect 语义被改判）；
+//	 0 = 未绑定，按调度规则自动；
+//	>0 = 绑定代理池里那个出口。
+const proxyIDDirect int64 = -1
+
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
 // HTTP handler 看到这个错时返回 429 给客户端。
 type RateLimitError struct {
 	Reason  string // "concurrent" / "rpm" / "rph"
-	ProxyID int64  // 0 = 直连 slot 满
-	// Bound：strict_proxy_binding 开着，账号绑定的那个出口（ProxyID）用不上，没换到别的出口。
+	ProxyID int64  // 0 = 直连 slot 满；proxyIDDirect(-1) = 锁定直连 slot 满
+	// Bound：账号绑定的那个出口（ProxyID）用不上，没换到别的出口（strict_proxy_binding
+	// 或 proxyIDDirect 锁定）。外层据此换号而不换出口——绝不串代理。
 	Bound bool
+	// AllProxiesFull：全池限流满（取代旧的 ProxyID=-1 哨兵；-1 现在是合法的
+	// 「锁定直连」绑定值，不能再当标签用）。
+	AllProxiesFull bool
 }
 
 func (e *RateLimitError) Error() string {
 	if e.Bound {
+		if e.ProxyID == proxyIDDirect {
+			return "account's locked direct exit unavailable (" + e.Reason + ")"
+		}
 		return fmt.Sprintf("account's bound proxy #%d unavailable (%s) and strict_proxy_binding is on", e.ProxyID, e.Reason)
 	}
 	if e.ProxyID == 0 {
@@ -410,8 +425,20 @@ func (e *RateLimitError) Error() string {
 // 优先级：代理池里有容量的代理 → 直连。
 // 全满返回 *RateLimitError。
 //
+// preferProxyID == proxyIDDirect（账号锁定本机直连）时无视代理池 / FallbackDirect /
+// StrictProxyBinding，只试直连槽 slots[0]；满则报 Bound=true 的 *RateLimitError，
+// 外层靠 Bound 换号而绝不串进代理池。
+//
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
 func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
+	// 锁定本机直连：唯一合法出口是直连槽，绝不进代理池。
+	if preferProxyID == proxyIDDirect {
+		if ok, reason := trySlotAcquire(0); ok {
+			return Proxy{}, true, nil
+		} else {
+			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: proxyIDDirect, Bound: true}
+		}
+	}
 	// 1. 先试代理池（如果配了）
 	proxyMu.RLock()
 	hasProxies := len(proxyCache) > 0
@@ -434,7 +461,7 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 			if reason == "unavailable" {
 				return Proxy{}, false, fmt.Errorf("proxy_unavailable: all configured proxies are disabled or in circuit-breaker cooldown")
 			}
-			return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: -1}
+			return Proxy{}, false, &RateLimitError{Reason: reason, AllProxiesFull: true}
 		}
 		// 代理池里有代理但一个都用不上（限流满 / 全禁用 / 全熔断且没过冷却）。
 		// 默认**不退回直连** —— 配了代理池就意味着不想让上游看到本机 IP，
@@ -475,6 +502,20 @@ func releaseSlot(proxyID int64) {
 // 恰在此刻满/冷却）原样报错，败方的 slot 已归还，胜者的归属由绑定结果保证，
 // 同一个账号绝不从两个 IP 外发、已绑定的号绝不直连外发。
 func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) {
+	// 库中绑定值核实先于 acquireSlot：prefer 可能是 accountList()/convState
+	// 的陈旧快照。库中锁了直连（-1）时绝不能拿过期代理 ID 去 acquireSlot——
+	// 那不但会真占用一个代理槽，满了/冷却时还会把本可走直连的请求误报成
+	// Bound 失败。同样，库中已不锁直连而 prefer 还是陈旧 -1 时也要按库中值。
+	if accountID > 0 {
+		if a := accountByID(accountID); a != nil && a.ProxyID != preferProxyID {
+			switch {
+			case a.ProxyID == proxyIDDirect:
+				preferProxyID = proxyIDDirect
+			case preferProxyID == proxyIDDirect:
+				preferProxyID = a.ProxyID
+			}
+		}
+	}
 	p, ok, err := acquireSlot(preferProxyID)
 	if !ok {
 		return nil, func() {}, err
@@ -484,6 +525,31 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 		if held {
 			held = false
 			releaseSlot(heldID)
+		}
+	}
+	if accountID > 0 {
+		// 库中绑定值核实：手上的 prefer 可能是 accountList()/convState 的陈旧快照，
+		// 而 proxyIDDirect 的「绝不走代理」承诺不分严格/非严格模式：
+		//   - 库里锁了直连（-1）而手上误持代理槽：释放、重取直连槽；
+		//   - 库里没锁直连而因陈旧 -1 快照误持直连槽，且池里有代理又关了
+		//     fallback_direct：直连对该号不合法，释放直连槽重取库中策略出口。
+		if a := accountByID(accountID); a != nil {
+			switch {
+			case a.ProxyID == proxyIDDirect && p.ID > 0:
+				release()
+				p2, ok2, err2 := acquireSlot(proxyIDDirect)
+				if !ok2 {
+					return nil, func() {}, err2
+				}
+				p, heldID, held = p2, p2.ID, true
+			case a.ProxyID != proxyIDDirect && p.ID == 0 && !rtCfg().FallbackDirect && hasProxyPool():
+				release()
+				p2, ok2, err2 := acquireSlot(a.ProxyID)
+				if !ok2 {
+					return nil, func() {}, err2
+				}
+				p, heldID, held = p2, p2.ID, true
+			}
 		}
 	}
 	if !rtCfg().StrictProxyBinding || accountID <= 0 {
@@ -498,10 +564,12 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 	for i := 0; i < 2; i++ {
 		var winner int64
 		if p.ID == 0 {
-			// 代理全满/全不可用落入 fallback_direct 直连兜底：先核库——库里已绑
-			// 启用出口的号绝不能从本机 IP 外发，必须释放直连槽去占绑定的出口。
-			// cur==0（未绑定或绑定已失效）时才允许直连。
-			if cur := currentBoundEnabledProxy(accountID); cur == 0 {
+			// 代理全满/全不可用落入 fallback_direct 直连兜底（或 prefer 为
+			// proxyIDDirect）：先核库——库里已绑启用出口的号绝不能从本机 IP 外发，
+			// 必须释放直连槽去占绑定的出口。
+			// cur==0（未绑定或绑定已失效）或 cur==proxyIDDirect（锁定直连）才允许直连；
+			// 陈旧 -1 快照撞上库里已改绑的号，同样要释放重取。
+			if cur := currentBoundEnabledProxy(accountID); cur == 0 || cur == proxyIDDirect {
 				return &p, release, nil
 			} else {
 				winner = cur
@@ -519,7 +587,7 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 			return nil, func() {}, err2
 		}
 		p, heldID, held = p2, p2.ID, true
-		if p.ID == winner {
+		if (winner == proxyIDDirect && p.ID == 0) || p.ID == winner {
 			return &p, release, nil
 		}
 		// winner 途中被禁用/挤兑，acquireSlot 落到了别的出口（可能是另一个代理，
@@ -535,13 +603,20 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 }
 
 // currentBoundEnabledProxy 在 claimMu 下取这个号当前绑定的、仍然存在且 enabled 的
-// 出口 id；没绑、或绑定的出口被删/禁用返回 0。冷却中的绑定仍然算数（同
+// 出口 id；没绑、或绑定的出口被删/禁用返回 0；账号锁定 proxyIDDirect 时原样返回
+// proxyIDDirect（锁定直连也是有效绑定，绝不覆写）。冷却中的绑定仍然算数（同
 // claimAccountProxy 的语义），只看 enabled 不看可用性。
 func currentBoundEnabledProxy(accountID int64) int64 {
 	claimMu.Lock()
 	defer claimMu.Unlock()
 	a := accountByID(accountID)
-	if a == nil || a.ProxyID <= 0 || !proxyEnabledByID(a.ProxyID) {
+	if a == nil {
+		return 0
+	}
+	if a.ProxyID == proxyIDDirect {
+		return proxyIDDirect
+	}
+	if a.ProxyID <= 0 || !proxyEnabledByID(a.ProxyID) {
 		return 0
 	}
 	return a.ProxyID
@@ -710,12 +785,25 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	var cookieID int64
 	var cookieLabel string
 	var lastDiag upstreamDiagMeta
+	// t0/lastTTFB/tracker 提前声明：attrib 在所有「循环启动后」的失败返回
+	// 路径统一回填真实计时与已发增量（见 streamGenerateConv 同形逻辑）。
+	t0 := time.Now()
+	var lastTTFB int64
+	var tracker, rtracker *deltaTracker
 	attrib := func(err error) (*StreamResult, error) {
-		return &StreamResult{
+		res := &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
 			ProxyID: picked.ID, ProxyName: picked.Name,
 			Diag: lastDiag, UpstreamModel: lastDiag.Model,
-		}, err
+			TTFBMs: lastTTFB, TotalMs: time.Since(t0).Milliseconds(),
+		}
+		if tracker != nil {
+			res.Emitted = tracker.emitted
+		}
+		if rtracker != nil {
+			res.EmittedReasoning = rtracker.emitted
+		}
+		return res, err
 	}
 
 	// 通过限流器拿一个 slot（代理或直连），严格绑定下顺带完成首绑仲裁。
@@ -803,16 +891,37 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		//（不消耗 maxCookieTries 预算），归属也不记它——错不在 cookie 在绑定。
 		// picked.ID>0 走 claimAccountProxy 仲裁；picked.ID==0（fallback_direct 直连
 		// 兜底）时库里绑在启用出口上的号同样绝不能从本机 IP 外发。
-		if rtCfg().StrictProxyBinding && acct.ID > 0 {
-			var conflictID int64
-			if picked.ID > 0 {
-				if w := claimAccountProxy(acct.ID, picked.ID); w != picked.ID {
-					conflictID = w
-				}
-			} else {
-				conflictID = currentBoundEnabledProxy(acct.ID)
+		//
+		// proxyIDDirect（-1 锁定直连）双向隔离（无论 strict_proxy_binding 开不开）：
+		//   - 库里锁定直连的号绝不能借代理槽外发（TR 绝不借代理）；
+		//   - 直连槽是 fallback_direct 兜底时，没锁直连的号（绑定代理或未绑）绝不能
+		//     借 TR 的直连槽漏本机 IP。
+		if acct.ID > 0 {
+			curBound := int64(0)
+			boundKnown := false
+			if a := accountByID(acct.ID); a != nil {
+				curBound, boundKnown = a.ProxyID, true
 			}
-			if conflictID != 0 {
+			var conflictID int64
+			conflict := false
+			switch {
+			case boundKnown && curBound == proxyIDDirect && picked.ID > 0:
+				conflictID, conflict = proxyIDDirect, true // 锁定直连号撞上代理槽：冲突跳过
+			case picked.ID == 0 && hasProxyPool() && !rtCfg().FallbackDirect &&
+				(!boundKnown || curBound != proxyIDDirect):
+				// 直连槽在池非空且关 fallback 时只对锁定直连号合法；
+				// 查不到绑定（号刚被删）也按冲突跳过，fail-closed。
+				conflictID, conflict = curBound, true
+			case rtCfg().StrictProxyBinding && picked.ID > 0:
+				if w := claimAccountProxy(acct.ID, picked.ID); w != picked.ID {
+					conflictID, conflict = w, true
+				}
+			case rtCfg().StrictProxyBinding:
+				if w := currentBoundEnabledProxy(acct.ID); w != 0 && w != proxyIDDirect {
+					conflictID, conflict = w, true
+				}
+			}
+			if conflict {
 				// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
 				if skip == nil {
 					skip = map[int64]bool{}
@@ -853,7 +962,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 粘性打散一次 —— 实测就是这么散掉的。
 			// 只在非严格模式写：严格模式的落库只走 claimMu 里的 claimAccountProxy
 			//（上面已仲裁过），锁外写库会覆盖管理员的并发改绑。
-			if !rtCfg().StrictProxyBinding && (acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
+			// acct.ProxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
+			if !rtCfg().StrictProxyBinding && acct.ProxyID != proxyIDDirect &&
+				(acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
 				bindAccountProxy(acct.ID, picked.ID)
 			}
 			break
@@ -870,9 +981,14 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
 			// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
 			rotAcct := *acct
-			// picked.ID==0（fallback_direct 直连兜底）时也必须清掉旧绑定：直连就是
-			// 本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
-			rotAcct.ProxyID = picked.ID
+			// picked.ID==0（fallback_direct 直连兜底或锁定直连）时也必须清掉旧绑定：
+			// 直连就是本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
+			// 锁定直连（-1）原样保留：-1 本身就是「走本机直连」的合法指令。
+			if acct.ProxyID == proxyIDDirect {
+				rotAcct.ProxyID = proxyIDDirect
+			} else {
+				rotAcct.ProxyID = picked.ID
+			}
 			if _, _, rerr := rotateAccount(rotAcct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
 					if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
@@ -880,7 +996,8 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 						acct = fresh
 						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
 						authUser = fresh.AuthUser
-						if !rtCfg().StrictProxyBinding && (fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID)) {
+						if !rtCfg().StrictProxyBinding && fresh.ProxyID != proxyIDDirect &&
+							(fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID)) {
 							bindAccountProxy(fresh.ID, picked.ID)
 						}
 						break
@@ -1113,15 +1230,13 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	// cookie 健康度只认 401/403，别的状态不算 cookie 的错，见 markCookieByStatus。
 	lastStatus := 0
 	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
-	t0 := time.Now()
 
 	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
-	// tracker/rtracker 始终指向本轮 lineHandler 的已发/已推增量记账（重试判断
-	// 与结果回填都读它）；每轮重建 lh 后必须同步重指，不能拿旧轮的脏状态。
-	var tracker, rtracker *deltaTracker
+	// tracker/rtracker 已在 attrib 前声明（失败回填也读它）：每轮重建 lh 后
+	// 必须同步重指，不能拿旧轮的脏状态。
 
-	retryWait := func() error {
-		return sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second)
+	retryWait := func(attempt int, werr error) error {
+		return sleepCtx(ctx, retryBackoffDelay(rtCfg().RetryDelaySec, attempt, werr))
 	}
 
 	// 新协议（#43）尚未接入按沉默计时（#33）、请求取消传播、工具提前收尾与扩展思考，
@@ -1165,6 +1280,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		// 每轮重试先清掉上一轮的帧现场：本轮若在拿到响应前就挂了，诊断得如实说
 		// 「这一轮没帧」，不能把上一轮的（可能是别的原因失败的）帧数留进来。
 		lastDiag = upstreamDiagMeta{}
+		lastTTFB = 0
 		var statusCode int
 		var raw []byte
 		var ttfb int64
@@ -1199,6 +1315,15 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// textsInLine/reasoningInLine，自报名复用 extractUpstreamModel——同一帧
 			// 不会因截断而判错，也不会把原文带进失败结果。
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
+		}
+		if ttfb > 0 {
+			lastTTFB = ttfb
+		}
+		// Argon 身份缺失修正归类：出错话术改判 errUpstreamFailureReply（不扣代理分、
+		// 走重试）；既无内容帧又无思考链且非视频受理 → 置 nil 落无内容帧分支；
+		// 有正文/思考但无合法身份 → 原样保留拒绝未验证模型（流式与非流式同判）。
+		if statusCode == 200 {
+			err = argonMissingReclassify(err, string(raw), mc.Tool)
 		}
 		var aie *argonIdentityError
 		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
@@ -1237,7 +1362,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				if werr := retryWait(); werr != nil {
+				if werr := retryWait(attempt, err); werr != nil {
 					return attrib(werr)
 				}
 			}
@@ -1276,7 +1401,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				if werr := retryWait(); werr != nil {
+				if werr := retryWait(attempt, lastErr); werr != nil {
 					return attrib(werr)
 				}
 			}
@@ -1295,7 +1420,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		// one extra video per attempt (burning daily quota). Once a conversation id
 		// exists, treat it as accepted and let fetchMediaArtifacts poll hNvQHb.
 		if !hasContentFrame(string(raw)) && !videoAccepted(mc.Tool, string(raw)) {
-			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
+			lastErr = &diagErr{
+				err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw)),
+				reason: reasonNoContentFrame}
 			if pickedOK {
 				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
 				// 脏出口一天约 9 次），连续踩中说明这个出口该歇了。
@@ -1306,7 +1433,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
-				if werr := retryWait(); werr != nil {
+				if werr := retryWait(attempt, lastErr); werr != nil {
 					return attrib(werr)
 				}
 			}
@@ -1320,7 +1447,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				if werr := retryWait(); werr != nil {
+				if werr := retryWait(attempt, lastErr); werr != nil {
 					return attrib(werr)
 				}
 			}
@@ -2215,6 +2342,63 @@ func hasFailureReply(raw string) bool {
 	return false
 }
 
+// argonMissingReclassify 修正 200 + errArgonIdentityMissing 的归类
+// （streamGenerateOnce / streamGenerateConv 共用，流式与非流式同判）：
+//   - raw 里有出错话术 → errUpstreamFailureReply（走重试分支，不扣代理分）；
+//   - 既无内容帧又无思考链、且不是已受理的视频任务 → nil（自然落入调用方
+//     的 !hasContentFrame 分支，按空帧重试）；
+//   - 否则（有正文帧或思考链但无合法 Argon/Neon 身份）→ 原样保留，拒绝未验证模型。
+func argonMissingReclassify(err error, raw string, tool int) error {
+	if err == nil || !errors.Is(err, errArgonIdentityMissing) {
+		return err
+	}
+	if hasFailureReply(raw) {
+		return errUpstreamFailureReply
+	}
+	if !hasContentFrame(raw) && extractReasoning(raw) == "" && !videoAccepted(tool, raw) {
+		return nil
+	}
+	return err
+}
+
+// retryBackoffDelay 决定本轮重试前等多久。
+//
+// baseSec <= 0 恒返回 0（测试零等待、配置关闭重试间隔）。
+// 空内容帧（reasonNoContentFrame / "no content frame" 错误串）与出错话术
+// （errUpstreamFailureReply）是瞬时拒绝：按 baseSec×2^attempt 指数退避、
+// 乘 [0.8,1.2] 随机抖动、全程封顶 15s——同号重发太密只会再撞一次同样的拒绝。
+// 其它错误维持固定 baseSec 秒（原行为）。调用方统一走 sleepCtx。
+func retryBackoffDelay(baseSec, attempt int, err error) time.Duration {
+	if baseSec <= 0 {
+		return 0
+	}
+	transient := err != nil &&
+		(errors.Is(err, errUpstreamFailureReply) || errDiagReason(err) == reasonNoContentFrame)
+	if !transient {
+		return time.Duration(baseSec) * time.Second
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 10 {
+		attempt = 10 // 防 shift 溢出；retry_attempts 上限 10 本来就不该到
+	}
+	const capDelay = 15 * time.Second
+	d := time.Duration(baseSec) * time.Second * time.Duration(int64(1)<<attempt)
+	if d <= 0 || d > capDelay {
+		d = capDelay
+	}
+	// 抖动 [0.8, 1.2]：多并发同号重试时错开节奏，不共振撞上游。
+	d = time.Duration(float64(d) * (0.8 + rand.Float64()*0.4))
+	if d > capDelay {
+		d = capDelay
+	}
+	if d < 0 {
+		d = 0
+	}
+	return d
+}
+
 // videoAccepted reports whether a video StreamGenerate response shows the job was
 // queued upstream (a conversation was created), even without a text content frame.
 func videoAccepted(tool int, raw string) bool {
@@ -2292,6 +2476,13 @@ type ProbeResult struct {
 // probeGemini 直接调 Gemini StreamGenerate（绕过限流），返回详细诊断。
 // 不写 db、不消耗限流 slot。
 func probeGemini(prompt, proxyURL string) ProbeResult {
+	return probeGeminiWithAccount(prompt, proxyURL, nil)
+}
+
+// probeGeminiWithAccount 同 probeGemini，但用调用方挑定的账号（nil=自动挑一个，
+// 池空=匿名）。handleAdminTest 用它保证测哪个出口就用兼容那个出口的号，
+// 绝不把锁定直连号的 Cookie 从代理发出去、也绝不把绑代理的号从本机 IP 发出去。
+func probeGeminiWithAccount(prompt, proxyURL string, acct *CookieAccount) ProbeResult {
 	res := ProbeResult{Impersonate: rtCfg().Impersonate}
 
 	inner := make([]interface{}, innerSlots)
@@ -2334,12 +2525,20 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
 	// probe 取 token 是辅助入口（allowSwitch=false）：点名非驻留号时
 	// errBrowserSkipAux 无条件回退纯 Go HTTP，不切/不借驻留 jar。
-	cookieStr, sapisid := loadCookie()
-	if tok, e := getXSRFSwitch(cookieStr, 0, proxyURL, false); e == nil && tok != "" {
+	cookieStr, sapisid := "", ""
+	probeAuthUser := 0
+	if acct != nil {
+		cookieStr, sapisid = acct.Cookie, extractSAPISID(acct.Cookie)
+		probeAuthUser = acct.AuthUser
+	} else {
+		cookieStr, sapisid = loadCookie()
+	}
+	if tok, e := getXSRFSwitch(cookieStr, probeAuthUser, proxyURL, false); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()
 	}
 	headers := buildGeminiHeaders(cookieStr, sapisid, probeModel.HexID)
+	setAuthUserHeaders(headers, probeAuthUser)
 
 	// 复用主流程同款 client 选择规则:有代理走 stdlib，没代理走 tls-client。
 	// 但 probe 需要看 302 的 Location header,所以这里直接发不用 doGeminiRequest。
@@ -2348,16 +2547,16 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	var locHeader string
 	var err error
 
-	acct := browserAccountFromHeaders(headers)
+	browserAcct := browserAccountFromHeaders(headers)
 	// 非池会话载体（acct==nil 但带 Cookie）不借浏览器 jar：页内 fetch 发不出
 	// 手工 Cookie 头也不该误带驻留主号登录态，probe 旁路探测走纯 Go HTTP。
 	// 判定先于桥操作：不走浏览器的探测严禁 syncBridgeUpstream 扰动桥。
-	skipBrowserProbe := acct == nil && headers["Cookie"] != ""
+	skipBrowserProbe := browserAcct == nil && headers["Cookie"] != ""
 	if shouldUseBrowserTransport() && !skipBrowserProbe {
 		// 浏览器传输模式：页内 fetch 探测，跟正式请求同一条链路。
 		// probe 是辅助入口（allowSwitch=false）。
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		status, b, e := browserMgr.doBrowserPostCtx(ctx, proxyURL, acct, endpoint, headers, []byte(body), false, nil)
+		status, b, e := browserMgr.doBrowserPostCtx(ctx, proxyURL, browserAcct, endpoint, headers, []byte(body), false, nil)
 		cancel()
 		if e != nil {
 			if isBrowserAuxSkip(e) {

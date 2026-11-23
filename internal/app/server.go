@@ -318,6 +318,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// context_overflow_mode=compact：在结构化 messages[] 层裁掉最早的
+	// 原子消息组再重拼 prompt；裁不动时 err 是 *PromptTooLongError。
+	if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
+		var ptl *PromptTooLongError
+		if errors.As(cerr, &ptl) {
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
+			return
+		}
+		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
+		return
+	} else if ok {
+		messages = cm
+		prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+	}
+
 	stream, _ := req["stream"].(bool)
 	includeUsage := false
 	if so, ok := req["stream_options"].(map[string]interface{}); ok {
@@ -581,6 +598,22 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// context_overflow_mode=compact：同 handleChatCompletions 的结构化裁剪。
+	if cm, ok, cerr := applyCompactIfNeeded(messages, prompt, pc); cerr != nil {
+		var ptl *PromptTooLongError
+		if errors.As(cerr, &ptl) {
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
+			return
+		}
+		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
+		return
+	} else if ok {
+		messages = cm
+		prompt, pc = messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+	}
+
 	stream, _ := req["stream"].(bool)
 	rid := "resp_" + randHex(16)
 	mid := "msg_" + randHex(12)
@@ -602,6 +635,19 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var onDelta func(string)
 	var ka *streamKeepalive
 	if stream {
+		// 开流前的确定性超长预检：命中后 WriteHeader 还没发，可以直接回
+		// 400——否则流式请求的超长会在 response.failed 里以 200 报，客户端
+		// 看不到 context_length_exceeded。MultiTurn 不发完整 prompt 不适用。
+		if ptlErr := responsesContextOverflowCheck(prompt, pc,
+			rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0); ptlErr != nil {
+			var ptl *PromptTooLongError
+			if errors.As(ptlErr, &ptl) {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": ptl.Error(), "type": "invalid_request_error",
+					"code": "context_length_exceeded"}})
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
@@ -699,6 +745,16 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			errObj := upstreamErrorJSON(err, res)
 			if downgraded {
 				errObj["code"] = "model_downgraded"
+			}
+			var ptl *PromptTooLongError
+			if errors.As(err, &ptl) {
+				errObj["type"] = "invalid_request_error"
+				errObj["code"] = "context_length_exceeded"
+			}
+			var rle *RateLimitError
+			if errors.As(err, &rle) {
+				errObj["type"] = "rate_limit_exceeded"
+				errObj["code"] = "ip_slot_full"
 			}
 			writeEvent("response.failed", map[string]interface{}{
 				"type": "response.failed",

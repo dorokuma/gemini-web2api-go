@@ -2930,7 +2930,7 @@ func TestBrowserBridgeSwitchCancelRestoresSameExit(t *testing.T) {
 		stopCh:    make(chan struct{}),
 	}
 	// 请求 A 持有出口 B。
-	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true); err != nil {
 		t.Fatalf("acquire exit B: %v", err)
 	}
 	defer m.releaseBridgeExit()
@@ -2938,7 +2938,7 @@ func TestBrowserBridgeSwitchCancelRestoresSameExit(t *testing.T) {
 	dCtx, dCancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer dCancel()
 	dDone := make(chan error, 1)
-	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080") }()
+	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080", true) }()
 	if err := <-dDone; err == nil {
 		t.Fatal("cross-exit waiter D acquired without waiting for in-flight drain")
 	}
@@ -2946,7 +2946,7 @@ func TestBrowserBridgeSwitchCancelRestoresSameExit(t *testing.T) {
 	// 也不被 D 残留的切换阻塞状态暂缓。
 	t0 := time.Now()
 	eDone := make(chan error, 1)
-	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080") }()
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true) }()
 	select {
 	case err := <-eDone:
 		if err != nil {
@@ -2980,7 +2980,7 @@ func TestBrowserBridgeAcquireCancelledCtxNoDeadlock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	t0 := time.Now()
-	if err := m.acquireBridgeExit(ctx, "http://proxy-b:8080"); !errors.Is(err, context.Canceled) {
+	if err := m.acquireBridgeExit(ctx, "http://proxy-b:8080", true); !errors.Is(err, context.Canceled) {
 		t.Fatalf("idle cancelled acquire err = %v, want context.Canceled", err)
 	}
 	if dt := time.Since(t0); dt >= 100*time.Millisecond {
@@ -2990,7 +2990,7 @@ func TestBrowserBridgeAcquireCancelledCtxNoDeadlock(t *testing.T) {
 	// 占用态：请求 A 持有出口 B，已取消 ctx 的跨出口请求 D 必须立刻
 	// 返回而不是重入 bridgeMu 死锁。
 	m = newMgr()
-	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true); err != nil {
 		t.Fatalf("acquire exit B: %v", err)
 	}
 	defer m.releaseBridgeExit()
@@ -2998,7 +2998,7 @@ func TestBrowserBridgeAcquireCancelledCtxNoDeadlock(t *testing.T) {
 	cancel2()
 	dDone := make(chan error, 1)
 	t0 = time.Now()
-	go func() { dDone <- m.acquireBridgeExit(ctx2, "http://proxy-c:8080") }()
+	go func() { dDone <- m.acquireBridgeExit(ctx2, "http://proxy-c:8080", true) }()
 	select {
 	case err := <-dDone:
 		if !errors.Is(err, context.Canceled) {
@@ -3024,7 +3024,7 @@ func TestBrowserBridgeSameExitStalledDuringSwitchUnblocked(t *testing.T) {
 		stopCh:    make(chan struct{}),
 	}
 	// 请求 A 持有出口 B。
-	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true); err != nil {
 		t.Fatalf("acquire exit B: %v", err)
 	}
 	defer m.releaseBridgeExit()
@@ -3033,7 +3033,7 @@ func TestBrowserBridgeSameExitStalledDuringSwitchUnblocked(t *testing.T) {
 	dCtx, dCancel := context.WithCancel(context.Background())
 	defer dCancel()
 	dDone := make(chan error, 1)
-	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080") }()
+	go func() { dDone <- m.acquireBridgeExit(dCtx, "http://proxy-c:8080", true) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		m.bridgeMu.Lock()
@@ -3051,7 +3051,7 @@ func TestBrowserBridgeSameExitStalledDuringSwitchUnblocked(t *testing.T) {
 	// 同出口请求 E 申请出口 B：D 在等时 E 必须被暂缓（不立刻返回），
 	// 且不占 bridgeSwitchWaiters 名额。
 	eDone := make(chan error, 1)
-	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080") }()
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true) }()
 	select {
 	case err := <-eDone:
 		t.Fatalf("same-exit E returned early with %v while cross-exit waiter pending (should be stalled)", err)
@@ -3103,15 +3103,15 @@ func TestBrowserBridgeSwitchCompletionClearsWaitersAndAllowsSameExit(t *testing.
 		stopCh:    make(chan struct{}),
 	}
 	// 请求 A 持有出口 B。
-	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080"); err != nil {
+	if err := m.acquireBridgeExit(context.Background(), "http://proxy-b:8080", true); err != nil {
 		t.Fatalf("acquire exit B: %v", err)
 	}
 	defer m.releaseBridgeExit()
 	// 跨出口等待者 D1、D2 排队切到出口 C，确认两份登记。
 	d1Done := make(chan error, 1)
 	d2Done := make(chan error, 1)
-	go func() { d1Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
-	go func() { d2Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
+	go func() { d1Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080", true) }()
+	go func() { d2Done <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080", true) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		m.bridgeMu.Lock()
@@ -3153,7 +3153,7 @@ func TestBrowserBridgeSwitchCompletionClearsWaitersAndAllowsSameExit(t *testing.
 	// 立刻自由并发。
 	t0 = time.Now()
 	eDone := make(chan error, 1)
-	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080") }()
+	go func() { eDone <- m.acquireBridgeExit(context.Background(), "http://proxy-c:8080", true) }()
 	select {
 	case err := <-eDone:
 		if err != nil {

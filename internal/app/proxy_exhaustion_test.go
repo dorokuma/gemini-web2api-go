@@ -993,8 +993,16 @@ func TestPatchAccountProxyID(t *testing.T) {
 	if c := patch(`{"proxy_id": 424242}`); c != 400 || accountByID(id).ProxyID != a {
 		t.Fatalf("不存在的代理应 400 且不改绑定：code=%d proxy=%d", c, accountByID(id).ProxyID)
 	}
-	if c := patch(`{"proxy_id": -1}`); c != 400 || accountByID(id).ProxyID != a {
-		t.Fatalf("负数 proxy_id 应 400 且不改绑定：code=%d proxy=%d", c, accountByID(id).ProxyID)
+	if c := patch(`{"proxy_id": -2}`); c != 400 || accountByID(id).ProxyID != a {
+		t.Fatalf("非法负数 proxy_id 应 400 且不改绑定：code=%d proxy=%d", c, accountByID(id).ProxyID)
+	}
+	// -1 是合法的锁定本机直连哨兵（v6.5.0 起面板可锁 TR 出口）。
+	if c := patch(`{"proxy_id": -1}`); c != 200 || accountByID(id).ProxyID != -1 {
+		t.Fatalf("proxy_id=-1 锁定直连应 200：code=%d proxy=%d", c, accountByID(id).ProxyID)
+	}
+	// 还原绑回 a，后续断言以它为基准。
+	if c := patch(fmt.Sprintf(`{"proxy_id": %d}`, a)); c != 200 || accountByID(id).ProxyID != a {
+		t.Fatalf("还原绑定：code=%d proxy=%d", c, accountByID(id).ProxyID)
 	}
 	if c := patch(`{"label": "x"}`); c != 200 || accountByID(id).ProxyID != a {
 		t.Fatalf("没传 proxy_id 不该动绑定：code=%d proxy=%d", c, accountByID(id).ProxyID)
@@ -1023,10 +1031,10 @@ func TestPostAccountProxyIDNotFound(t *testing.T) {
 	if after != before {
 		t.Fatalf("400 请求前后账号总数必须不变：before=%d after=%d", before, after)
 	}
-	// 负数同样拦。
-	w = post(`{"label":"p","cookie":"SAPISID=x; SID=y","proxy_id":-1}`)
+	// 非法负数（<-1）同样拦；-1 是合法的锁定本机直连哨兵，不在此断言。
+	w = post(`{"label":"p","cookie":"SAPISID=x; SID=y","proxy_id":-2}`)
 	if w.Code != 400 {
-		t.Fatalf("负 proxy_id 应 400，得到 %d", w.Code)
+		t.Fatalf("非法负 proxy_id 应 400，得到 %d", w.Code)
 	}
 	if after2, _ := accountCount(); after2 != before {
 		t.Fatalf("400 请求不能新增账号：%d -> %d", before, after2)

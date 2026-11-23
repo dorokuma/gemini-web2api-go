@@ -493,6 +493,40 @@ func handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"items": out})
 }
 
+// compatibleProbeAccount 为连通性测试挑一个与目标出口兼容的启用账号：
+// target==0（测直连）→ 锁定直连(-1)优先、其次未绑定(0)；
+// target>0（测代理 #N）→ 绑 N 优先、其次未绑定(0)。
+// 找不到兼容号返回 nil——调用方走匿名探测，绝不借一个不兼容的号串出口。
+func compatibleProbeAccount(target int64) *CookieAccount {
+	var fallback *CookieAccount
+	for _, a := range accountList() {
+		if a.Status != "enabled" {
+			continue
+		}
+		switch {
+		case target == 0:
+			if a.ProxyID == proxyIDDirect {
+				cp := a
+				return &cp
+			}
+			if a.ProxyID == 0 && fallback == nil {
+				cp := a
+				fallback = &cp
+			}
+		default:
+			if a.ProxyID == target {
+				cp := a
+				return &cp
+			}
+			if a.ProxyID == 0 && fallback == nil {
+				cp := a
+				fallback = &cp
+			}
+		}
+	}
+	return fallback
+}
+
 func atoiDefault(s string, d int) int {
 	if s == "" {
 		return d
@@ -560,6 +594,7 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	var proxyURL, proxyName string
 	var proxyID int64
 	useDirect := false
+	directExplicit := false // proxy_id=0 或 -1 显式测直连
 	if proxyIDStr == "" {
 		// 自动模式：仿照 acquireSlot 优先代理池里第一个 enabled
 		for _, p := range listProxies() {
@@ -581,8 +616,10 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "bad proxy_id"})
 			return
 		}
-		if proxyID == 0 {
+		if proxyID <= 0 {
+			// proxy_id=0（旧语义）与 proxy_id=-1（锁定直连槽）都测本机直连
 			useDirect = true
+			directExplicit = true
 			proxyName = "直连"
 		} else {
 			found := false
@@ -604,8 +641,20 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		proxyURL = ""
 	}
 
+	// 测出口要挑与该出口兼容的账号，杜绝「点测试把 TR Cookie 从 JP 代理发出」：
+	//   - 测直连（proxy_id=0/-1）：优先锁直连的号，其次未绑定的号，
+	//     绝不挑绑着代理的号（它的 Cookie 从本机 IP 出去就是串出口）；
+	//   - 测某代理：优先绑它的号，其次未绑定的号，绝不挑锁定直连的号。
+	// 自动模式照旧（出口跟着第一个启用代理/直连走）。
+	var probeAcct *CookieAccount
+	if directExplicit {
+		probeAcct = compatibleProbeAccount(0)
+	} else if proxyID > 0 {
+		probeAcct = compatibleProbeAccount(proxyID)
+	}
+
 	t0 := time.Now()
-	res := probeGemini(prompt, proxyURL)
+	res := probeGeminiWithAccount(prompt, proxyURL, probeAcct)
 	res.TotalMs = time.Since(t0).Milliseconds()
 	res.ProxyID = proxyID
 	res.ProxyName = proxyName

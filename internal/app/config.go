@@ -42,6 +42,13 @@ type Config struct {
 	GeminiBLAuto bool `json:"gemini_bl_auto"`
 	// 单次请求 prompt 的 UTF-8 字节上限，0 = 不限。
 	MaxPromptBytes int `json:"max_prompt_bytes"`
+	// 历史转附件时的附件字节上限：实测模型能读到的附件总量约 16 万字节，
+	// 默认 150000 留余量。0 = 不限。超限时按 ContextOverflowMode 处理。
+	MaxContextFileBytes int `json:"max_context_file_bytes"`
+	// 附件超限怎么办："error"（默认）= 直接 400 context_length_exceeded；
+	// "compact" = 在结构化 messages[] 层裁剪最早的原子消息组后重试附件；
+	// "" 等同 "error"。只在显式 opt-in 时才裁——静默丢历史是大忌。
+	ContextOverflowMode string `json:"context_overflow_mode"`
 	// 是否走 Gemini 原生 conversation_id 服务端多轮。默认 false，见 conversation.go。
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
@@ -141,6 +148,8 @@ func defaultConfig() Config {
 		// 实测上游的墙在约 13 万 UTF-8 字节：129,950 字节中英文各 3/3 过，
 		// 135,990 字节各 1/3，141,920 字节各 1/3。取 128000 留一点余量。
 		MaxPromptBytes:         128000,
+		MaxContextFileBytes:    150000,
+		ContextOverflowMode:    "error",
 		MultiTurn:              false,
 		AutoDeleteConversation: true,
 		AnonFirst:              false,

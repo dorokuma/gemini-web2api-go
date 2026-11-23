@@ -446,6 +446,15 @@ func joinComma(parts []string) string {
 	return out
 }
 
+// proxyDisplayName 是「绑定出口」展示名：-1 = 本机直连（锁定），0 = 未绑定，
+// >0 = 代理名（取不到回空串）。
+func proxyDisplayName(id int64) string {
+	if id == proxyIDDirect {
+		return "本机直连（锁定）"
+	}
+	return proxyNameByID(id)
+}
+
 // proxyNameByID 按 id 找代理名，找不到返回空串（0 = 还没绑 / 直连）。
 func proxyNameByID(id int64) string {
 	if id <= 0 {
@@ -530,6 +539,15 @@ func proxyEnabledByID(id int64) bool {
 		}
 	}
 	return false
+}
+
+// hasProxyPool 报告代理池是否配置了任何代理（不看 enabled/熔断）。
+// 「池非空 = 配了池」是所有「绝不直连」判定的共用口径（acquireSlot /
+// syncBridgeUpstream / allSlotUsage / acquireClaimedSlot 的 -1 快照纠偏）。
+func hasProxyPool() bool {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	return len(proxyCache) > 0
 }
 
 // proxyUsableByID 这个出口现在还能不能用（存在 + enabled + 没熔断或已过冷却）。

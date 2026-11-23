@@ -68,7 +68,7 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 		"has_1psidts":  nameSet["__Secure-1PSIDTS"],
 		"has_osid":     nameSet["OSID"],
 		"proxy_id":     a.ProxyID,
-		"proxy_name":   proxyNameByID(a.ProxyID),
+		"proxy_name":   proxyDisplayName(a.ProxyID),
 		"authuser":     a.AuthUser,
 	}
 }
@@ -105,9 +105,11 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("账号序号要在 0..%d 之间", maxAuthUser)})
 			return
 		}
-		// ProxyID 手动指定绑定的出口（#80）：>0 必须指向存在的代理，不存在直接 400——
-		// 必须在 accountAdd 之前拦，否则 400 出去了库里却留下一条没绑定的号。
-		if p.ProxyID != nil && (*p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
+		// ProxyID 手动指定绑定的出口（#80）：-1 = 锁定本机直连，>0 必须指向
+		// 存在的代理，其它负值/不存在的代理直接 400——必须在 accountAdd 之前拦，
+		// 否则 400 出去了库里却留下一条没绑定的号。
+		if p.ProxyID != nil && (*p.ProxyID < proxyIDDirect ||
+			(*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
 			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
 			return
 		}
@@ -230,7 +232,8 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		// 先全部校验再统一落库：任何一个字段非法都 400 零副作用——以前
 		// bindAccountProxy 抢在 authuser/status 校验前写库，带合法 proxy_id +
 		// 非法 authuser 的请求 400 了却已经改掉绑定。
-		if p.ProxyID != nil && (*p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
+		if p.ProxyID != nil && (*p.ProxyID < proxyIDDirect ||
+			(*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
 			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
 			return
 		}

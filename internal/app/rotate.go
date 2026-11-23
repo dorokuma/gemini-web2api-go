@@ -60,10 +60,53 @@ var rotateInitRe = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[
 
 // rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
 // 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
+// rotateProxyURL 为保活决定出口（fail-closed，绝不退回静默直连泄漏 JP/US Cookie）：
+//   - a.ProxyID == proxyIDDirect（-1 锁定直连）：允许 proxyURL="" 直连；
+//   - a.ProxyID > 0：必须查到存在且 Enabled 的代理 URL，代理被删/禁用直接
+//     报错跳过本轮保活（Cookie 绝不从本机 IP 发出）；
+//   - a.ProxyID == 0（未绑定）：代理池非空且 fallback_direct 关着时挑一个
+//     可用启用代理，挑不到同样 fail-closed 跳过。
+func rotateProxyURL(a CookieAccount) (string, error) {
+	switch {
+	case a.ProxyID == proxyIDDirect:
+		return "", nil
+	case a.ProxyID > 0:
+		if !proxyEnabledByID(a.ProxyID) {
+			return "", fmt.Errorf("账号 #%d 绑定的出口 #%d 已删除或禁用，跳过保活（fail-closed 不直连）",
+				a.ID, a.ProxyID)
+		}
+		return proxyURLByID(a.ProxyID), nil
+	default:
+		if hasProxyPool() && !rtCfg().FallbackDirect {
+			url := firstUsableProxyURL()
+			if url == "" {
+				return "", fmt.Errorf("账号 #%d 未绑出口且代理池无可用出口，跳过保活（fail-closed 不直连）", a.ID)
+			}
+			return url, nil
+		}
+		return "", nil
+	}
+}
+
+// firstUsableProxyURL 返回代理池里第一个可用（enabled 且未熔断或已过冷却）的
+// 代理 URL，没有返回空串。未绑定账号的后台保活按池规则借用出口用。
+func firstUsableProxyURL() string {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	now := time.Now().Unix()
+	cooldown := rtCfg().ProxyCooldownMin
+	for _, p := range proxyCache {
+		if proxyUsable(p, now, cooldown) {
+			return p.URL
+		}
+	}
+	return ""
+}
+
 func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
-	proxyURL := ""
-	if a.ProxyID > 0 {
-		proxyURL = proxyURLByID(a.ProxyID)
+	proxyURL, err := rotateProxyURL(a)
+	if err != nil {
+		return 0, nil, err
 	}
 
 	cookie := a.Cookie

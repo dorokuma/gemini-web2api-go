@@ -2,6 +2,71 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 6.5.0 - 2026-11-23
+
+### 新增
+
+- **账号级「锁定本机直连」出口（`proxy_id = -1`）**：账号绑定表新增哨兵
+  `proxyIDDirect = -1`（`-1` = 锁定本机直连槽 `slots[0]`，`0` = 未绑定自动，
+  `>0` = 绑定指定代理），锁定直连的账号永远只走本机直连槽、绝不进代理池、
+  也绝不因 `fallback_direct` / `strict_proxy_binding` 语义被改判——满时报
+  `Bound=true` 的 `RateLimitError` 让外层换号而不换出口。全链路封堵 7 处
+  泄漏/覆写点：`acquireSlot`/`acquireClaimedSlot`/`claimAccountProxy`/
+  `currentBoundEnabledProxy` 对 `-1` 原样透传绝不覆写，库中锁定直连的号
+  即便 prefer 误传代理 ID 也会先改判再取直连槽；XSRF 换号循环双向隔离
+  （锁定直连号绝不借代理槽，代理池非空且 `fallback_direct` 关时其它号
+  绝不借直连槽泄漏本机 IP）；后台保活 `rotateAccount` fail-closed（绑定
+  代理被删/禁用时跳过本轮绝不静默直连，未绑定号在池非空且关 fallback 时
+  挑不到可用代理同样跳过）；`viaSlot`/多轮 `conversation` 写绑守卫不覆写
+  `-1`；浏览器冷启动先开 `about:blank` → 读持久 Jar 匹配启用账号 → 按
+  绑定出口 `SetUpstream`（`-1` 显式 `("", true)`，`>0` 启用代理
+  `(url, false)`）→ 再导航 `/app`，不匹配或绑定失效先在 `about:blank`
+  清空 Jar；`syncBridgeUpstream`/`acquireBridgeExit`/`recreateTab` 改收
+  显式 `allowDirect`（仅 `-1 || 池空 || fallback_direct` 为 true），出口
+  身份含 allowDirect 参与并发分组；`bl.go` 匿名刷新在存在代理池或常驻
+  号已绑特定出口时走纯 Go HTTP；Admin 连通性测试只挑与目标出口兼容的
+  账号（测直连不挑代理号、测代理不挑锁定直连号）；`POST/PATCH
+  /admin/api/cookies` 放行 `proxy_id=-1` 并返回清晰出口名，面板「绑定出口」
+  下拉在代理池为空时也始终显示（含 `0 自动`、`-1 本机直连（锁定）`）；
+  `allSlotUsage` 在有启用账号绑定 `-1` 时保留直连槽指标。
+- **`max_context_file_bytes`（默认 150000）+ `context_overflow_mode`**：
+  附件路径自身的总量墙——history 超过 `max_context_file_bytes` 时默认
+  `error` 模式 fail-closed 返回 `400 context_length_exceeded`（不再传上去
+  让模型静默读不到尾段）；显式 `compact` 模式在结构化 `messages[]` 层裁剪：
+  带 `tool_calls` 的 assistant 与其紧随的全部 `tool` 消息绑成不可拆分
+  原子组，先对中间组单条 `>12KB` 的 tool 输出按 UTF-8 rune 安全边界
+  头尾截断（头 4KB + 尾 4KB + 省略提示），仍超再从最旧中间组整组移除
+  并插入 `[System note: omitted N earlier messages (X UTF-8 bytes) ...]`
+  说明（自身计入预算），必保集合（全部 system、首条 user 任务消息
+  ≤25% 预算、最后一组交互、`pc.Head`/`pc.Tail` 工具协议）仍超则
+  fail-closed 400。管理面板 `RT_GROUPS` 与中英文案同步收录。
+- **同号重试指数退避 + 抖动（`retryBackoffDelay`）**：空内容帧
+  （`reasonNoContentFrame`）与出错话术（`errUpstreamFailureReply`）两类
+  瞬时拒绝按 `retry_delay_sec × 2^attempt` 指数退避、乘 `[0.8,1.2]` 随机
+  抖动、封顶 15s——同号重发太密只会再撞同样的拒绝；其它错误维持固定
+  间隔；`baseSec <= 0` 恒返回 0。
+
+### 修复
+
+- **Argon 空帧/出错话术归类**：`streamGenerateOnce` 与 `streamGenerateConv`
+  对 `200 + errArgonIdentityMissing` 统一过 `argonMissingReclassify`——
+  响应含出错话术改判 `errUpstreamFailureReply`（走话术重试不扣代理分），
+  无内容帧且无思考链且非视频受理置 nil 落入空帧分支，有正文帧但无合法
+  Argon/Neon 身份仍保留哨兵拒绝未验证模型；无内容帧分支统一包
+  `diagErr{reason: reasonNoContentFrame}`。
+- **失败路径指标回填**：`streamGenerateOnce`/`streamGenerateConv` 循环内
+  所有失败返回（耗尽、身份拒绝、取消、降级早退）统一回填
+  `TTFBMs`/`TotalMs`/`Diag`/`UpstreamModel`/`Emitted`/`EmittedReasoning`
+  ——降级用 `mde.Reported`，其余 `lastDiag.Model`，不再丢诊断现场。
+- **`/v1/responses` 流式吞 400**：`handleResponses` 在 `WriteHeader(200)`
+  之前做无副作用确定性超长预检（非 MultiTurn：无启用 cookie 且 prompt 超
+  `MaxPromptBytes`，或 `error` 模式下规划后 `inline` 超 `MaxPromptBytes` /
+  `history` 超 `MaxContextFileBytes`），命中直接回 `HTTP 400` +
+  `code: context_length_exceeded`；流式 `response.failed` 事件补齐错误
+  分类（`PromptTooLongError` → `invalid_request_error` /
+  `context_length_exceeded`，`RateLimitError` → `rate_limit_exceeded` /
+  `ip_slot_full`）。
+
 ## 6.4.0 - 2026-11-23
 
 ### 新增

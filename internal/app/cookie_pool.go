@@ -658,6 +658,8 @@ var claimMu sync.Mutex
 //   - 已绑定且绑定出口仍然存在且 enabled：返回绑定值，不覆写——熔断冷却中的绑定
 //     照样算数（冷却会过），绝不能因为暂时不可用就覆写（否则并发请求会把一个
 //     还在冷却的号的绑定抢改成自己的出口）；
+//   - 绑定为 proxyIDDirect（锁定本机直连）：原样返回 proxyIDDirect，严禁覆写——
+//     这是显式的「绝不走代理」承诺，仲裁也不能把它改成别的出口；
 //   - 未绑定 / 绑定已失效（删除或禁用）：把 candidateProxyID 写库并返回它（本次请求胜出）。
 //
 // 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
@@ -668,6 +670,9 @@ func claimAccountProxy(accountID, candidateProxyID int64) int64 {
 	cur := int64(0)
 	if a := accountByID(accountID); a != nil {
 		cur = a.ProxyID
+	}
+	if cur == proxyIDDirect {
+		return proxyIDDirect // 锁定直连：任何候选出口都不得覆写
 	}
 	if cur > 0 && proxyEnabledByID(cur) {
 		return cur

@@ -289,7 +289,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	// 胜者的场景。匿名会话（accountID==0）不写：它没有账号行可绑。
 	// 严格模式下绝不锁外写库：绑定仲裁已在 acquireClaimedSlot 的 claimMu 里完成，
 	// 这里再写会覆盖管理员并发改绑（R3-S2）；内存快照 conv.proxyID 仍就地同步。
-	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID {
+	// conv.proxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
+	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID && conv.proxyID != proxyIDDirect {
 		if !rtCfg().StrictProxyBinding {
 			bindAccountProxy(conv.accountID, p.ID)
 		}
@@ -300,8 +301,14 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 
 	// 首轮定出口；续接沿用会话原出口（acquireSlot 已优先，但拿不到原出口时只能换，
 	// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
+	// 账号锁定 proxyIDDirect 时不许用 p.ID（0=未绑语义的直连槽值）覆写绑定记忆——
+	// -1 是「永不走代理」的显式承诺，落了 0 下一轮就丢了这个承诺。
 	if conv.turn == 0 {
-		conv.proxyID = p.ID
+		if conv.isLogin && conv.accountID > 0 && prefer == proxyIDDirect {
+			conv.proxyID = proxyIDDirect
+		} else {
+			conv.proxyID = p.ID
+		}
 		conv.proxyURL = proxyURL
 		// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
 		if conv.cookie == "" && !conv.isLogin {
@@ -426,20 +433,41 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	t0 := time.Now()
 	var lastErr error
 	var lastDiag upstreamDiagMeta
+	var lastTTFB int64
+	// failRes 是「循环启动后」各失败返回路径的统一回填：真实计时
+	//（TTFBMs/TotalMs）、结构化现场（Diag/UpstreamModel）与已发增量。
+	failRes := func() *StreamResult {
+		return &StreamResult{
+			ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
+			Diag: lastDiag, UpstreamModel: lastDiag.Model,
+			TTFBMs: lastTTFB, TotalMs: time.Since(t0).Milliseconds(),
+			Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted,
+		}
+	}
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
 		if cerr := ctx.Err(); cerr != nil {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, cerr
+			return failRes(), cerr
 		}
 		// 同 streamGenerateOnce：每轮先清上一轮现场，防帧数污染最后一轮。
 		lastDiag = upstreamDiagMeta{}
+		lastTTFB = 0
 		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil, mc.TaskMode)
 		if len(raw) > 0 {
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
+		}
+		if ttfb > 0 {
+			lastTTFB = ttfb
 		}
 		if len(setCookie) > 0 && conv.cookie != "" {
 			if merged := mergeSetCookieForHost(conv.cookie, setCookie, endpoint, geminiCookieTargetHost); merged != conv.cookie {
 				conv.cookie = merged
 			}
+		}
+		// Argon 身份缺失修正归类（同 streamGenerateOnce）：出错话术 →
+		// errUpstreamFailureReply；真·空帧 → nil 落无内容帧分支；
+		// 有正文/思考但无合法身份 → 原样拒绝未验证模型。
+		if statusCode == 200 {
+			err = argonMissingReclassify(err, string(raw), mc.Tool)
 		}
 		var aie *argonIdentityError
 		if strictCheck != nil && errors.As(err, &aie) && modelDowngraded(mc, aie.name) {
@@ -448,13 +476,13 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		// 降级：同一个号重试还是降级，直接交给上层（见 gemini.go 同一处）。
 		var mde *ModelDowngradedError
 		if errors.As(err, &mde) {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
-				UpstreamModel: mde.Reported, TotalMs: time.Since(t0).Milliseconds(),
-				Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted}, err
+			res := failRes()
+			res.UpstreamModel = mde.Reported
+			return res, err
 		}
 		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
 			if cerr := ctx.Err(); cerr != nil {
-				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, cerr
+				return failRes(), cerr
 			}
 			if err == nil && statusCode == 200 {
 				// 无帧在 conversation.go:412 用中文报错（续接作废提示），错误串里
@@ -485,8 +513,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 				if errors.Is(err, errUpstreamFailureReply) {
 					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
 				}
-				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
-					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, werr
+				if werr := sleepCtx(ctx, retryBackoffDelay(rtCfg().RetryDelaySec, attempt, lastErr)); werr != nil {
+					return failRes(), werr
 				}
 			}
 			continue
@@ -499,8 +527,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
-				if werr := sleepCtx(ctx, time.Duration(rtCfg().RetryDelaySec)*time.Second); werr != nil {
-					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID, Diag: lastDiag}, werr
+				if werr := sleepCtx(ctx, retryBackoffDelay(rtCfg().RetryDelaySec, attempt, lastErr)); werr != nil {
+					return failRes(), werr
 				}
 			}
 			continue
@@ -534,8 +562,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			TotalMs:          time.Since(t0).Milliseconds(),
 		}, nil
 	}
-	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
-		Diag: lastDiag, UpstreamModel: lastDiag.Model}, lastErr
+	return failRes(), lastErr
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
@@ -581,7 +608,8 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
 			fresh = true
 			conv = nil
-		case rtCfg().StrictProxyBinding && a.ProxyID > 0 && a.ProxyID != conv.proxyID:
+		case rtCfg().StrictProxyBinding && a.ProxyID != conv.proxyID &&
+			(a.ProxyID > 0 || a.ProxyID == proxyIDDirect || conv.proxyID == proxyIDDirect):
 			// 账号绑定出口变了（管理员改绑、或并发首绑仲裁后落库）：新绑定的出口
 			// 才是这个号的合法出口，会话记忆里那个旧出口（含直连 0）绝不能再外发
 			//（严格绑定的核心承诺）。强制冷启动，不能带着旧出口的会话记忆续接。

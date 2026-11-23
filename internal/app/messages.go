@@ -713,5 +713,8 @@ func (e *PromptTooLongError) Error() string {
 			"with one configured, oversized conversations are uploaded as a text " +
 			"attachment instead and this limit largely goes away."
 	}
-	return base + " Shorten the conversation, the system prompt, or the tool definitions."
+	return base + " The conversation history is too large even for the text-attachment " +
+		"path (max_context_file_bytes). Shorten the conversation, the system prompt, " +
+		"or the tool definitions — or set context_overflow_mode=compact to let the " +
+		"server drop the oldest message groups before building the attachment."
 }

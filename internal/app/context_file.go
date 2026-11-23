@@ -90,6 +90,16 @@ func prepareContextFile(ctx context.Context, prompt string, pc promptCtx, budget
 		return prompt, nil, false, nil // 匿名：引用会被回 1100，转了也没用
 	}
 	history, inline := planContextFile(prompt, pc, budget)
+	// 附件自身也有总量墙（约 16 万字节见文件头）：history 超过
+	// max_context_file_bytes 时传上去模型照样读不到尾段，等于把「内联
+	// 静默截断」换成「附件静默截断」。默认 error 模式直接 fail-closed
+	// 报 context_length_exceeded，让客户端自己压缩上下文；
+	// compact 模式已在 messages[] 层裁剪到预算内才走到这里。
+	maxFile := rtCfg().MaxContextFileBytes
+	if maxFile > 0 && len(history) > maxFile {
+		return prompt, nil, false, &PromptTooLongError{
+			Bytes: len(history), Budget: maxFile, HasCookie: true}
+	}
 	ref, err := uploadBytesCtx(ctx, cookie, authuser, proxyURL, []byte(history), contextFileName)
 	if err != nil {
 		return prompt, nil, false, fmt.Errorf("超长对话转附件失败: %w", err)
