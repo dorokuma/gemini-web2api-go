@@ -380,6 +380,11 @@ type StreamResult struct {
 	// 不往 StreamResult 留原文（含内部 token，不能进 502 body 或 requests 表）。
 	// 成功路径不填：Raw 本身已完整带回给正常消费者。
 	Diag upstreamDiagMeta
+	// UpstreamTouched 为 true 表示本轮已经把请求发往上游（调用过
+	// doGeminiRequestStopMode）；false = 本地就失败了（挑号、限流、取 XSRF、
+	// ctx 取消）。多轮续接靠它判断被 convTake 消费的会话 head 能否安全归还：
+	// 没碰上游，那轮就没发生，head 没被推进、仍然有效。
+	UpstreamTouched bool
 }
 
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
@@ -604,11 +609,15 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	var cookieID int64
 	var cookieLabel string
 	var lastDiag upstreamDiagMeta
+	// upstreamTouched 一旦置位就闭合：表示本轮已经把请求发往上游。
+	// 闭包捕获，attrib 把当时的值带回给调用方（多轮续接靠它判断 head 可否归还）。
+	upstreamTouched := false
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
 			ProxyID: picked.ID, ProxyName: picked.Name,
 			Diag: lastDiag, UpstreamModel: lastDiag.Model,
+			UpstreamTouched: upstreamTouched,
 		}, err
 	}
 
@@ -621,6 +630,15 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		busy := map[int64]bool{}
 		for id := range skip {
 			busy[id] = true
+		}
+		// M1 驻留号跳过了 pickAccountForModel，skip 里没有 strict_model 的冷却
+		// 集合——Bound 内层换号走 pickCookieAccountExcept 会把正在冷却的号挑出来，
+		// 必须并入 busy，否则 Bound 换号绕过了 strict_model 守卫。
+		if rtCfg().StrictModel {
+			cooling, _ := coolingAccounts(mc)
+			for id := range cooling {
+				busy[id] = true
+			}
 		}
 		for !slotOK && errors.As(slotErr, &bindErr) && bindErr.Bound {
 			busy[acct.ID] = true
@@ -643,7 +661,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		return attrib(slotErr)
 	}
 	picked = p
-	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
+	// 闭包读取 picked 的终值：claimAccountProxy 仲裁败方会释放手上的 slot
+	// 改占胜者那侧，picked 在函数中途可能被换掉。
+	defer func() { releaseSlot(picked.ID) }() // picked.ID=0 表示直连 slot
 
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
@@ -668,6 +688,19 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+		// strict_proxy_binding 首次绑定仲裁必须在任何出站请求之前：两个并发请求
+		// 同时拿到同一未绑定账号时各自挑了出口，claimAccountProxy 只允许一个胜出——
+		// 败方释放手上的 slot、改占胜者那一侧，同一账号绝不从两个 IP 外发。
+		if rtCfg().StrictProxyBinding && picked.ID > 0 && picked.ID != acct.ProxyID {
+			if winner := claimAccountProxy(acct.ID, picked.ID); winner != picked.ID {
+				releaseSlot(picked.ID)
+				p2, ok2, err2 := acquireSlot(winner)
+				if !ok2 {
+					return attrib(err2)
+				}
+				picked, pickedOK, proxyURL = p2, p2.ID > 0, p2.URL
+			}
+		}
 		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
@@ -997,6 +1030,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(ctx, wcReq, proxyURL, lh.cb, &lh.stop)
 		} else {
 			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop, mc.TaskMode)
+			upstreamTouched = true
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookieForHost(cookieStr, setCookie, reqEndpoint, geminiCookieTargetHost); merged != cookieStr {
@@ -1155,6 +1189,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			AccountLabel:     cookieLabel,
 			TTFBMs:           ttfb,
 			TotalMs:          time.Since(t0).Milliseconds(),
+			UpstreamTouched:  upstreamTouched,
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。

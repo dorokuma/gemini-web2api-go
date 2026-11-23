@@ -86,3 +86,31 @@ func TestSummarizeQuota(t *testing.T) {
 		t.Fatalf("recovered: %+v", q)
 	}
 }
+
+// R1 修复 4 回归：viaSlot 在挑到的出口跟账号记的不一样时持久化 bindAccountProxy
+// 并同步 acct.ProxyID——同一次额度查询的后续 RPC 沿用新出口，不跨 IP 漂移。
+func TestViaSlotPersistsRebind(t *testing.T) {
+	_, b := withTwoProxies(t, true) // A 被 withTwoProxies 占满
+	acct := addTestAccount(t, "viaslot")
+	// 未绑定的账号（ProxyID=0）：acquireSlot(0) 轮询到 B（A 满）。应写库 B。
+	var used string
+	ca := CookieAccount{ID: acct}
+	if err := viaSlot(&ca, func(url string) error { used = url; return nil }); err != nil {
+		t.Fatalf("viaSlot 应拿到空闲出口：%v", err)
+	}
+	if ca.ProxyID != b || used == "" {
+		t.Fatalf("首次绑定应就地同步 ProxyID=%d，得到 %d", b, ca.ProxyID)
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != b {
+		t.Fatalf("首次绑定必须落库：%+v", acc)
+	}
+
+	// 已绑 B 再调：绑定有效就不重写（B 仍空闲，acquireSlot(B) 命中 B）。
+	ca2 := CookieAccount{ID: acct, ProxyID: b}
+	if err := viaSlot(&ca2, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ca2.ProxyID != b {
+		t.Fatalf("绑定出口可用时不该换：%d", ca2.ProxyID)
+	}
+}

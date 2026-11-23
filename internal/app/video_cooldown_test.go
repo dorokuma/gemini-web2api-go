@@ -152,3 +152,58 @@ func TestVideoJobMovesPastASignedOutAccount(t *testing.T) {
 		t.Fatal("a signed-out account is not out of video quota and must not be put in the cooldown")
 	}
 }
+
+// R1 修复 6 回归：新建视频任务遇 Bound 429（绑定出口不可用）切到下一个账号，
+// 不记视频额度冷却、不把 Bound 错当配额耗尽；全池 Bound 时保留 Bound 错返回。
+func TestCallOnVideoAccountSwitchesOnBound(t *testing.T) {
+	var tried []int64
+	boundAcct := int64(0)
+	ids := withVideoAccounts(t, 3, func(mc ModelConfig) (*StreamResult, error) {
+		tried = append(tried, mc.PinAccountID)
+		if boundAcct == 0 {
+			boundAcct = mc.PinAccountID
+		}
+		if mc.PinAccountID == boundAcct {
+			return &StreamResult{AccountID: mc.PinAccountID},
+				&RateLimitError{Reason: "concurrent", ProxyID: 99901001, Bound: true}
+		}
+		return &StreamResult{AccountID: mc.PinAccountID, Artifacts: []MediaArtifact{{Data: []byte("mp4"), Mime: "video/mp4"}}}, nil
+	})
+	j := newTestJob()
+	runVideoJob(j, nil)
+	if j.Status != "completed" || len(tried) != 2 || tried[1] == boundAcct || j.accountID != tried[1] {
+		t.Fatalf("Bound 受阻应换到下一个账号：status=%s err=%q tried=%v", j.Status, j.Error, tried)
+	}
+	if videoCoolingAccounts()[boundAcct] {
+		t.Fatalf("Bound 不是额度耗尽，账号 #%d 绝不能进视频冷却", boundAcct)
+	}
+
+	// 全池 Bound：每个号都撞 Bound → 任务失败，错误仍是 Bound 429 的形状，
+	// 而不是谎报「无可用账号」。
+	tried = nil
+	boundAcct = 0
+	boundAll := map[int64]bool{}
+	for _, id := range ids {
+		boundAll[id] = true
+	}
+	prevCall := videoCall
+	videoCall = func(_ context.Context, _ string, _ promptCtx, mc ModelConfig, _ []map[string]interface{}, _ []pendingUpload, _, _ func(string)) (string, []ToolCall, *StreamResult, error) {
+		tried = append(tried, mc.PinAccountID)
+		return "", nil, &StreamResult{AccountID: mc.PinAccountID},
+			&RateLimitError{Reason: "concurrent", ProxyID: 99901001, Bound: true}
+	}
+	defer func() { videoCall = prevCall }()
+	j2 := newTestJob()
+	runVideoJob(j2, nil)
+	if j2.Status != "failed" || !strings.Contains(j2.Error, "strict_proxy_binding") {
+		t.Fatalf("全池 Bound 应报 Bound 错（保留 429 语义），得到 status=%s err=%q", j2.Status, j2.Error)
+	}
+	if len(tried) != len(ids) {
+		t.Fatalf("每个账号都该被试一次再放弃：tried=%v", tried)
+	}
+	for _, id := range ids {
+		if videoCoolingAccounts()[id] {
+			t.Fatalf("Bound 换号不该记视频冷却：#%d", id)
+		}
+	}
+}

@@ -227,11 +227,22 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "bad json"})
 			return
 		}
+		// 先全部校验再统一落库：任何一个字段非法都 400 零副作用——以前
+		// bindAccountProxy 抢在 authuser/status 校验前写库，带合法 proxy_id +
+		// 非法 authuser 的请求 400 了却已经改掉绑定。
+		if p.ProxyID != nil && (*p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
+			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
+			return
+		}
+		if p.AuthUser != nil && (*p.AuthUser < 0 || *p.AuthUser > maxAuthUser) {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("账号序号要在 0..%d 之间", maxAuthUser)})
+			return
+		}
+		if p.Status != nil && *p.Status != "enabled" && *p.Status != "disabled" {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("非法状态 %q", *p.Status)})
+			return
+		}
 		if p.ProxyID != nil {
-			if *p.ProxyID < 0 || (*p.ProxyID > 0 && !proxyExists(*p.ProxyID)) {
-				writeJSON(w, 400, map[string]string{"error": "proxy not found"})
-				return
-			}
 			bindAccountProxy(id, *p.ProxyID)
 		}
 		if p.AuthUser != nil {

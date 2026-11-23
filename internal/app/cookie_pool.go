@@ -626,6 +626,32 @@ func bindAccountProxy(accountID, proxyID int64) {
 	_, _ = getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`, proxyID, accountID)
 }
 
+// claimMu 把「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作。
+// 不加锁时两个并发请求同时拿到同一未绑定账号、各自 acquireSlot 选了不同出口，
+// 发完 getXSRF 才先后写 bindAccountProxy——后写覆盖先写，这个号已经从两个 IP
+// 外发过（strict_proxy_binding 想防的正是这个）。进程内一把锁就够（同 pickMu）。
+var claimMu sync.Mutex
+
+// claimAccountProxy 原子决定这个账号本次该走哪个出口（strict_proxy_binding 首绑仲裁）。
+//   - 已绑定且绑定出口仍然有效（存在 + enabled + 没熔断）：返回绑定值，不覆写；
+//   - 未绑定 / 绑定已失效：把 candidateProxyID 写库并返回它（本次请求胜出）。
+//
+// 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
+// 必须释放手上的 slot、按返回值重新 acquireSlot——胜者是别的并发请求绑的。
+func claimAccountProxy(accountID, candidateProxyID int64) int64 {
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	cur := int64(0)
+	if a := accountByID(accountID); a != nil {
+		cur = a.ProxyID
+	}
+	if cur > 0 && proxyUsableByID(cur) {
+		return cur
+	}
+	bindAccountProxy(accountID, candidateProxyID)
+	return candidateProxyID
+}
+
 // accountDisplayName 面板/记录里显示的账号名，没填标签就用 #id。
 func accountDisplayName(a *CookieAccount) string {
 	if a.Label != "" {
