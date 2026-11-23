@@ -296,8 +296,9 @@ func TestApplyCompactIfNeededRealBytesWithinBudget(t *testing.T) {
 	}
 }
 
-// 必保集合不挪位：首条 user 超 25% 也要留在原位（不把它挪到 system 后面当
-// 「最后 user」），中间 system 的顺序也不乱。
+// 必保集合不挪位、不顶替：超长首条 user（>25% 预算）装得下时原位保留、装不下
+// 时可整组淘汰；后续短 user 绝不会被倒序提前顶替「首条 user」位；中间 system
+// 原地保留不前置。
 func TestCompactMessagesPinnedNoReorder(t *testing.T) {
 	withContextCfg(t, 3000, "compact")
 	msgs := []map[string]interface{}{
@@ -317,13 +318,41 @@ func TestCompactMessagesPinnedNoReorder(t *testing.T) {
 	if getStr(out[0], "role") != "system" || contentToString(out[0]["content"]) != "S1" {
 		t.Fatalf("首条 system 被挪位：%v", out[0])
 	}
-	// 长首条 user 仍紧跟 S1（原位 pinned，不挪到尾部）
+	// 超长首条 user 装得下 → 原位保留（不挪到尾部、不被 mid-q 顶替）
 	if getStr(out[1], "role") != "user" || !strings.Contains(contentToString(out[1]["content"]), "首") {
 		t.Fatalf("超长首条 user 应原位保留：%v", out[1])
 	}
 	// 最后一条仍是 tail
 	if contentToString(out[len(out)-1]["content"]) != "tail" {
 		t.Fatalf("最后一组被挪位：%v", out[len(out)-1])
+	}
+	// mid-q 若幸存，绝不能出现在首条 user 之前（不顶替首 user 位）
+	for i, m := range out {
+		if contentToString(m["content"]) == "mid-q" && i < 1 {
+			t.Fatalf("后续短 user 被倒序提前：%v", out)
+		}
+	}
+}
+
+// 超长首条 user（>25% 预算）装不下时允许整组淘汰，而非假 400。
+func TestCompactMessagesOversizedFirstUserDroppable(t *testing.T) {
+	withContextCfg(t, 2000, "compact")
+	msgs := []map[string]interface{}{
+		{"role": "system", "content": "S1"},
+		{"role": "user", "content": strings.Repeat("首", 4000)}, // 远超预算
+		{"role": "user", "content": "tail"},
+	}
+	out, err := compactMessages(msgs, 2000, 0)
+	if err != nil {
+		t.Fatalf("首条 user 超预算应可淘汰而非报错: %v", err)
+	}
+	for _, m := range out {
+		if strings.Contains(contentToString(m["content"]), "首首首") {
+			t.Fatalf("装不下的超长首条 user 应被淘汰：%v", out)
+		}
+	}
+	if contentToString(out[len(out)-1]["content"]) != "tail" {
+		t.Fatalf("最后一组必须保留：%v", out[len(out)-1])
 	}
 }
 
@@ -421,5 +450,110 @@ func TestArgonMissingReclassify(t *testing.T) {
 	other := errors.New("other")
 	if got := argonMissingReclassify(other, raw2, 0); got != other {
 		t.Fatalf("其它错误应原样透传，得到 %v", got)
+	}
+}
+
+// R2-M4 回归：工具协议 Head+Tail 自身 > MaxPromptBytes 时 planContextFile 放弃
+// 剥离（协议留在 history），inlineOverhead 必须按 len(history)-len(h) 计入——
+// 裁剪后重建的 prompt 必须真 ≤maxFile，且不能把必保项挤死后报假 400。
+func TestApplyCompactIfNeededBigToolProtocolOverhead(t *testing.T) {
+	// 让 maxFile 介于「剥掉协议的 history」与「带协议的整段 prompt」之间：
+	// 协议若被错误地按 inlineOverhead=0 放进来，终检会把必保项也挤爆报假 400。
+	withContextCfgBudget(t, 12000, "compact", 2000)
+	ck := addTestAccount(t, "bigProtoCookie")
+	defer func() { _ = accountDelete(ck) }()
+	head := strings.Repeat("H", 4000) // Head+Tail > MaxPromptBytes → 协议留 history
+	tail := strings.Repeat("T", 4000)
+	msgs := []map[string]interface{}{
+		{"role": "system", "content": "sys"},
+		{"role": "user", "content": "最初任务"},
+	}
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs,
+			map[string]interface{}{"role": "user", "content": strings.Repeat("问", 250)},
+			map[string]interface{}{"role": "assistant", "content": strings.Repeat("答", 250)},
+		)
+	}
+	msgs = append(msgs, map[string]interface{}{"role": "user", "content": "最后"})
+	pc := promptCtx{Latest: "最后", Head: head, Tail: tail}
+	prompt := joinPromptParts(head, buildPrompt(msgs, nil, nil, false), tail)
+	// 前提：剥掉协议的 history 本身装得下 maxFile-overhead（有东西可留），
+	// 而带协议的整段超 maxFile 触发裁剪。
+	hist, _ := stripToolProtocol(prompt, pc)
+	if len(hist) <= 12000-len(head)-len(tail) || len(prompt) <= 12000 {
+		t.Fatalf("场景前提不成立：prompt=%d hist=%d", len(prompt), len(hist))
+	}
+	out, done, err := applyCompactIfNeeded(msgs, prompt, pc)
+	if err != nil {
+		t.Fatalf("协议留 history 时裁完应可放行，得到 err=%v", err)
+	}
+	if !done {
+		t.Fatal("history（含协议）超 maxFile 未触发裁剪")
+	}
+	// 裁剪结果的渲染历史 + 协议开销必须 ≤ maxFile（overhead 真计入的硬证据）。
+	if n := renderedHistoryBytes(out) + len(head) + len(tail); n > 12000 {
+		t.Fatalf("裁后 history+overhead=%d 仍超 maxFile=12000（协议开销漏计）", n)
+	}
+}
+
+// R2-S3 #2 回归：多模态 tool content 只截 text part，非文本 part（image_url 等）
+// 原样保留；且预算按整条消息全部文本 part 累计——多个 <12KB part 合计超限同样截。
+func TestTruncateMultimodalPartsKeepsNonText(t *testing.T) {
+	img := map[string]interface{}{"type": "image_url", "image_url": "https://x/a.png"}
+	// 两个 7KB 文本 part：单条都 <12KB，合计 14KB 超限。
+	big1 := strings.Repeat("a", 7*1024)
+	big2 := strings.Repeat("b", 7*1024)
+	parts := []interface{}{
+		map[string]interface{}{"type": "text", "text": big1},
+		img,
+		map[string]interface{}{"type": "input_text", "text": big2},
+	}
+	np, changed := truncateMultimodalParts(parts)
+	if !changed {
+		t.Fatal("累计文本超限应截断")
+	}
+	// image part 必须原样保留（同一对象、内容不变）。
+	found := false
+	var texts []string
+	for _, p := range np {
+		pm, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if getStr(pm, "type") == "image_url" {
+			found = true
+			if pm["image_url"] != "https://x/a.png" {
+				t.Fatal("image part 被改动")
+			}
+		}
+		if textPartTypes[getStr(pm, "type")] {
+			texts = append(texts, getStr(pm, "text"))
+		}
+	}
+	if !found {
+		t.Fatal("image part 被丢")
+	}
+	if len(texts) == 0 {
+		t.Fatal("文本 part 全没了")
+	}
+	total := 0
+	for _, s := range texts {
+		total += len(s)
+	}
+	if total >= len(big1)+len(big2) {
+		t.Fatal("累计文本未实际缩减")
+	}
+	// 非文本 part（普通 JSON 数据）也绝不截。
+	data := map[string]interface{}{"type": "json", "v": strings.Repeat("d", 20000)}
+	np2, _ := truncateMultimodalParts([]interface{}{
+		map[string]interface{}{"type": "text", "text": strings.Repeat("x", 20000)}, data})
+	var kept map[string]interface{}
+	for _, p := range np2 {
+		if pm, ok := p.(map[string]interface{}); ok && getStr(pm, "type") == "json" {
+			kept = pm
+		}
+	}
+	if kept == nil || getStr(kept, "v") != getStr(data, "v") {
+		t.Fatal("非文本 JSON part 被改动")
 	}
 }

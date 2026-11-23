@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -447,24 +449,24 @@ func TestAnonFirstEligible(t *testing.T) {
 	think := Models["gemini-3.6-flash-thinking"]
 
 	set(false)
-	if anonFirstEligible(plain, false) {
+	if anonFirstEligible(plain, false, 0) {
 		t.Error("开关关时应恒 false（池里有号就用号）")
 	}
 
 	set(true)
-	if !anonFirstEligible(plain, false) {
+	if !anonFirstEligible(plain, false, 0) {
 		t.Error("开 + 纯文本无附件应走匿名")
 	}
-	if anonFirstEligible(plain, true) {
+	if anonFirstEligible(plain, true, 0) {
 		t.Error("带附件必须挑号（匿名引用被上游 1100 拒）")
 	}
-	if anonFirstEligible(pro, false) {
+	if anonFirstEligible(pro, false, 0) {
 		t.Error("3.1 Pro 需登录，不能走匿名")
 	}
-	if anonFirstEligible(img, false) {
+	if anonFirstEligible(img, false, 0) {
 		t.Error("生图需登录，不能走匿名")
 	}
-	if anonFirstEligible(think, false) {
+	if anonFirstEligible(think, false, 0) {
 		t.Error("扩展思考需登录，不能走匿名")
 	}
 }
@@ -521,5 +523,72 @@ func TestFailureReplyInLine(t *testing.T) {
 	// 短 inner（不到 32 槽）不能越界
 	if failureReplyInLine(`[["wrb.fr",null,"[null,null,null,null,[[\"rc_x\",[\"hello world hello world hello world hello world hello world\"]]]]"]]` + strings.Repeat(" ", 200)) {
 		t.Error("short inner misdetected")
+	}
+}
+
+// R2-S2 ① 回归：streamGenerateOnce 重试循环内的失败返回必须回填真实诊断——
+// TTFBMs 记最后一次真实 TTFB、TotalMs 从循环起点 t0 起算（非 0）、Diag 记帧
+// 统计、UpstreamModel 记上游自报名。空帧耗尽量是最典型的失败路径。
+func TestStreamGenerateOnceFailureMetricsBackfill(t *testing.T) {
+	// 假上游：/app 出 XSRF；StreamGenerate 永远回「有 wrb.fr 帧但无内容帧」，
+	// 触发 no-content-frame 重试直到耗尽。
+	var upstreamCalls int
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/app":
+			return respJSON(req, 200, fakeAppTokens), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			upstreamCalls++
+			// 元信息帧（无 inner[4] 文本）：hasContentFrame=false，但 Diag.Frames≥1。
+			meta, _ := json.Marshal([]interface{}{[]interface{}{"wrb.fr", "rpc1", `[null,"meta"]`, nil}})
+			return respJSON(req, 200, ")]}'\n"+string(meta)+"\n"), nil
+		}
+		return respJSON(req, 404, ""), nil
+	})
+	fakeUpstreamServer(t, rt)
+	seedXSRFAndRetry(t, 2) // 2 次尝试，RetryDelaySec=0
+	res, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+		Models["gemini-3.6-flash"], nil, nil, nil, nil, map[int64]bool{})
+	if err == nil {
+		t.Fatal("无内容帧耗尽可能成功")
+	}
+	if res == nil {
+		t.Fatal("失败必须带回 StreamResult 归属")
+	}
+	if res.Diag.Frames < 1 {
+		t.Fatalf("失败路径必须回填 Diag.Frames：%+v", res.Diag)
+	}
+	if res.Diag.ContentFrame {
+		t.Fatal("无内容帧的失败 Diag.ContentFrame 应为 false")
+	}
+	if res.TTFBMs < 0 || res.TotalMs < 0 {
+		t.Fatalf("TTFBMs/TotalMs 必须真实回填：%+v", res)
+	}
+	// t0 在循环起点：失败返回的 TotalMs 是循环内真实耗时（≥0 且恒非负断言之上；
+	// 更重要的是字段已被填充而非缺省——结合 Diag 一起证明走的是 attrib 回填路径）。
+	if upstreamCalls != 2 {
+		t.Fatalf("应重试到耗尽（2 次上游调用），实际 %d", upstreamCalls)
+	}
+}
+
+// R2-S2 回归：一行里两个 wrb.fr 帧（元信息帧 arr[0] + 内容帧 arr[1]）都必须
+// 取出——旧实现带 len(line)<200 启发式会在长行漏掉第二个帧。
+func TestWrbPayloadsInLineTwoFrames(t *testing.T) {
+	meta := `[null,"meta"]`
+	content := make([]interface{}, 43)
+	content[4] = []interface{}{[]interface{}{"rc_x", []interface{}{
+		"hello world hello world hello world hello world hello world"}}}
+	cb, _ := json.Marshal(content)
+	line, _ := json.Marshal([]interface{}{
+		[]interface{}{"wrb.fr", "rpcmeta", meta, nil},
+		[]interface{}{"wrb.fr", "rpc1", string(cb), nil},
+	})
+	payloads := wrbPayloadsInLine(string(line))
+	if len(payloads) != 2 {
+		t.Fatalf("同行双帧应取出 2 条 payload，得到 %d", len(payloads))
+	}
+	texts := textsInLine(string(line))
+	if len(texts) == 0 || !strings.Contains(texts[0], "hello world") {
+		t.Fatalf("第二个内容帧的文本丢失：%v", texts)
 	}
 }

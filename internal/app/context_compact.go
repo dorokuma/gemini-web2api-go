@@ -193,7 +193,7 @@ func compactMessages(messages []map[string]interface{}, budget, inlineOverhead i
 		return messages, nil
 	}
 
-	pinned := pinMustKeepGroups(groups)
+	pinned := pinMustKeepGroups(groups, historyBudget)
 
 	// 第一步：压非 pinned 组里单条超长 tool 输出。
 	for i, g := range groups {
@@ -221,16 +221,26 @@ func compactMessages(messages []map[string]interface{}, budget, inlineOverhead i
 	}
 	// 终检以真实渲染长度为准（含已插入的 noteMsg）：msgBytes 对 tool /
 	// tool_calls 已按真实模板算，此处再按 buildPromptParts 口径兜底。
+	// Bytes 必须计入 inlineOverhead：inlineOverhead>0（工具协议实际留在
+	// history）时 Bytes 是「渲染总长」，否则错误文案会自相矛盾
+	//（"prompt is 30000 bytes, over the 150000-byte limit"）。
 	if total := renderedHistoryBytes(out); total > historyBudget {
 		return nil, &PromptTooLongError{
-			Bytes: total, Budget: budget, HasCookie: true}
+			Bytes: total + inlineOverhead, Budget: budget, HasCookie: true}
 	}
 	return out, nil
 }
 
-// pinMustKeepGroups 原位标记必保组：前导 system + 首条 user（无论大小都锚定）
-// + 中间 system + 最后一组。绝不把后续短 user 倒序提前、不把中间 system 前置。
-func pinMustKeepGroups(groups []atomicGroup) []bool {
+// pinMustKeepGroups 原位标记必保组：前导 system + 首条 user（≤25% 预算才
+// 锚定）+ 中间 system + 最后一组。绝不把后续短 user 倒序提前、不把中间
+// system 前置。
+//
+// 首条 user 契约（规格 §3.3）：遇到第一条 role=="user"||"" 的组**无条件**
+// 置 seenFirstUser（保证后续短 user 绝不会顶替/倒序提前），但仅当
+// groupBytes() <= historyBudget/4 时才 pinned——超过 25% 预算的超长首问
+// 不入必保集，空间不够时可被整组淘汰（防止「首问 100KB + 尾问 60KB 同时
+// 钉死 > 150KB 预算」的合法请求被假 400 误杀）。
+func pinMustKeepGroups(groups []atomicGroup, historyBudget int) []bool {
 	pinned := make([]bool, len(groups))
 	seenFirstUser := false
 	last := len(groups) - 1
@@ -242,8 +252,10 @@ func pinMustKeepGroups(groups []atomicGroup) []bool {
 		case role == "system":
 			pinned[i] = true // 前导与中间 system 都原位保留
 		case !seenFirstUser && (role == "user" || role == ""):
-			pinned[i] = true
 			seenFirstUser = true
+			if g.groupBytes() <= historyBudget/4 {
+				pinned[i] = true // 首条 user ≤25% 预算才锚定
+			}
 		}
 	}
 	return pinned
@@ -362,10 +374,15 @@ func withReplacedField(m map[string]interface{}, key string, v interface{}) map[
 
 // truncateMultimodalParts 截多模态 []interface{} tool content 里的超长文本
 // part（保留非文本 part 与未超限文本原样）。返回 (新数组, 是否有改动)。
+//
+// 只认 textPartTypes（text/input_text/output_text）的文本 part：媒体 part
+// （image_url 等）与普通 JSON 数据绝不截断。预算按**整条消息所有文本 part
+// 的累计字节**计——总文本 >12KB 但分散在多个 <12KB part 时同样要截，
+// 从尾部 part 开始整段截掉直到累计落回预算内（首个超长 part 按头尾截断）。
 func truncateMultimodalParts(c []interface{}) ([]interface{}, bool) {
 	total := 0
 	for _, p := range c {
-		if pm, ok := p.(map[string]interface{}); ok {
+		if pm, ok := p.(map[string]interface{}); ok && textPartTypes[getStr(pm, "type")] {
 			total += len(getStr(pm, "text"))
 		}
 	}
@@ -374,23 +391,41 @@ func truncateMultimodalParts(c []interface{}) ([]interface{}, bool) {
 	}
 	var np []interface{}
 	changed := false
+	kept := 0 // 已输出的文本字节累计（预算按整条消息所有文本 part 计）
 	for _, p := range c {
 		pm, ok := p.(map[string]interface{})
-		if !ok {
+		if !ok || !textPartTypes[getStr(pm, "type")] {
 			np = append(np, p)
 			continue
 		}
 		txt := getStr(pm, "text")
-		if txt == "" || len(txt) <= compactToolMsgLimit {
+		switch {
+		case kept+len(txt) <= compactToolMsgLimit:
+			// 本 part 连同已输出部分仍在预算内：原样保留。
+			kept += len(txt)
 			np = append(np, p)
-			continue
-		}
-		if nc, ok2 := truncateToolContent(txt, compactToolHead, compactToolTail); ok2 {
-			np = append(np, withReplacedField(pm, "text", nc))
+		case kept < compactToolMsgLimit:
+			// 本 part 是第一个把累计顶出预算的：把头尾截断填到预算内
+			// （头 compactToolHead + 尾按剩余额度取，绝不超 limit）。
+			tail := compactToolMsgLimit - kept - compactToolHead
+			if tail > compactToolTail {
+				tail = compactToolTail
+			}
+			if tail < 0 {
+				tail = 0
+			}
+			if nc, ok2 := truncateToolContent(txt, compactToolHead, tail); ok2 {
+				np = append(np, withReplacedField(pm, "text", nc))
+				kept += len(nc)
+				changed = true
+			} else {
+				// 太短无法头尾截断：整段丢弃（仍在预算内的部分已由头段体现）。
+				changed = true
+			}
+		default:
+			// 预算已满：后续文本 part 整段淘汰，非文本 part 仍原样保留。
 			changed = true
-			continue
 		}
-		np = append(np, p)
 	}
 	return np, changed
 }
@@ -452,15 +487,67 @@ func applyCompactIfNeeded(messages []map[string]interface{}, prompt string,
 		return messages, false, nil
 	}
 	// inlineOverhead 仅当工具协议实际留在 history 里时才计入：
-	// planContextFile 已把 Head+Tail 剥进 inline（stripToolProtocol ok）时
-	// 它们不占附件预算；剥离失败（Head+Tail 留在 history）才计入。
+	// planContextFile 把 Head+Tail 剥进 inline 的充要条件是 stripToolProtocol
+	// 成功 **且** len(joinPromptParts(Head,inline,Tail)) <= budget——协议很大
+	// 时 strip 成功但 planContextFile 放弃剥离，整段 prompt（含 Head+Tail）
+	// 全部留在 history。判据用 history 与剥离后正文 h 的长度差精确得出，
+	// 不再只看 stripToolProtocol 的 ok：
+	//   - !ok（无协议/不匹配）：Head+Tail 全留 history → overhead = len(Head)+len(Tail)；
+	//   - ok 且 len(history) != len(h)：放弃剥离（withTools 超 budget），
+	//     Head+Tail+分隔同样留在 history → overhead = len(history)-len(h)；
+	//   - ok 且 len(history) == len(h)：协议已剥进 inline → overhead = 0。
 	overhead := 0
-	if _, ok := stripToolProtocol(prompt, pc); !ok {
+	h, ok := stripToolProtocol(prompt, pc)
+	if !ok {
 		overhead = len(pc.Head) + len(pc.Tail)
+	} else if len(history) != len(h) {
+		overhead = len(history) - len(h)
 	}
 	out, err := compactMessages(messages, maxFile, overhead)
 	if err != nil {
 		return messages, false, err
 	}
 	return out, true, nil
+}
+
+// promptGate 是 compact 接线的请求级判定快照：三个 OpenAI/Google 入口共用
+// 同一份资格判定，保证 prepare 与 run（或多轮分流）永不失步。
+type promptGate struct {
+	messages          []map[string]interface{}
+	prompt            string
+	pc                promptCtx
+	hasMedia          bool // 轻量媒体预判（不下载）
+	multiTurnEligible bool
+	anonEligible      bool
+}
+
+// applyCompactGate 统一 compact 接线与资格重算（R2-M5）：
+//  1. 按 hasMedia 预判 multiTurnEligible / anonEligible（不下载远程图——
+//     compact 前后各跑一次 collectImages 会重复下载，且被裁轮次的失效外链
+//     会让请求在裁剪前提前 400）；
+//  2. 两条资格都为假才允许 applyCompactIfNeeded；
+//  3. 裁剪成功后重建 prompt/pc 并按新媒体态重算两条资格——被裁轮次带图时
+//     hasMedia 由 true 翻回 false，陈旧的 anonEligible=false 若继续传给
+//     预检会让按附件路径放行的请求在 streamGenerateOnce 里被反手按匿名
+//     400 杀掉（/v1/responses 流式吞 400 的来源）。
+//
+// rebuild 由调用方注入（闭包捕获 tools/toolChoice/TaskMode），用于按新
+// messages 重拼 prompt 与 pc。
+func applyCompactGate(g promptGate, mc ModelConfig,
+	rebuild func([]map[string]interface{}) (string, promptCtx)) (promptGate, error) {
+	g.multiTurnEligible = rtCfg().MultiTurn && !g.hasMedia && mc.Tool == 0
+	g.anonEligible = anonFirstEligible(mc, g.hasMedia, len(g.prompt))
+	if g.multiTurnEligible || g.anonEligible {
+		return g, nil
+	}
+	cm, ok, err := applyCompactIfNeeded(g.messages, g.prompt, g.pc)
+	if err != nil || !ok {
+		return g, err
+	}
+	g.messages = cm
+	g.prompt, g.pc = rebuild(cm)
+	g.hasMedia = hasMediaInMessages(cm)
+	g.multiTurnEligible = rtCfg().MultiTurn && !g.hasMedia && mc.Tool == 0
+	g.anonEligible = anonFirstEligible(mc, g.hasMedia, len(g.prompt))
+	return g, nil
 }

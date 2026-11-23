@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,10 +95,26 @@ func (c *cdpClient) OnAny(fn func(cdpEvent)) {
 
 // Once 注册一个只触发一次的 method 监听器：第一次匹配事件到达时调用 fn 后
 // 自动摘除。用于「等一次事件」的场合（Page.loadEventFired），避免反复注册累积。
-func (c *cdpClient) Once(method string, fn func(cdpEvent)) {
+// 返回的 cancel 可在等待方放弃时提前摘除监听器（事件永不到达时防泄漏）。
+func (c *cdpClient) Once(method string, fn func(cdpEvent)) (cancel func()) {
 	c.evtMu.Lock()
 	c.onceHandlers[method] = append(c.onceHandlers[method], fn)
 	c.evtMu.Unlock()
+	var once sync.Once
+	want := reflect.ValueOf(fn).Pointer()
+	return func() {
+		once.Do(func() {
+			c.evtMu.Lock()
+			list := c.onceHandlers[method]
+			for i, f := range list {
+				if reflect.ValueOf(f).Pointer() == want {
+					c.onceHandlers[method] = append(list[:i:i], list[i+1:]...)
+					break
+				}
+			}
+			c.evtMu.Unlock()
+		})
+	}
 }
 
 // setOnClose 注册断连回调（只允许设一次，重复设置会覆盖旧值）。

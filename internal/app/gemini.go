@@ -286,8 +286,18 @@ func modelNeedsLogin(mc ModelConfig) bool {
 // 开关开着 + 没带附件 + 模型不需要登录态。附件（图/视频）在对话里引用必须登录
 // （匿名会被上游回 1100），所以带附件时一律挑号。开关关着永远返回 false（保持旧行为：
 // 池里有号就用号）。
-func anonFirstEligible(mc ModelConfig, hasAttachment bool) bool {
-	return rtCfg().AnonFirst && !hasAttachment && !modelNeedsLogin(mc)
+//
+// promptBytes 守卫：超 MaxPromptBytes 的超长请求必须靠登录态把历史转成
+// message.txt 附件上传——匿名会把附件引用回 1100/400。有可用 cookie 时
+// 这类请求绝不走匿名（无 cookie 照旧匿名，最后按超长 400 如实报错）。
+func anonFirstEligible(mc ModelConfig, hasAttachment bool, promptBytes int) bool {
+	if !rtCfg().AnonFirst || hasAttachment || modelNeedsLogin(mc) {
+		return false
+	}
+	if b := rtCfg().MaxPromptBytes; b > 0 && promptBytes > b && hasCookie() {
+		return false
+	}
+	return true
 }
 
 // temporaryChatEligible 判断这次请求该不该走网页端原生「临时对话」（inner[45]=1，#34）。
@@ -547,38 +557,17 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 	// slot 实际落到第 3 个出口」的窗口——那个出口同样要仲裁一次才能外发。
 	var lastWinner int64
 	for i := 0; i < 2; i++ {
-		var winner int64
-		if p.ID == 0 {
-			// 代理全满/全不可用落入 fallback_direct 直连兜底（或 prefer 为
-			// proxyIDDirect）：先核库——库里已绑启用出口的号绝不能从本机 IP 外发，
-			// 必须释放直连槽去占绑定的出口。
-			// cur==0（未绑定或绑定已失效）或 cur==proxyIDDirect（锁定直连）才允许直连；
-			// 陈旧 -1 快照撞上库里已改绑的号，同样要释放重取。
-			if hasProxyPool() && !rtCfg().FallbackDirect {
-				// 池非空且关 fallback：直连槽只归库里实锤锁定直连的账号。
-				// cur==0（未绑定/绑定失效）或号已被删，都必须释放直连槽
-				// 重取策略出口（已删账号 fail-closed 报错）。
-				p2, perr, action := directSlotGuard(accountID, release)
-				switch action {
-				case directSlotFail:
-					return nil, func() {}, perr
-				case directSlotKeep:
-					return &p, release, nil
-				default: // directSlotReacquire
-					p, heldID, held = p2, p2.ID, true
-					continue
-				}
-			}
-			if cur := currentBoundEnabledProxy(accountID); cur == 0 || cur == proxyIDDirect {
-				return &p, release, nil
-			} else {
-				winner = cur
-			}
-		} else {
-			winner = claimAccountProxy(accountID, p.ID)
-			if winner == p.ID {
-				return &p, release, nil
-			}
+		winner, keep, failErr, reacq := arbitrateHeldExit(accountID, p, release)
+		switch {
+		case keep:
+			return &p, release, nil
+		case failErr != nil:
+			return nil, func() {}, failErr
+		case reacq != nil:
+			// directSlotGuard 已释放直连槽并按库中绑定重取到新出口：
+			// 回圈顶对它再仲裁一次。
+			p, heldID, held = *reacq, reacq.ID, true
+			continue
 		}
 		release()
 		p2, ok2, err2 := acquireSlot(winner)
@@ -600,6 +589,47 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 	// 绝不把手上那个跟库里胜者不一致的出口直接外发（fail-open）。
 	release()
 	return nil, func() {}, &RateLimitError{Reason: "rebound", ProxyID: lastWinner, Bound: true}
+}
+
+// arbitrateHeldExit 对严格绑定下手上的出口做一轮仲裁：
+// 返回 (winner, keep, failErr, reacquired) 四态：
+//   - keep=true：手上出口合法，直接外发；
+//   - failErr!=nil：已释放手上 slot，fail-closed 报错；
+//   - reacquired!=nil：directSlotGuard 已释放直连槽并按库中绑定重取成功，
+//     新 slot 由返回值带回，回圈顶再仲裁；
+//   - winner>0/=-1：需要释放手上 slot 按胜者重取。
+func arbitrateHeldExit(accountID int64, p Proxy, release func()) (int64, bool, error, *Proxy) {
+	if p.ID == 0 {
+		// 代理全满/全不可用落入 fallback_direct 直连兜底（或 prefer 为
+		// proxyIDDirect）：先核库——库里已绑启用出口的号绝不能从本机 IP 外发，
+		// 必须释放直连槽去占绑定的出口。
+		// cur==0（未绑定或绑定已失效）或 cur==proxyIDDirect（锁定直连）才允许直连；
+		// 陈旧 -1 快照撞上库里已改绑的号，同样要释放重取。
+		if hasProxyPool() && !rtCfg().FallbackDirect {
+			// 池非空且关 fallback：直连槽只归库里实锤锁定直连的账号。
+			// cur==0（未绑定/绑定失效）或号已被删，都必须释放直连槽
+			// 重取策略出口（已删账号 fail-closed 报错）。
+			p2, perr, action := directSlotGuard(accountID, release)
+			switch action {
+			case directSlotFail:
+				return 0, false, perr, nil
+			case directSlotKeep:
+				return 0, true, nil, nil
+			default: // directSlotReacquire
+				return 0, false, nil, &p2
+			}
+		}
+		cur := currentBoundEnabledProxy(accountID)
+		if cur == 0 || cur == proxyIDDirect {
+			return 0, true, nil, nil
+		}
+		return cur, false, nil, nil
+	}
+	winner := claimAccountProxy(accountID, p.ID)
+	if winner == p.ID {
+		return 0, true, nil, nil
+	}
+	return winner, false, nil, nil
 }
 
 // resolvePreferProxy 在 acquireSlot 之前先核库修正陈旧的 prefer 快照：
@@ -742,6 +772,34 @@ func xsrfExitConflict(accountID, pickedID int64) (conflictID int64, conflict boo
 	return 0, false, curBound
 }
 
+// ensureSkipMap 惰性建 skip 集合（XSRF 换号冲突路径共用）。
+func ensureSkipMap(skip map[int64]bool) map[int64]bool {
+	if skip == nil {
+		return map[int64]bool{}
+	}
+	return skip
+}
+
+// pickNextUnboundAccount 在账号被并发改绑（出口冲突）后挑下一个可试号：
+// 排除 skip ∪ tried，并过滤掉绑在其它仍然有效出口上的号
+// （strictBoundElsewhere——出口已按第一号选定，绑别处的号不能借这个出口）。
+// 取不到返回 nil，调用方循环自然结束。
+func pickNextUnboundAccount(skip, tried map[int64]bool, pickedID int64) *CookieAccount {
+	next := map[int64]bool{}
+	for id := range skip {
+		next[id] = true
+	}
+	for id := range tried {
+		next[id] = true
+	}
+	acct, _ := pickCookieAccountExcept(next)
+	for acct != nil && strictBoundElsewhere(acct, pickedID) {
+		next[acct.ID] = true
+		acct, _ = pickCookieAccountExcept(next)
+	}
+	return acct
+}
+
 // deltaTracker 把上游的累积帧转成增量。
 //
 // 上游每帧带的是**到目前为止的全文**，不是新增部分，所以要跟已发出的做前缀
@@ -865,7 +923,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			return &StreamResult{}, &pinnedAccountError{ID: mc.PinAccountID}
 		}
 		acct = a
-	} else if !anonFirstEligible(mc, len(pending) > 0) {
+	} else if !anonFirstEligible(mc, len(pending) > 0, len(prompt)) {
 		if shouldUseBrowserTransport() {
 			// 策略 M1：常驻浏览器有粘性主号且它还能用时，优先继续驻留
 			// （同 cookieIdentity 的 authuser=0..9 共用同一 /app Tab），
@@ -1024,27 +1082,14 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			conflictID, conflict, _ := xsrfExitConflict(acct.ID, picked.ID)
 			if conflict {
 				// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
-				if skip == nil {
-					skip = map[int64]bool{}
-				}
+				skip = ensureSkipMap(skip)
 				skip[acct.ID] = true // 挡回挑号；不写 tried，不占换号预算
 				lastBoundErr = &RateLimitError{Reason: "rebound", ProxyID: conflictID, Bound: true}
 				if mc.PinAccountID > 0 {
 					// 会话钉住的号被绑走：直接报 Bound，绝不能换号，也绝不能匿名下发。
 					return &StreamResult{AccountID: acct.ID}, lastBoundErr
 				}
-				next := map[int64]bool{}
-				for id := range skip {
-					next[id] = true
-				}
-				for id := range tried {
-					next[id] = true
-				}
-				acct, _ = pickCookieAccountExcept(next)
-				for acct != nil && strictBoundElsewhere(acct, picked.ID) {
-					next[acct.ID] = true
-					acct, _ = pickCookieAccountExcept(next)
-				}
+				acct = pickNextUnboundAccount(skip, tried, picked.ID)
 				continue
 			}
 		}
@@ -1078,38 +1123,26 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		// 只试一次，且只在这一轮。
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
-			// 轮转必须走本次选定的出口：rotateAccount 按 a.ProxyID 取出口 URL，
-			// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
-			// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
-			rotAcct := *acct
-			// picked.ID==0（fallback_direct 直连兜底或锁定直连）时也必须清掉旧绑定：
-			// 直连就是本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
-			// 判定必须按**刚核库的实时绑定**：acct.ProxyID 是挑号时的陈旧快照，
-			// 管理员此刻可能已把它锁成 -1——拿陈旧值判会把锁定直连号的 Cookie
-			// 按 picked.ID=0 交给 rotateProxyURL 挑代理外发。
-			curBound := acct.ProxyID
-			if a := accountByID(acct.ID); a != nil {
-				curBound = a.ProxyID
-			}
-			if curBound == proxyIDDirect {
-				rotAcct.ProxyID = proxyIDDirect
-			} else {
-				rotAcct.ProxyID = picked.ID
-			}
-			if _, _, rerr := rotateAccount(rotAcct); rerr == nil {
-				if fresh := accountByID(acct.ID); fresh != nil {
-					if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
-						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
-						acct = fresh
-						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
-						authUser = fresh.AuthUser
-						if !rtCfg().StrictProxyBinding && fresh.ProxyID != proxyIDDirect &&
-							(fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID)) {
-							autoBindAccountProxy(fresh.ID, picked.ID)
-						}
-						break
-					}
+			out := healXSRFByRotation(mc, acct, picked, proxyURL, skip, tried)
+			skip = out.skip
+			if out.boundErr != nil {
+				lastBoundErr = out.boundErr
+				if out.failRes != nil {
+					// 钉会话的号被绑走：直接报 Bound，绝不能换号。
+					return out.failRes, out.boundErr
 				}
+				acct = out.next
+				continue
+			}
+			if out.healed {
+				acct = out.acct
+				cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), out.xsrf
+				authUser = acct.AuthUser
+				if !rtCfg().StrictProxyBinding && acct.ProxyID != proxyIDDirect &&
+					(acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
+					autoBindAccountProxy(acct.ID, picked.ID)
+				}
+				break
 			}
 		}
 		// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
@@ -1123,19 +1156,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			acct = nil // pinned: never switch to another account mid-conversation
 			continue
 		}
-		next := map[int64]bool{}
-		for id := range skip {
-			next[id] = true
-		}
-		for id := range tried {
-			next[id] = true
-		}
-		acct, _ = pickCookieAccountExcept(next) // 取不到时返回 nil，循环自然结束
-		// 严格绑定：出口已经定了，绑在别的仍然有效的出口上的号不能借用这个出口。
-		for acct != nil && strictBoundElsewhere(acct, picked.ID) {
-			next[acct.ID] = true
-			acct, _ = pickCookieAccountExcept(next)
-		}
+		// 严格绑定：出口已经定了，绑在别的仍然有效的出口上的号不能借用这个出口
+		// （pickNextUnboundAccount 内部过滤 strictBoundElsewhere）。
+		acct = pickNextUnboundAccount(skip, tried, picked.ID)
 	}
 	if cookieStr == "" && lastCookieErr == nil && lastBoundErr != nil {
 		// 循环里只遇到并发改绑冲突、没试过任何 cookie：绝不能绕过
@@ -1682,6 +1705,95 @@ func newLineHandler(onDelta, onReasoning func(string), stopWhen func(string) boo
 		return nil
 	}
 	return lh
+}
+
+// rotationHeal 是 healXSRFByRotation 的结果。
+type rotationHeal struct {
+	skip     map[int64]bool  // 可能并入冲突号后的新 skip
+	boundErr *RateLimitError // 钉会话被绑走时的 Bound 失败（配 failRes 直接返回）
+	failRes  *StreamResult   // boundErr 场景的失败 res
+	next     *CookieAccount  // 冲突跳号后的下一个候选
+	healed   bool            // 轮转后重取 XSRF 成功
+	acct     *CookieAccount  // healed 时的新号
+	xsrf     string          // healed 时的新 token
+}
+
+// healXSRFByRotation 是 XSRF 取失败后的「轮转一次救号」流程（每号一次机会由
+// 调用方的 rotatedOnce 控制）：轮转前后各核一次出口冲突（getXSRF / rotateAccount
+// 都是网络 I/O，期间管理员可能已把号锁成 -1 或绑走），冲突就跳号并把冲突记回
+// 调用方的 lastBoundErr；钉会话的号被绑走直接给 Bound 失败（failRes+boundErr）。
+// 返回 healed=true 表示轮转救回（acct/xsrf 已回填）。
+func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxyURL string,
+	skip map[int64]bool, tried map[int64]bool) rotationHeal {
+	out := rotationHeal{skip: skip}
+	// 并发改绑复核（R2-M3）：进入轮转前先核出口冲突——getXSRF 是
+	// 1-3s 网络 I/O，期间管理员可能已把号锁成 -1 或绑到别的代理。
+	// 拿着已变 -1 的号在旧代理 proxyURL 上轮转/重取 XSRF，或拿着
+	// 已绑代理的号在直连 proxyURL=="" 上重取，都会串出口外发。
+	if acct.ID > 0 {
+		conflictID, conflict, _ := xsrfExitConflict(acct.ID, picked.ID)
+		if conflict {
+			out.skip = ensureSkipMap(skip)
+			out.skip[acct.ID] = true
+			out.boundErr = &RateLimitError{Reason: "rebound", ProxyID: conflictID, Bound: true}
+			if mc.PinAccountID > 0 {
+				out.failRes = &StreamResult{AccountID: acct.ID}
+			} else {
+				out.next = pickNextUnboundAccount(out.skip, tried, picked.ID)
+			}
+			return out
+		}
+	}
+	// 轮转必须走本次选定的出口：rotateAccount 按 a.ProxyID 取出口 URL，
+	// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
+	// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
+	rotAcct := *acct
+	// picked.ID==0（fallback_direct 直连兜底或锁定直连）时也必须清掉旧绑定：
+	// 直连就是本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
+	// 判定必须按**刚核库的实时绑定**：acct.ProxyID 是挑号时的陈旧快照，
+	// 管理员此刻可能已把它锁成 -1——拿陈旧值判会把锁定直连号的 Cookie
+	// 按 picked.ID=0 交给 rotateProxyURL 挑代理外发。
+	curBound := acct.ProxyID
+	if a := accountByID(acct.ID); a != nil {
+		curBound = a.ProxyID
+	}
+	if curBound == proxyIDDirect {
+		rotAcct.ProxyID = proxyIDDirect
+	} else {
+		rotAcct.ProxyID = picked.ID
+	}
+	if _, _, rerr := rotateAccount(rotAcct); rerr != nil {
+		return out
+	}
+	fresh := accountByID(acct.ID)
+	if fresh == nil {
+		return out
+	}
+	// 轮转成功后拿新 cookie 重取 XSRF 前再核一次出口冲突：
+	// rotateAccount 本身也是网络 I/O，期间绑定可能又变了。
+	// 冲突就跳号（记 skip + lastBoundErr），绝不在错配的
+	// proxyURL 上重取。
+	cid2, conflict2, _ := xsrfExitConflict(fresh.ID, picked.ID)
+	if conflict2 {
+		out.skip = ensureSkipMap(out.skip)
+		out.skip[fresh.ID] = true
+		out.boundErr = &RateLimitError{Reason: "rebound", ProxyID: cid2, Bound: true}
+		if mc.PinAccountID > 0 {
+			out.failRes = &StreamResult{AccountID: fresh.ID}
+		} else {
+			out.next = pickNextUnboundAccount(out.skip, tried, picked.ID)
+		}
+		return out
+	}
+	tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL)
+	if err2 != nil {
+		return out
+	}
+	logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
+	out.healed = true
+	out.acct = fresh
+	out.xsrf = tok2
+	return out
 }
 
 // healXSRFRefresh 在上游返回 400 + isXSRFError 时作废本地 XSRF 缓存并重取 token；

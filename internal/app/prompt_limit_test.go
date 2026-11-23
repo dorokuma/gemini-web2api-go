@@ -136,3 +136,28 @@ func TestResponsesStreamOverflowPrecheck(t *testing.T) {
 		t.Fatal("400 路径不该先发出 SSE 事件")
 	}
 }
+
+// R2-S2 回归：流式 response.failed 事件的错误码映射——
+// PromptTooLongError→invalid_request_error/context_length_exceeded、
+// RateLimitError→rate_limit_exceeded/ip_slot_full、
+// ModelDowngradedError→code=model_downgraded；且诊断字段来自 res.Diag。
+func TestResponsesFailedErrorMapping(t *testing.T) {
+	res := &StreamResult{Diag: upstreamDiagMeta{Frames: 3, ContentFrame: true, Model: "m-x"},
+		UpstreamModel: "m-x"}
+	errObj := responsesFailedError(&PromptTooLongError{Bytes: 9, Budget: 5}, res)
+	if errObj["type"] != "invalid_request_error" || errObj["code"] != "context_length_exceeded" {
+		t.Fatalf("PTL 映射错：%v", errObj)
+	}
+	errObj = responsesFailedError(&RateLimitError{Reason: "concurrent", ProxyID: 2, Bound: true}, res)
+	if errObj["type"] != "rate_limit_exceeded" || errObj["code"] != "ip_slot_full" {
+		t.Fatalf("RLE 映射错：%v", errObj)
+	}
+	errObj = responsesFailedError(&ModelDowngradedError{Requested: "a", Reported: "b"}, res)
+	if errObj["code"] != "model_downgraded" {
+		t.Fatalf("MDE 映射错：%v", errObj)
+	}
+	// 诊断字段必须随事件走（frames/upstream_model 出自 res）。
+	if errObj["upstream_model"] != "m-x" || errObj["frames"] != 3 {
+		t.Fatalf("诊断字段缺失：%v", errObj)
+	}
+}

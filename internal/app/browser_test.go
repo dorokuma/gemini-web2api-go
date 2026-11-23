@@ -69,6 +69,17 @@ type fakeCDPServer struct {
 	muteFetch   atomic.Bool
 	// cookiesJSON 非 nil 时 Network.getCookies 返回它（测试注入持久 Jar）。
 	cookiesJSON atomic.Value // json.RawMessage
+
+	// pageOrigin / pageReady 模拟当前活动文档的 location.origin 与
+	// document.readyState（about:blank 初始为 "null"/"complete"）；
+	// pageNavDelay>0 时 Page.navigate 后延迟这么久才切 origin 并推
+	// Page.loadEventFired（模拟真实导航的网络往返）。
+	pageOrigin   atomic.Value // string
+	pageReady    atomic.Value // string
+	pageNavDelay atomic.Int64 // 纳秒
+
+	// failMethods 列出的 CDP method 一律回 JSON-RPC 错误（fault 注入）。
+	failMethods sync.Map // map[string]bool
 }
 
 type cdpCall struct {
@@ -104,6 +115,9 @@ func newFakeCDPServer(t *testing.T) *fakeCDPServer {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	s.wsURL = fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/fake", port)
+	s.pageOrigin.Store("null")     // about:blank
+	s.pageReady.Store("complete")  // about:blank 的 readyState 恰为 complete
+	s.pageNavDelay.Store(int64(0)) // 默认立即切 origin 推 load
 	go s.serve()
 	return s
 }
@@ -215,6 +229,12 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	if s.holdReplies.Load() || m.Method == "Never.Returns" {
 		return
 	}
+	if _, bad := s.failMethods.Load(m.Method); bad {
+		go s.sendText([]byte(fmt.Sprintf(
+			`{"id":%d,"error":{"code":-32000,"message":"injected %s failure"}}`,
+			m.ID, m.Method)))
+		return
+	}
 
 	result := json.RawMessage(`{}`)
 	switch m.Method {
@@ -222,13 +242,41 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 		result = json.RawMessage(`{"targetId":"fake-target-1"}`)
 	case "Target.attachToTarget":
 		result = json.RawMessage(`{"sessionId":"fake-session-1"}`)
+	case "Page.navigate":
+		// 模拟真实导航：返回响应时活动文档仍是旧文档；延迟 navDelay 后
+		// 切 origin 并推 Page.loadEventFired（sessionId 与请求一致）。
+		delay := time.Duration(s.pageNavDelay.Load())
+		go func(sessionID string) {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			s.pageOrigin.Store("https://gemini.google.com")
+			s.pageReady.Store("complete")
+			s.pushEvent(sessionID, "Page.loadEventFired",
+				map[string]interface{}{"timestamp": 1})
+		}(m.SessionID)
+		result = json.RawMessage(`{"frameId":"frame-1","loaderId":"loader-1"}`)
+	case "Page.enable":
+		// 模拟真实浏览器：新 attach 的 page 起于 about:blank。
+		s.pageOrigin.Store("null")
+		s.pageReady.Store("complete")
+		result = json.RawMessage(`{}`)
 	case "Runtime.evaluate":
 		switch {
 		case strings.Contains(string(m.Params), "typeof __gwPush"):
 			result = json.RawMessage(`{"result":{"type":"string","value":"function/object"}}`)
+		case strings.Contains(string(m.Params), "location.origin"):
+			// navigateAndWaitApp 的终核：按当前模拟 origin 回
+			// "origin/readyState"——about:blank 的 origin 是 "null"，
+			// 导航 /app 后应切到 https://gemini.google.com。
+			val := s.pageOrigin.Load().(string) + "/" + s.pageReady.Load().(string)
+			result = json.RawMessage(fmt.Sprintf(
+				`{"result":{"type":"string","value":%q}}`, val))
 		case strings.Contains(string(m.Params), "document.readyState"):
-			// waitPageLoad 的轮询：直接报已加载，免得测试等 loadEventFired 超时。
-			result = json.RawMessage(`{"result":{"type":"string","value":"complete"}}`)
+			// waitPageLoad 的轮询：按模拟 readyState 回。
+			result = json.RawMessage(fmt.Sprintf(
+				`{"result":{"type":"string","value":%q}}`,
+				s.pageReady.Load().(string)))
 		default:
 			s.handleEvaluate(m.Params)
 		}
@@ -3479,7 +3527,9 @@ func TestAlignResidentAndNavigateDeadSeed(t *testing.T) {
 	m.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	m.alignResidentAndNavigate(ctx, client, "fake-session-1")
+	if err := m.alignResidentAndNavigate(ctx, client, "fake-session-1"); err != nil {
+		t.Fatalf("alignResidentAndNavigate: %v", err)
+	}
 	sawClear, sawNav := false, false
 	for {
 		select {
@@ -3514,6 +3564,110 @@ done4:
 	if url != wantURL || direct != wantDirect {
 		t.Fatalf("bridgeActive* 与实际出口不一致：got(%q,%v) want(%q,%v)",
 			url, direct, wantURL, wantDirect)
+	}
+}
+
+// R2-S2 ⑦ alignColdStartJar fail-closed：读 Jar 出错 → 清 Jar 后按匿名出口导航；
+// 清 Jar 失败 → 直接中止返回错误，绝不带残留身份导航。
+func TestAlignColdStartJarFailClosed(t *testing.T) {
+	t.Run("read error clears jar then navigates", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, bridge := newTestClientAndBridge(t, srv)
+		srv.failMethods.Store("Network.getCookies", true) // 读 Jar 出错
+		m := &browserManager{}
+		res := &startResult{}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.alignColdStartJar(ctx, client, "fake-session-1", bridge, "", res); err != nil {
+			t.Fatalf("读 Jar 出错应清 Jar 后继续：%v", err)
+		}
+		sawClear, sawNav := false, false
+		for {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Network.clearBrowserCookies" {
+					sawClear = true
+				}
+				if c.method == "Page.navigate" {
+					sawNav = true
+					if !sawClear {
+						t.Fatal("导航发生在清 Jar 之前")
+					}
+				}
+			default:
+				goto done
+			}
+		}
+	done:
+		if !sawClear {
+			t.Fatal("读 Jar 出错必须 fail-closed 清 Jar")
+		}
+		if !sawNav {
+			t.Fatal("清 Jar 后应按匿名出口导航 /app")
+		}
+	})
+
+	t.Run("clear failure aborts", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, bridge := newTestClientAndBridge(t, srv)
+		srv.cookiesJSON.Store(json.RawMessage(
+			`{"cookies":[{"name":"SAPISID","value":"alien"}]}`)) // 陌生 Cookie
+		srv.failMethods.Store("Network.clearBrowserCookies", true) // 清 Jar 失败
+		m := &browserManager{}
+		res := &startResult{seed: browserSeedState{AccountID: 1}}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.alignColdStartJar(ctx, client, "fake-session-1", bridge, "", res); err == nil {
+			t.Fatal("清 Jar 失败必须中止冷启动，绝不能带残留身份导航")
+		}
+		// 绝不能发出 Page.navigate。
+		for {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Page.navigate" {
+					t.Fatal("清 Jar 失败后绝不该导航")
+				}
+			default:
+				return
+			}
+		}
+	})
+}
+
+// navigateAndWaitApp 不得在 about:blank（readyState 恰为 "complete"）上提前返回：
+// fake 把 origin 切换延迟到导航之后，若实现只看 readyState 就会误以为已就绪。
+// 断言 fake 侧确实收到了导航前注册的 Once 监听所等的那次 loadEventFired——
+// 即函数返回时 origin 已切到 gemini.google.com。
+func TestNavigateAndWaitAppWaitsForOrigin(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, _ := newTestClientAndBridge(t, srv)
+	// 导航有真实耗时：origin 在 300ms 后才切到 gemini.google.com。
+	srv.pageNavDelay.Store(int64(300 * time.Millisecond))
+	m := &browserManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.navigateAndWaitApp(ctx, client, "fake-session-1")
+	if got := srv.pageOrigin.Load().(string); got != "https://gemini.google.com" {
+		t.Fatalf("返回时 origin 仍为 %q（在 about:blank 提前返回）", got)
+	}
+	// 必须真发出了 Page.navigate。
+	sawNav := false
+	for {
+		select {
+		case c := <-srv.gotCalls:
+			if c.method == "Page.navigate" {
+				sawNav = true
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if !sawNav {
+		t.Fatal("未发出 Page.navigate")
 	}
 }
 

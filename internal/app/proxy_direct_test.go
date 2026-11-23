@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -292,4 +293,27 @@ func TestCompatibleProbeAccountStrictAnonymity(t *testing.T) {
 	if got0 == nil || got0.ID != unbound {
 		t.Fatalf("开 fallback 无锁定号时应退回未绑定号 #%d，得到 %+v", unbound, got0)
 	}
+}
+
+// R2-S2 回归：probeGeminiWithAccount(..., nil, false) 是严格匿名——池里明明
+// 有号也绝不 loadCookie() 借号外发（借号会把锁定直连号的 Cookie 从代理发出去）。
+func TestProbeGeminiWithAccountStrictAnonymity(t *testing.T) {
+	_ = addTestAccount(t, "probeNoBorrow") // 池里有号，诱惑 loadCookie
+	var sawCookie string
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/app" {
+			return respJSON(req, 200, fakeAppTokens), nil
+		}
+		if strings.Contains(req.URL.Path, "StreamGenerate") {
+			sawCookie = req.Header.Get("Cookie")
+			return respJSON(req, 200, ")]}'\n[]\n"), nil
+		}
+		return respJSON(req, 404, ""), nil
+	})
+	proxy := fakeUpstreamServer(t, rt)
+	res := probeGeminiWithAccount("hi", proxy, nil, false)
+	if sawCookie != "" {
+		t.Fatalf("严格匿名探测绝不许带池里账号的 Cookie：%q", sawCookie)
+	}
+	_ = res
 }

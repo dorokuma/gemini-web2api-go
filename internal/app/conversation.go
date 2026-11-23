@@ -328,47 +328,8 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		}
 	}
 
-	inner := make([]interface{}, innerSlots)
-	inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
-	inner[1] = []interface{}{"en"}
-	if conv.turn == 0 {
-		inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
-	} else {
-		// 续接：[cid, rid, rcid(登录)/""(匿名), null×6, tok26]
-		inner[2] = []interface{}{conv.cid, conv.rid, conv.rcid,
-			nil, nil, nil, nil, nil, nil, conv.tok26}
-	}
-	inner[6] = []interface{}{0}
-	inner[7] = 1
-	inner[10] = 1
-	inner[11] = 0
-	inner[17] = []interface{}{[]interface{}{conv.turn}}
-	inner[18] = 0
-	inner[27] = 1
-	inner[30] = []interface{}{4}
-	inner[41] = []interface{}{1}
-	inner[53] = 0
 	reqUUID := uuid.NewString()
-	inner[59] = reqUUID
-	inner[61] = []interface{}{}
-	inner[68] = 1
-	inner[79] = mc.Mode
-	tw := mc.thinkWire()
-	inner[80] = tw
-	inner[91] = 0
-	inner[96] = 0
-	if tw != thinkingNormal {
-		inner[96] = 1
-	}
-	// 任务模式槽位：仅 mc.TaskMode 触发，与 streamGenerateOnce 同一套路由——
-	// Mode==8 走 argonMode8Slots，Mode!=8 走 taskModeSlots；对话模型发纯普通 inner。
-	if mc.TaskMode {
-		if mc.Mode == 8 {
-			argonMode8Slots(inner)
-		} else {
-			taskModeSlots(inner)
-		}
-	}
+	inner := convInnerSlots(conv, mc, prompt, reqUUID)
 
 	innerJSON, _ := json.Marshal(inner)
 	outerJSON, _ := json.Marshal([]interface{}{nil, string(innerJSON)})
@@ -562,11 +523,62 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	return failRes(), lastErr
 }
 
+// convInnerSlots 拼一路会话一轮的 inner 槽位数组（首轮空接/续接回填三件套）。
+func convInnerSlots(conv *convState, mc ModelConfig, prompt, reqUUID string) []interface{} {
+	inner := make([]interface{}, innerSlots)
+	inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+	inner[1] = []interface{}{"en"}
+	if conv.turn == 0 {
+		inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
+	} else {
+		// 续接：[cid, rid, rcid(登录)/""(匿名), null×6, tok26]
+		inner[2] = []interface{}{conv.cid, conv.rid, conv.rcid,
+			nil, nil, nil, nil, nil, nil, conv.tok26}
+	}
+	inner[6] = []interface{}{0}
+	inner[7] = 1
+	inner[10] = 1
+	inner[11] = 0
+	inner[17] = []interface{}{[]interface{}{conv.turn}}
+	inner[18] = 0
+	inner[27] = 1
+	inner[30] = []interface{}{4}
+	inner[41] = []interface{}{1}
+	inner[53] = 0
+	inner[59] = reqUUID
+	inner[61] = []interface{}{}
+	inner[68] = 1
+	inner[79] = mc.Mode
+	tw := mc.thinkWire()
+	inner[80] = tw
+	inner[91] = 0
+	inner[96] = 0
+	if tw != thinkingNormal {
+		inner[96] = 1
+	}
+	// 任务模式槽位：仅 mc.TaskMode 触发，与 streamGenerateOnce 同一套路由——
+	// Mode==8 走 argonMode8Slots，Mode!=8 走 taskModeSlots；对话模型发纯普通 inner。
+	if mc.TaskMode {
+		if mc.Mode == 8 {
+			argonMode8Slots(inner)
+		} else {
+			taskModeSlots(inner)
+		}
+	}
+	return inner
+}
+
 // resolveFirstTurnProxyID 决定首轮会话记哪个出口（turn==0 时调一次）：
 // 登录账号以库中实锤为准——锁定直连的号即便手上的槽是 0 也记 -1（-1 是
 // 「永不走代理」的显式承诺，落了 0 下一轮就丢了）；库中值已被改回代理或
 // prefer 已核成 -1 之外的值时按 prefer/picked 记。
 func resolveFirstTurnProxyID(conv *convState, prefer, pickedID int64) int64 {
+	// pickedID>0 一律返回 pickedID：会话实际建在这个出口上，只有
+	// pickedID==0（直连槽）时才可能记 proxyIDDirect——并发改绑已把会话
+	// 落到真代理时记 -1 会让下一轮误判无需冷启动而串出口。
+	if pickedID > 0 {
+		return pickedID
+	}
 	if conv.isLogin && conv.accountID > 0 {
 		if a := accountByID(conv.accountID); a != nil && a.ProxyID == proxyIDDirect {
 			return proxyIDDirect
@@ -718,7 +730,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
 			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
 			// last_used_at，调了不用等于白占一轮。
-			if !anonFirstEligible(mc, false) {
+			if !anonFirstEligible(mc, false, 0) {
 				var a *CookieAccount
 				if shouldUseBrowserTransport() {
 					// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
