@@ -300,6 +300,7 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 	skip := videoCoolingAccounts()
 	var res *StreamResult
 	var err error
+	var boundErr error
 	for tries := len(accountList()); tries > 0; tries-- {
 		acct, ok := pickCookieAccountExcept(skip)
 		if !ok {
@@ -316,6 +317,14 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 			logf("[video] %s: 账号 #%d 额度用完，换下一个账号", j.ID, acct.ID)
 			continue
 		}
+		// strict_proxy_binding：这个号绑的出口用不上不是额度问题，记进 skip 换
+		// 下一个号（它有自己的出口）；全池 Bound 不可用时保留 Bound 429 报出去。
+		var rle *RateLimitError
+		if errors.As(err, &rle) && rle.Bound {
+			boundErr = err
+			logf("[video] %s: 账号 #%d 绑定出口 #%d 不可用，换下一个账号", j.ID, acct.ID, rle.ProxyID)
+			continue
+		}
 		var pinned *pinnedAccountError
 		if errors.As(err, &pinned) {
 			continue
@@ -324,6 +333,9 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 	}
 	if exhausted, reset := videoPoolExhausted(); exhausted {
 		return res, fmt.Errorf("%s", videoPoolExhaustedError(reset))
+	}
+	if boundErr != nil {
+		return res, boundErr
 	}
 	if err == nil {
 		err = fmt.Errorf("no signed-in account is available for video")

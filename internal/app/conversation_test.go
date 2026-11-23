@@ -4,11 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// blockingBody 让 StreamGenerate 的响应体读取阻塞到 ctx 结束：模拟真实
+// 流式响应中途客户端取消——readBody 经 stopReader/heardReader 读到 ctx.Err() 中断。
+// reachedRead 非 nil 时首个 Read 关闭它一次：调用方据此确定取消发生在
+// StreamGenerate 已进入响应体读取之后（R3-M3 要求确定性，不靠 sleep）。
+type blockingBody struct {
+	ctx         context.Context
+	reachedRead chan struct{}
+	once        sync.Once
+}
+
+func (b *blockingBody) Read(p []byte) (int, error) {
+	if b.reachedRead != nil {
+		b.once.Do(func() { close(b.reachedRead) })
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+func (b *blockingBody) Close() error { return nil }
 
 func conversationTestCall(id, name, arguments string) map[string]interface{} {
 	return map[string]interface{}{"id": id, "type": "function", "function": map[string]interface{}{"name": name, "arguments": arguments}}
@@ -386,6 +408,9 @@ func TestCallGeminiConvFailedContinuationIsNotReused(t *testing.T) {
 		st.cid = "failed-continuation"
 		st.turn++ // Even a failed request may already have advanced upstream.
 		if len(turns) == 2 {
+			// CanRestoreConvHead 零值（fail-closed）：失败发生在已发往上游之后
+			//（中途断流），head 已被服务端推进，绝不能归还复用（区别于本地
+			// Bound/取消那种上游没碰过的确定性失败）。
 			return &StreamResult{}, errors.New("lost upstream response")
 		}
 		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
@@ -719,5 +744,624 @@ func TestCallGeminiConvDoesNotStoreHeadWithoutCID(t *testing.T) {
 	defer convMu.Unlock()
 	if len(convStore) != 0 {
 		t.Fatalf("a turn without cid must not be stored as a continuation head: %d entries", len(convStore))
+	}
+}
+
+// ── R1 修复 1/2/4 回归：strict_proxy_binding 下的多轮 Bound 行为 ──
+
+// 登录态多轮会话架：禁用匿名优先，让首轮必须从 cookie 池挑号。
+func resetConvBoundState(t *testing.T) {
+	t.Helper()
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.AnonFirst = false
+	rtMu.Unlock()
+}
+
+// stubConvTurnRealSlot 把上游轮桩在「拿到 slot 之后」：先真实执行
+// acquireClaimedSlot（strict_proxy_binding 的 Bound 判定全靠它），
+// 拿到 slot 才进桩（桩等于把上游那一发换成了成功帧）。Bound 时
+// acquireClaimedSlot 返回 *RateLimitError{Bound:true} 且 CanRestoreConvHead
+// 显式置 true——跟真实 streamGenerateConv 的本地失败路径完全同形。
+func stubConvTurnRealSlot(t *testing.T, f func(st *convState) (*StreamResult, error)) {
+	t.Helper()
+	old := runConversationTurn
+	runConversationTurn = func(ctx context.Context, _ string, _ ModelConfig, conv *convState, _, _ func(string)) (*StreamResult, error) {
+		if err := ctx.Err(); err != nil {
+			return &StreamResult{}, err
+		}
+		pp, release, err := acquireClaimedSlot(conv.accountID, conv.proxyID)
+		if pp == nil {
+			// CanRestoreConvHead=true：跟真实 streamGenerateConv 的本地失败路径
+			// 同形——上游没碰过，被消费的 head 可以归还。
+			return &StreamResult{AccountID: conv.accountID, CanRestoreConvHead: true}, err
+		}
+		release()
+		// conv.proxyID 按真实 streamGenerateConv 的语义就地同步成拿到的出口。
+		conv.proxyID = pp.ID
+		res, err := f(conv)
+		if res != nil {
+			res.AccountID = conv.accountID
+			res.ProxyID = pp.ID
+			// CanRestoreConvHead 保持零值：桩走到这里 = 上游那一发已经发生。
+		}
+		return res, err
+	}
+	t.Cleanup(func() { runConversationTurn = old })
+}
+
+// 真实入口回归：新会话全池 Bound 受阻时，callGeminiConv 必须返回
+// *RateLimitError{Bound:true}（真实的 429），绝不能被 pickAccountForModel 的
+// 「排除集非空 → ModelDowngradedError」谎报成模型降级。
+func TestCallGeminiConvBoundExhaustedReturnsRateLimitNotDowngrade(t *testing.T) {
+	resetConvBoundState(t)
+	a, _ := withTwoProxies(t, true)
+	acct := addTestAccount(t, "boundonly")
+	bindAccountProxy(acct, a) // 唯一账号绑在满出口 A 上
+	mc := Models["gemini-3.6-flash"]
+
+	var calls int
+	stubConvTurnRealSlot(t, func(st *convState) (*StreamResult, error) {
+		calls++
+		st.cid = "bound-conv"
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "q"}}
+	_, _, res, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "bound-thread"})
+	var rle *RateLimitError
+	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+		t.Fatalf("全池 Bound 受阻应报 Bound 429(出口 %d)，得到 err=%v res=%+v", a, err, res)
+	}
+	var mde *ModelDowngradedError
+	if errors.As(err, &mde) {
+		t.Fatalf("Bound 耗尽不能谎报 ModelDowngradedError：%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("上游一轮都不该被调用（Bound 是本地限流），实际 %d 次", calls)
+	}
+}
+
+// 真实入口回归：4 账号池（前 3 绑满 A、第 4 绑空闲 B）必须试到第 4 号——
+// Bound 换号不受 maxCookieTries=3 截断。
+func TestCallGeminiConvBoundSwitchReachesFourthAccount(t *testing.T) {
+	resetConvBoundState(t)
+	a, b := withTwoProxies(t, true)
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		id := addTestAccount(t, fmt.Sprintf("stuck%d", i))
+		bindAccountProxy(id, a) // 前 3 号全绑在满出口 A
+		ids = append(ids, id)
+	}
+	fourth := addTestAccount(t, "free4")
+	bindAccountProxy(fourth, b) // 第 4 号绑空闲出口 B
+	mc := Models["gemini-3.6-flash"]
+
+	var tried []int64
+	stubConvTurnRealSlot(t, func(st *convState) (*StreamResult, error) {
+		tried = append(tried, st.accountID)
+		st.cid = "fourth-conv"
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "q"}}
+	_, _, res, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "fourth-thread"})
+	if err != nil {
+		t.Fatalf("第 4 号绑在空闲出口上必须能被试到，得到 err=%v tried=%v", err, tried)
+	}
+	if res == nil || res.AccountID != fourth {
+		t.Fatalf("应落在第 4 号 #%d，得到 res=%+v", fourth, res)
+	}
+	if len(tried) != 1 || tried[0] != fourth {
+		t.Fatalf("前 3 号 Bound 受阻不该调到上游轮，只有第 4 号能进：tried=%v", tried)
+	}
+}
+
+// 真实入口回归：续接（!fresh）遇本地 Bound 429——上游一个字节都没发——
+// 返回 Bound 429 且被 convTake 消费的健康 head 必须归还：释放 A 后重试
+// 在同一路会话上继续 turn 1，而不是作废 head 逼回全量重发。
+func TestCallGeminiConvBoundContinuationRestoresHead(t *testing.T) {
+	resetConvBoundState(t)
+	a, _ := withTwoProxies(t, true)
+	// 首轮要 A 空闲：withTwoProxies 占了它，先释放。
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	acct := addTestAccount(t, "boundcont")
+	bindAccountProxy(acct, a) // 会话要绑的号，出口 A 此刻空闲
+	mc := Models["gemini-3.6-flash"]
+
+	var turns []int
+	stubConvTurnRealSlot(t, func(st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		st.cid = "cont-conv"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "hello"}}
+	if _, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "cont-thread"}); err != nil {
+		t.Fatalf("首轮应在 A 空闲时成功: %v", err)
+	}
+	next := append(append([]map[string]interface{}{}, first...),
+		map[string]interface{}{"role": "assistant", "content": "answer"},
+		map[string]interface{}{"role": "user", "content": "follow"})
+
+	// 占满 A：续接轮 acquireSlot(conv.proxyID=A) 本地 Bound 429，零字节发上游。
+	s.mu.Lock()
+	s.inflight = 1
+	s.mu.Unlock()
+	_, _, res, err := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil, conversationOptions{requestScope: "cont-thread"})
+	var rle *RateLimitError
+	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+		t.Fatalf("续接遇绑定出口满应报 Bound 429，得到 err=%v res=%+v", err, res)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("本地 Bound 不该调到上游轮：turns=%v", turns)
+	}
+
+	// 释放 A：重试同一路请求必须命中归还的 head 继续 turn 1，不是冷启动 turn 0。
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	if _, _, _, err := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil, conversationOptions{requestScope: "cont-thread"}); err != nil {
+		t.Fatalf("head 归还后重试应成功续接: %v", err)
+	}
+	if len(turns) != 2 || turns[1] != 1 {
+		t.Fatalf("归还的 head 应让重试继续 turn=1（不是冷启动 0）：turns=%v", turns)
+	}
+}
+
+// 真实入口回归：管理员把账号绑定的出口从 A 改成 B 后，携带旧出口记忆的续接
+// 必须强制冷启动——严格绑定的承诺是绝不从旧 IP 外发。
+func TestCallGeminiConvRebindForcesColdStart(t *testing.T) {
+	resetConvBoundState(t)
+	a, b := withTwoProxies(t, true)
+	// A 不占满：续接若不走冷启动会在旧出口上真发（桩可见 turn=1）。
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	acct := addTestAccount(t, "rebind")
+	bindAccountProxy(acct, a)
+	mc := Models["gemini-3.6-flash"]
+
+	var turns []int
+	var proxies []int64
+	stubConvTurnRealSlot(t, func(st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		proxies = append(proxies, st.proxyID)
+		st.cid = "rebind-conv"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "answer")}, nil
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "hello"}}
+	if _, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil, conversationOptions{requestScope: "rebind-thread"}); err != nil {
+		t.Fatal(err)
+	}
+	next := append(append([]map[string]interface{}{}, first...),
+		map[string]interface{}{"role": "assistant", "content": "answer"},
+		map[string]interface{}{"role": "user", "content": "follow"})
+
+	bindAccountProxy(acct, b) // 管理员改绑到 B
+	if _, _, _, err := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil, conversationOptions{requestScope: "rebind-thread"}); err != nil {
+		t.Fatalf("改绑后应冷启动成功: %v", err)
+	}
+	if len(turns) != 2 || turns[1] != 0 {
+		t.Fatalf("管理员改绑后必须冷启动（turn=0），不能在旧出口上续接 turn=1：turns=%v", turns)
+	}
+	if proxies[1] != b {
+		t.Fatalf("冷启动应带新绑定出口 %d 进会话，得到 %d", b, proxies[1])
+	}
+}
+
+// convFakeUpstream 把指定 proxyURL 的 stdlibClientCache（限时/不限时两个 key）
+// 换成走 rt 的假客户端——streamGenerateConv 的 /app（XSRF）与 StreamGenerate
+// 都走 stdlib 代理分支时被它接管。返回该 proxyURL。
+func convFakeUpstream(t *testing.T, proxyURL string, rt http.RoundTripper) string {
+	t.Helper()
+	timeout := rtCfg().RequestTimeout
+	for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+		stdlibClientCache.Store(proxyURL+suf, &http.Client{Transport: rt})
+	}
+	t.Cleanup(func() {
+		for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+			stdlibClientCache.Delete(proxyURL + suf)
+		}
+	})
+	return proxyURL
+}
+
+// R2 修复 2 回归：真实 streamGenerateConv 的 slot 记账——
+//   - 胜者改占（ok2=true）：胜者 slot 不泄漏、败方不双释放；
+//   - 败方重取胜者失败（ok2=false）：败方 slot 不双释放、胜者的占用保持。
+//
+// 用 claimMu 同步门把仲裁卡在临界区，主线程在期间改状态，跟真实并发首绑同构。
+// R3-M3：两个子例共用同一套「并发首绑」场景与哨兵计位——
+//   - 账号在库中保持未绑定（ProxyID=0），goroutine 拿 B 只是轮询落空；
+//   - PerIPConcurrent=2，slots[a]=2 满载迫使 acquireSlot(0) 必选 B，
+//     slots[b]=1 哨兵（借出变 2、单释放回 1、双释放跌 0），
+//     slots[0]=1 哨兵（误释放直连槽会跌 0）；
+//   - 主线程持 claimMu → goroutine 拿到 B 后阻塞在 claimAccountProxy 的锁上
+//     （轮询 slotUsage(b)==2 且 done 未关 = 确定性同步点，不用 sleep），
+//     主线程以 bindAccountProxyLocked 模拟并发胜者落库后再放锁。
+func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
+	// 轮询等待 goroutine 拿下 B 的 slot（inflight 1→2）并阻塞在 claimMu 上：
+	// 拿到 B 后唯一的锁点就是 claimAccountProxy，done 未关证明它还在临界区前。
+	waitBLoaned := func(t *testing.T, b int64, done chan struct{}) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for slotUsage(b).Inflight != 2 {
+			select {
+			case <-done:
+				t.Fatal("goroutine 在拿到 B 的 slot 之前就退出了")
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("goroutine 未在 5s 内拿到 B 的 slot：%+v", slotUsage(b))
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	t.Run("ok2 winner takes over without leak", func(t *testing.T) {
+		a, b := withTwoProxies(t, true)
+		rtMu.Lock()
+		rtVal.PerIPConcurrent = 2
+		rtMu.Unlock()
+		setSlotInflight := func(id int64, n int) {
+			s := getSlot(id)
+			s.mu.Lock()
+			s.inflight = n
+			s.mu.Unlock()
+		}
+		setSlotInflight(a, 2) // 满载迫使 acquireSlot(0) 必选 B
+		setSlotInflight(b, 1) // 哨兵：借出→2、单释放回 1、双释放跌 0
+		setSlotInflight(0, 1) // 哨兵：误释放直连槽会跌 0
+		acct := addTestAccount(t, "convwin")
+		// 库中保持未绑定：goroutine 先拿到 B，主线程稍后落库胜者 A。
+
+		claimMu.Lock()
+		done := make(chan struct{})
+		var res *StreamResult
+		var err error
+		conv := &convState{isLogin: true, accountID: acct,
+			cookie: "SAPISID=convwin; SID=x; __Secure-1PSID=convwin", turn: 0, proxyID: 0}
+		go func() {
+			defer close(done)
+			res, err = streamGenerateConv(context.Background(), "hi",
+				Models["gemini-3.6-flash"], conv, nil, nil)
+		}()
+		waitBLoaned(t, b, done)
+		// 模拟并发胜者落库，再给胜者 A 腾出 1 个并发位（2→1）：
+		// 放锁后败方释放 B、重取 A 必成功（ok2=true）。
+		bindAccountProxyLocked(acct, a)
+		setSlotInflight(a, 1)
+		claimMu.Unlock()
+		<-done
+		_ = res
+		// getXSRF 会真发请求（127.0.0.1:1 不可达）→ 失败，但 slot 必须先正确记账。
+		_ = err
+		// goroutine 拿走 A 又随 defer release() 归还：哨兵终态必须回到主线程占的 1——
+		// 泄漏留 2（旧实现 defer releaseSlot(p.ID) 记的是败方 B）。
+		if u := slotUsage(a); u.Inflight != 1 {
+			t.Fatalf("胜者 A 不能泄漏 slot（哨兵应回 1）：%+v", u)
+		}
+		if u := slotUsage(b); u.Inflight != 1 {
+			t.Fatalf("败方 B 必须单释放回哨兵 1（双释放会跌 0）：%+v", u)
+		}
+		if u := slotUsage(0); u.Inflight != 1 {
+			t.Fatalf("直连 slot 绝不能被误释放（哨兵应保持 1）：%+v", u)
+		}
+		// 会话跟库都必须绑到胜者 A。
+		if conv.proxyID != a {
+			t.Fatalf("会话应就地在胜者 A：%d", conv.proxyID)
+		}
+		if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
+			t.Fatalf("胜者绑定必须落库：%+v", acc)
+		}
+	})
+
+	t.Run("ok2 false loser never double releases", func(t *testing.T) {
+		a, b := withTwoProxies(t, true)
+		rtMu.Lock()
+		rtVal.PerIPConcurrent = 2
+		rtMu.Unlock()
+		setSlotInflight := func(id int64, n int) {
+			s := getSlot(id)
+			s.mu.Lock()
+			s.inflight = n
+			s.mu.Unlock()
+		}
+		setSlotInflight(a, 2) // 保持满载：败方重取 A 必然 !ok2
+		setSlotInflight(b, 1)
+		setSlotInflight(0, 1)
+		acct := addTestAccount(t, "convlose")
+		// 库中保持未绑定。
+
+		claimMu.Lock()
+		done := make(chan struct{})
+		var res *StreamResult
+		var err error
+		conv := &convState{isLogin: true, accountID: acct,
+			cookie: "SAPISID=convlose; SID=x; __Secure-1PSID=convlose", turn: 0, proxyID: 0}
+		go func() {
+			defer close(done)
+			res, err = streamGenerateConv(context.Background(), "hi",
+				Models["gemini-3.6-flash"], conv, nil, nil)
+		}()
+		waitBLoaned(t, b, done)
+		// 主线程以并发胜者落库 A，保持 A 满载后放锁：败方重取必然 !ok2。
+		bindAccountProxyLocked(acct, a)
+		claimMu.Unlock()
+		<-done
+
+		var rle *RateLimitError
+		if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+			t.Fatalf("败方重取胜者失败应报 Bound 429(出口 %d)：err=%v res=%+v", a, err, res)
+		}
+		if res == nil || res.AccountID != acct {
+			t.Fatalf("失败结果必须带会话账号：%+v", res)
+		}
+		if u := slotUsage(a); u.Inflight != 2 {
+			t.Fatalf("胜者 A 保持占用 2（主线程哨兵，goroutine 没拿过 A）：%+v", u)
+		}
+		if u := slotUsage(b); u.Inflight != 1 {
+			t.Fatalf("败方 B 必须单释放回哨兵 1（双释放会跌 0）：%+v", u)
+		}
+		if u := slotUsage(0); u.Inflight != 1 {
+			t.Fatalf("直连 slot 绝不能被误释放（哨兵应保持 1）：%+v", u)
+		}
+	})
+}
+
+// R2 修复 3 回归：真实 streamGenerateConv + fakeUpstreamServer 的续接行为。
+//   - 子例 A：续接轮上游回降级行（inner[42]=3.5 Flash-Lite）→ ModelDowngradedError
+//     后 convStore 必须为空（脏 head 绝不归还）、coolingAccounts 登记该号、
+//     下次冷启动自动跳过它挑到 acct2；
+//   - 子例 B：流中 ctx 取消 → convStore 为空（取消不能归还脏 head）。
+func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
+	// 假上游：/app 出 XSRF，StreamGenerate 按请求轮次决定行为。
+	var mu sync.Mutex
+	var genCalls int
+	var cancelHook func()
+	// reachedRead 随 cancelHook 一起设置：挂起路径的 blockingBody 首个 Read 关闭它，
+	// 子例 B 据此确定取消发生在已进入响应体读取之后（R3-M3，不用 sleep）。
+	var reachedRead chan struct{}
+	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp := func(status int, body string) *http.Response {
+			return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status),
+				Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}
+		}
+		switch req.URL.Path {
+		case "/app":
+			return resp(200, fakeAppTokens), nil
+		case "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate":
+			mu.Lock()
+			genCalls++
+			n := genCalls
+			hook := cancelHook
+			reached := reachedRead
+			mu.Unlock()
+			inner := make([]any, innerSlots)
+			if hook != nil {
+				// 子例 B：返回挂起的流式响应——Body 的 Read 阻塞到 ctx 取消，
+				// 让 readBody 真实走到 ctx.Err() 中断。
+				inner[1] = []any{"c_b", "r_1"}
+				inner[4] = []any{[]any{"rc_x", []any{"never"}}}
+			} else if n == 1 {
+				// 子例 A 首轮：正常帧带 cid/rid + 自报 3.5 Flash-Lite（降级）。
+				inner[1] = []any{"c_down", "r_1"}
+				inner[4] = []any{[]any{"rc_x", []any{"partial"}}}
+				inner[39], inner[42], inner[43] = hexFlash36, "3.5 Flash-Lite", true
+			} else {
+				inner[1] = []any{"c_b", "r_1"}
+				inner[4] = []any{[]any{"rc_x", []any{"never"}}}
+			}
+			ib, _ := json.Marshal(inner)
+			line, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(ib), nil}})
+			if hook != nil {
+				r := resp(200, "")
+				r.Body = &blockingBody{ctx: req.Context(), reachedRead: reached}
+				return r, nil
+			}
+			return resp(200, ")]}'\n"+string(line)+"\n"), nil
+		}
+		return resp(404, ""), nil
+	})
+	convFakeUpstream(t, "http://fake-exit.invalid:3128", rt)
+	// 代理池指向假出口（同 fakeUpstreamServer）：stdlib 代理分支被接管。
+	proxyMu.Lock()
+	oldProxies := proxyCache
+	proxyCache = []Proxy{{ID: 997, Name: "diag-test", URL: "http://fake-exit.invalid:3128", Enabled: true}}
+	proxyMu.Unlock()
+	t.Cleanup(func() { proxyMu.Lock(); proxyCache = oldProxies; proxyMu.Unlock() })
+
+	resetConversationTestState(t)
+	resetDowngrades(t)
+	mc := Models["gemini-3.6-flash"] // Upstream="3.6 Flash"，自报 3.5 Flash-Lite 判降级
+	rtMu.Lock()
+	oldCfg := rtVal
+	rtVal.AnonFirst = false
+	rtVal.StrictModel = true
+	rtVal.StrictModelCooldownMin = 300
+	rtVal.RetryAttempts, rtVal.RetryDelaySec = 1, 0
+	rtMu.Unlock()
+	t.Cleanup(func() { rtMu.Lock(); rtVal = oldCfg; rtMu.Unlock() })
+
+	acct1 := addTestAccount(t, "convacct1")
+	acct2 := addTestAccount(t, "convacct2")
+	// 两个号都带 __Secure-1PSID，browserAccountFromHeaders/反查不会因 "|" 短路。
+	for _, id := range []int64{acct1, acct2} {
+		_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+			fmt.Sprintf("SAPISID=c%d; SID=x; __Secure-1PSID=c%d", id, id), id)
+	}
+
+	// ── 子例 A：续接降级 → convStore 空 + 冷却登记 + 冷启动换号 ──
+	t.Run("downgrade", func(t *testing.T) {
+		// 手动种 head：模拟首轮续接已建立（turn=1 之后），绑 acct1 + 假出口 997。
+		// 不依赖首个 callGeminiConv 的真实首轮，专注续接失败路径。
+		first := []map[string]interface{}{{"role": "user", "content": "down-q"}}
+		scope := convScopeKey(mc, nil, nil, "downgrade-scope")
+		keys := convPrefixKeys(first, scope)
+		convPut(keys[len(keys)-1], &convState{
+			cid: "c_down", rid: "r_1", turn: 1, isLogin: true,
+			accountID: acct1, cookie: "SAPISID=c" + fmt.Sprint(acct1) + "; SID=x; __Secure-1PSID=c" + fmt.Sprint(acct1),
+			proxyID: 997,
+		})
+		next := append(append([]map[string]interface{}{}, first...),
+			map[string]interface{}{"role": "assistant", "content": "partial"},
+			map[string]interface{}{"role": "user", "content": "down-next"})
+
+		_, _, _, err := callGeminiConv(context.Background(), next, mc, nil, nil, nil, nil,
+			conversationOptions{requestScope: "downgrade-scope"})
+		var mde *ModelDowngradedError
+		if !errors.As(err, &mde) || mde.AccountID != acct1 {
+			t.Fatalf("续接降级应报 ModelDowngradedError(账号 %d)：err=%v", acct1, err)
+		}
+		// 脏 head 绝不归还：被消费的 key 不能回到 convStore。
+		convMu.Lock()
+		storeEmpty := len(convStore) == 0
+		convMu.Unlock()
+		if !storeEmpty {
+			t.Fatal("续接碰过上游后 head 绝不能归还到 convStore")
+		}
+		// 降级已登记该号该模型的冷却：下次冷启动自动跳过它。
+		cooling, _ := coolingAccounts(mc)
+		if !cooling[acct1] {
+			t.Fatalf("降级必须登记冷却：cooling=%v", cooling)
+		}
+		// 下一次冷启动（fresh）挑号必须跳过冷却中的 acct1 到 acct2。
+		fresh1 := []map[string]interface{}{{"role": "user", "content": "down-fresh"}}
+		var pickedID int64
+		stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+			pickedID = st.accountID
+			st.cid = "fresh-conv"
+			st.turn++
+			return &StreamResult{Raw: conversationTestRaw(t, "fresh-answer")}, nil
+		})
+		if _, _, _, err := callGeminiConv(context.Background(), fresh1, mc, nil, nil, nil, nil,
+			conversationOptions{requestScope: "downgrade-scope"}); err != nil {
+			t.Fatal(err)
+		}
+		if pickedID != acct2 {
+			t.Fatalf("冷启动应跳过冷却号 %d 挑到 %d，实际 %d", acct1, acct2, pickedID)
+		}
+	})
+
+	// ── 子例 B：流中取消 → convStore 空，脏 head 不归还 ──
+	t.Run("cancel mid-stream", func(t *testing.T) {
+		first := []map[string]interface{}{{"role": "user", "content": "cancel-q"}}
+		scope := convScopeKey(mc, nil, nil, "cancel-scope")
+		keys := convPrefixKeys(first, scope)
+		convPut(keys[len(keys)-1], &convState{
+			cid: "c_cancel", rid: "r_1", turn: 1, isLogin: true,
+			accountID: acct2, cookie: "SAPISID=c" + fmt.Sprint(acct2) + "; SID=x; __Secure-1PSID=c" + fmt.Sprint(acct2),
+			proxyID: 997,
+		})
+		next := append(append([]map[string]interface{}{}, first...),
+			map[string]interface{}{"role": "assistant", "content": "before"},
+			map[string]interface{}{"role": "user", "content": "cancel-next"})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		reached := make(chan struct{})
+		mu.Lock()
+		cancelHook = func() {} // 非 nil 标记走挂起路径（见 blockingBody）
+		reachedRead = reached
+		mu.Unlock()
+		// 确定性证明取消发生在 StreamGenerate 已进入响应体读取之后：blockingBody
+		// 首个 Read 关闭 reached，等到了才 cancel——不靠 sleep 猜时机（R3-M3）。
+		go func() {
+			<-reached
+			cancel()
+		}()
+		_, _, _, err := callGeminiConv(ctx, next, mc, nil, nil, nil, nil,
+			conversationOptions{requestScope: "cancel-scope"})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("流中取消应返回 context.Canceled，得到 %v", err)
+		}
+		// 被消费的 head 绝不能归还：cancel-scope 这一路在 convTake 后必须留空
+		//（A 子例冷启动成功落的 head 属于另一 scope，不在此断言范围内）。
+		convMu.Lock()
+		_, restored := convStore[keys[len(keys)-1]]
+		convMu.Unlock()
+		if restored {
+			t.Fatal("流中取消后脏 head 绝不能归还到 convStore")
+		}
+		mu.Lock()
+		cancelHook = nil
+		reachedRead = nil
+		mu.Unlock()
+	})
+}
+
+// R2 修复 4 回归：上游模型降级换号预算严格保持 maxCookieTries=3。
+// StrictProxyBinding 放宽的只该是给 Bound 受阻号的池大小预算——5 个健康出口
+// 账号依次降级（无 Bound）时，总上游尝试次数必须严格等于 3，不能被
+// total+maxCookieTries 放大成外发 5 次。
+func TestCallGeminiConvDowngradeBudgetStaysCappedAtThree(t *testing.T) {
+	resetConvBoundState(t)
+	resetDowngrades(t)
+	a, b := withTwoProxies(t, true)
+	// 5 个号：前 2 绑 A（此刻空闲），后 3 绑 B（空闲），全部健康可挑。
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	var ids []int64
+	for i := 0; i < 2; i++ {
+		id := addTestAccount(t, fmt.Sprintf("dega%d", i))
+		bindAccountProxy(id, a)
+		ids = append(ids, id)
+	}
+	for i := 0; i < 3; i++ {
+		id := addTestAccount(t, fmt.Sprintf("degb%d", i))
+		bindAccountProxy(id, b)
+		ids = append(ids, id)
+	}
+	mc := Models["gemini-3.6-flash"]
+	rtMu.Lock()
+	rtVal.StrictModel = true
+	rtVal.StrictModelCooldownMin = 300
+	rtMu.Unlock()
+
+	var calls int
+	// 桩真实出口（拿到 slot 成功）后返回降级错——等于上游那一发已发出且报了
+	// ModelDowngradedError：每个号一次，上层换号预算到顶必须停。
+	stubConvTurnRealSlot(t, func(st *convState) (*StreamResult, error) {
+		calls++
+		return &StreamResult{AccountID: st.accountID},
+			&ModelDowngradedError{Requested: mc.Upstream, Reported: "3.5 Flash-Lite", AccountID: st.accountID}
+	})
+	first := []map[string]interface{}{{"role": "user", "content": "budget-q"}}
+	_, _, _, err := callGeminiConv(context.Background(), first, mc, nil, nil, nil, nil,
+		conversationOptions{requestScope: "budget-scope"})
+	if err == nil {
+		t.Fatal("全部降级必须报错")
+	}
+	if calls != maxCookieTries {
+		t.Fatalf("降级换号预算必须严格是 %d 次上游尝试，实际 %d", maxCookieTries, calls)
+	}
+}
+
+// streamGenerateConv 绑定持久化：挑到的出口跟会话记的不一样时写库同步——
+// 首轮定出口与失效重绑共用这一条路径。
+func TestStreamGenerateConvPersistsRebind(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	acct := addTestAccount(t, "convrebind")
+	bindAccountProxy(acct, a)
+	conv := &convState{isLogin: true, accountID: acct, proxyID: a, cookie: "SAPISID=x; SID=y", turn: 0}
+	// 把 A 禁用：acquireSlot(a) 走轮询到 B，会话应就地重绑并持久化。
+	setProxyField(a, func(p *Proxy) { p.Enabled = false })
+	// getXSRF 会真发请求（127.0.0.1:1 立即失败）——只验证绑定已同步，
+	// 不关心上游结果。
+	_, _ = streamGenerateConv(context.Background(), "hi", Models["gemini-3.6-flash"], conv, nil, nil)
+	if conv.proxyID != b {
+		t.Fatalf("绑定出口失效后应就地换成 %d，得到 %d", b, conv.proxyID)
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != b {
+		t.Fatalf("重绑必须持久化到账号行：%+v", acc)
 	}
 }

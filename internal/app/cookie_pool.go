@@ -565,11 +565,19 @@ type CookieCheck struct {
 // 只抓页面，不发对话，不消耗生成配额。
 func checkAccountCookie(a CookieAccount) CookieCheck {
 	t0 := time.Now()
-	picked, ok, err := acquireSlot(a.ProxyID)
-	if !ok {
+	// 调用方手上是 accountList() 的陈旧快照：并发请求或手动改绑之后，库里的
+	// 绑定可能已经变了，必须先按库里当前值走（同 viaSlot 的刷新），绝不能拿
+	// 旧 ProxyID 去挑出口——严格绑定下拿旧值仲裁会误抢并发请求赢下的绑定。
+	if a.ID > 0 {
+		if cur := accountByID(a.ID); cur != nil {
+			a.ProxyID = cur.ProxyID
+		}
+	}
+	picked, release, err := acquireClaimedSlot(a.ID, a.ProxyID)
+	if picked == nil {
 		return CookieCheck{Detail: "拿不到出口：" + err.Error()}
 	}
-	defer releaseSlot(picked.ID)
+	defer release()
 	proxyURL := picked.URL
 	name := picked.Name
 	if name == "" {
@@ -590,7 +598,9 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
 	}
 	markAccountResult(a.ID, true, "")
-	if picked.ID > 0 && a.ProxyID != picked.ID {
+	// 严格绑定下绑定仲裁已在 acquireClaimedSlot 里完成：这里再无条件覆写会把
+	// 已仲裁出的胜者改成本次挑到的出口。非严格模式保留原写库语义（首次绑定/失效重绑）。
+	if !rtCfg().StrictProxyBinding && picked.ID > 0 && a.ProxyID != picked.ID {
 		bindAccountProxy(a.ID, picked.ID)
 	}
 	detail := "登录态有效"
@@ -618,12 +628,52 @@ func explainCookieFailure(err error) string {
 	}
 }
 
-// bindAccountProxy 记住这个账号这次用的出口，下次优先复用。
-func bindAccountProxy(accountID, proxyID int64) {
+// bindAccountProxyLocked 记住这个账号这次用的出口，下次优先复用。
+// 调用方必须持有 claimMu——锁外写库会覆盖 claimAccountProxy 刚仲裁出的胜者。
+func bindAccountProxyLocked(accountID, proxyID int64) {
 	if accountID <= 0 {
 		return
 	}
 	_, _ = getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`, proxyID, accountID)
+}
+
+// bindAccountProxy 是锁外入口（管理员 PATCH/POST 改绑、非严格模式的首绑/重绑落库）：
+// 加 claimMu 后与 claimAccountProxy 完全互斥——手动改绑不能插在「核库→写库」之间。
+func bindAccountProxy(accountID, proxyID int64) {
+	if accountID <= 0 {
+		return
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	bindAccountProxyLocked(accountID, proxyID)
+}
+
+// claimMu 把「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作。
+// 不加锁时两个并发请求同时拿到同一未绑定账号、各自 acquireSlot 选了不同出口，
+// 发完 getXSRF 才先后写 bindAccountProxy——后写覆盖先写，这个号已经从两个 IP
+// 外发过（strict_proxy_binding 想防的正是这个）。进程内一把锁就够（同 pickMu）。
+var claimMu sync.Mutex
+
+// claimAccountProxy 原子决定这个账号本次该走哪个出口（strict_proxy_binding 首绑仲裁）。
+//   - 已绑定且绑定出口仍然存在且 enabled：返回绑定值，不覆写——熔断冷却中的绑定
+//     照样算数（冷却会过），绝不能因为暂时不可用就覆写（否则并发请求会把一个
+//     还在冷却的号的绑定抢改成自己的出口）；
+//   - 未绑定 / 绑定已失效（删除或禁用）：把 candidateProxyID 写库并返回它（本次请求胜出）。
+//
+// 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
+// 必须释放手上的 slot、按返回值重新 acquireSlot——胜者是别的并发请求绑的。
+func claimAccountProxy(accountID, candidateProxyID int64) int64 {
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	cur := int64(0)
+	if a := accountByID(accountID); a != nil {
+		cur = a.ProxyID
+	}
+	if cur > 0 && proxyEnabledByID(cur) {
+		return cur
+	}
+	bindAccountProxyLocked(accountID, candidateProxyID)
+	return candidateProxyID
 }
 
 // accountDisplayName 面板/记录里显示的账号名，没填标签就用 #id。

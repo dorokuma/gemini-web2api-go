@@ -727,7 +727,7 @@ const pages = {
                     <button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button>
                     <button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>
                     <button class="btn muted" onclick="toggleCookieAcct(${a.id})">${a.status === 'enabled' ? '禁用' : '启用'}</button>
-                    <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')}, ${a.authuser || 0})">编辑</button>
+                    <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')}, ${a.authuser || 0}, ${a.proxy_id || 0})">编辑</button>
                     <button class="btn danger" onclick="delCookieAcct(${a.id})">删除</button>
                   </span>
                 </td>
@@ -1073,6 +1073,8 @@ const RT_GROUPS = [
         hint: '代理连续失败 5 次后歇多久再放回池子。实测被拦的出口 106-121 分钟自恢复，默认 120；0=不恢复，要去代理池页面手动重置' },
       { k: 'fallback_direct', label: '无可用代理时退回直连', type: 'bool',
         hint: '关：直接返回 429，本机 IP 不会暴露给上游（默认）。开：可用性优先，但上游会看到本机真实出口' },
+      { k: 'strict_proxy_binding', label: '账号严格绑定出口', type: 'bool',
+        hint: '每个号第一次用到哪个代理就绑定哪个。关：绑定的代理满了或在熔断冷却时换别的出口并重新绑定，可用性优先（默认）。开：这时只换号、不换出口，号都出不去就返回 429；同一个号始终从同一个 IP 出去。代理被删除或手动禁用时仍会重新绑定。在 Cookie 池里可以手动指定绑定' },
       { k: 'fallback_anon', label: 'cookie 失效时降级匿名', type: 'bool',
         hint: '关：直接报错，能立刻发现该换号了（默认）。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失，客户端看不出来' },
       { k: 'strict_model', label: '严格模型校验', type: 'bool',
@@ -1468,22 +1470,32 @@ function parseAuthUser(v) {
   return parseInt(s, 10);
 }
 
-async function editCookieAcct(id, label, note, authuser) {
+async function editCookieAcct(id, label, note, authuser, proxyId) {
+  const proxies = (await api('api/proxies')).items || [];
+  const proxyOptions = [{ value: '0', label: '自动（第一次用到哪个代理就绑哪个）' }]
+    .concat(proxies.map(p => ({ value: String(p.id), label: '#' + p.id + ' ' + (p.name || p.url) + (p.enabled ? '' : '（已禁用）') })));
+  const fields = [
+    { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
+    { name: 'authuser', label: '账号序号', value: String(authuser || 0),
+      hint: '浏览器里同时登了多个 Google 号时用：地址栏 /u/1/ 填 1，没有 /u/ 填 0。' },
+    { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
+  ];
+  if (proxies.length) {
+    fields.push({ name: 'proxy_id', label: '绑定出口', value: String(proxyId || 0), options: proxyOptions,
+      hint: '这个号固定从哪个代理出去。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。' });
+  }
   const data = await modalForm({
     title: '编辑 Cookie #' + id,
-    desc: '只改标签、备注和账号序号，不动 cookie 本身。要换 cookie 请删掉重新导入。',
-    fields: [
-      { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
-      { name: 'authuser', label: '账号序号', value: String(authuser || 0),
-        hint: '浏览器里同时登了多个 Google 号时用：地址栏 /u/1/ 填 1，没有 /u/ 填 0。' },
-      { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
-    ],
+    desc: '只改标签、备注、账号序号和绑定出口，不动 cookie 本身。要换 cookie 请删掉重新导入。',
+    fields,
   });
   if (!data) return;
   const au = parseAuthUser(data.authuser);
   if (au === null) return flash(t('账号序号要填 0 到 9 的整数'));
+  const body = { label: data.label, note: data.note, authuser: au };
+  if (data.proxy_id !== undefined) body.proxy_id = parseInt(data.proxy_id, 10) || 0;
   const j = await api('api/cookies/' + id, {
-    method: 'PATCH', body: JSON.stringify({ label: data.label, note: data.note, authuser: au }),
+    method: 'PATCH', body: JSON.stringify(body),
   });
   if (j.error) return flash(t('保存失败：') + t(j.error));
   flash(t('已保存'));
@@ -1767,9 +1779,11 @@ function modalForm({ title, desc, fields, submitText = '提交' }) {
   const html = fields.map(f => `
     <div class="field">
       <label>${escapeHtml(t(f.label))}${f.required ? ' *' : ''}</label>
-      <input data-name="${escapeHtml(f.name)}" type="${f.password ? 'password' : 'text'}"
+      ${f.options ? `<select data-name="${escapeHtml(f.name)}">${f.options.map(o =>
+        `<option value="${escapeHtml(o.value)}"${o.value === f.value ? ' selected' : ''}>${escapeHtml(t(o.label))}</option>`).join('')}</select>`
+      : `<input data-name="${escapeHtml(f.name)}" type="${f.password ? 'password' : 'text'}"
              placeholder="${escapeHtml(t(f.placeholder || ''))}"
-             value="${escapeHtml(f.value || '')}" />
+             value="${escapeHtml(f.value || '')}" />`}
       ${f.hint ? `<div class="hint">${escapeHtml(t(f.hint))}</div>` : ''}
     </div>`).join('');
   return buildModal({
@@ -2316,6 +2330,9 @@ const I18N_EN = {
   '自动跟随 bl 版本': 'Auto-follow bl version',
   '熔断冷却（分钟）': 'Circuit-breaker cooldown (min)',
   '无可用代理时退回直连': 'Fall back to direct when no proxy is available',
+  '账号严格绑定出口': 'Strict account-to-proxy binding',
+  '每个号第一次用到哪个代理就绑定哪个。关：绑定的代理满了或在熔断冷却时换别的出口并重新绑定，可用性优先（默认）。开：这时只换号、不换出口，号都出不去就返回 429；同一个号始终从同一个 IP 出去。代理被删除或手动禁用时仍会重新绑定。在 Cookie 池里可以手动指定绑定':
+    'Each account is bound to the first proxy it uses. Off: when the bound proxy is full or cooling down after failures, another proxy is used and the binding moves (availability first, default). On: another account is used instead and the proxy never changes; if no account can go out, it returns 429. An account always leaves from the same IP. Deleting or disabling a proxy still allows rebinding. The binding can be set manually in the Cookie pool',
   'cookie 失效时降级匿名': 'Downgrade to anonymous when cookie fails',
   '严格模型校验': 'Strict model check',
   '开：服务端自报的模型跟请求的不一致时（通常是这个号这一档额度用完、被静默降级），不把降级后的回答当成功返回，而是换下一个号重试；全池都被降级就回 429 insufficient_quota（code: model_downgraded）。流式在吐出第一个字之前就判断。关：照常返回降级后的回答（默认）':
@@ -2388,6 +2405,10 @@ const I18N_EN = {
   'cookie 里没有 SAPISID，多半没复制全': 'No SAPISID in the cookie — you probably did not copy it all',
   '导入': 'Import',
   '只改标签、备注和账号序号，不动 cookie 本身。要换 cookie 请删掉重新导入。': 'Edits only the label, note and account index, not the cookie itself. To replace the cookie, delete and re-import.',
+  '只改标签、备注、账号序号和绑定出口，不动 cookie 本身。要换 cookie 请删掉重新导入。': 'Edits only the label, note, account index and bound proxy, not the cookie itself. To replace the cookie, delete and re-import.',
+  '绑定出口': 'Bound proxy',
+  '自动（第一次用到哪个代理就绑哪个）': 'Automatic (bind to the first proxy used)',
+  '这个号固定从哪个代理出去。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。': 'Which proxy this account always uses. With "Strict account-to-proxy binding" on in Settings, it will not switch IP even when that proxy is full.',
   '账号序号': 'Account index',
   '浏览器里同时登了多个 Google 号才需要改：打开那个号的 Gemini，地址栏是 /u/1/ 就填 1，没有 /u/ 就是 0。同一串 cookie 想当几个号用，就导入几次、各填各的序号。':
     'Only needed when several Google accounts are signed in to the same browser: open Gemini as that account — if the address bar shows /u/1/, enter 1; no /u/ means 0. To use one cookie string as several accounts, import it once per account with its own index.',

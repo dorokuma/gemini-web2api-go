@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -84,5 +85,57 @@ func TestSummarizeQuota(t *testing.T) {
 	summarizeQuota(&q, now)
 	if q.Status != "available" || !strings.Contains(q.ResetSource, "estimated") {
 		t.Fatalf("recovered: %+v", q)
+	}
+}
+
+// R1 修复 4 回归：viaSlot 在挑到的出口跟账号记的不一样时持久化 bindAccountProxy
+// 并同步 acct.ProxyID——同一次额度查询的后续 RPC 沿用新出口，不跨 IP 漂移。
+func TestViaSlotPersistsRebind(t *testing.T) {
+	_, b := withTwoProxies(t, true) // A 被 withTwoProxies 占满
+	acct := addTestAccount(t, "viaslot")
+	// 未绑定的账号（ProxyID=0）：acquireSlot(0) 轮询到 B（A 满）。应写库 B。
+	var used string
+	ca := CookieAccount{ID: acct}
+	if err := viaSlot(&ca, func(url string) error { used = url; return nil }); err != nil {
+		t.Fatalf("viaSlot 应拿到空闲出口：%v", err)
+	}
+	if ca.ProxyID != b || used == "" {
+		t.Fatalf("首次绑定应就地同步 ProxyID=%d，得到 %d", b, ca.ProxyID)
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != b {
+		t.Fatalf("首次绑定必须落库：%+v", acc)
+	}
+
+	// 已绑 B 再调：绑定有效就不重写（B 仍空闲，acquireSlot(B) 命中 B）。
+	ca2 := CookieAccount{ID: acct, ProxyID: b}
+	if err := viaSlot(&ca2, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ca2.ProxyID != b {
+		t.Fatalf("绑定出口可用时不该换：%d", ca2.ProxyID)
+	}
+}
+
+// R2 修复 2 回归：viaSlot 必须尊重库里已落库的绑定——陈旧快照（ProxyID=0）
+// 不能绕过并发/手动绑定去打别的出口。库里绑的是满载 A 时，陈旧 ProxyID=0
+// 的 viaSlot 必须报 Bound 429、fn 一次都不被调用、库里绑定保持 A。
+func TestViaSlotStrictBindingRespectsExistingClaim(t *testing.T) {
+	a, _ := withTwoProxies(t, true) // A 被占满
+	acct := addTestAccount(t, "viaslotclaim")
+	bindAccountProxy(acct, a) // 库里已绑满载 A
+
+	// 陈旧快照：调用方手上是 accountList() 之前的 ProxyID=0。
+	stale := CookieAccount{ID: acct, ProxyID: 0}
+	called := false
+	err := viaSlot(&stale, func(string) error { called = true; return nil })
+	var rle *RateLimitError
+	if err == nil || !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+		t.Fatalf("陈旧快照绝不能绕过已绑定的满载 A：err=%v", err)
+	}
+	if called {
+		t.Fatal("Bound 受阻时 fn 绝不能被调用（不能外发）")
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
+		t.Fatalf("库里绑定必须保持 A：%+v", acc)
 	}
 }
