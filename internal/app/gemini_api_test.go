@@ -367,6 +367,9 @@ func TestV1GeminiAction(t *testing.T) {
 // 提前舍入。多轮续接前缀里，9007199254740992 与 …993 在 canonicalToolArguments
 // 里是不同参数：入口若先解成 float64 就都成 …992，变异历史会撞同一份前缀
 // 指纹错误续接。对照组回放相同历史必须命中续接，变异组必须冷启动。
+// 利用 convTake「仅命中才删 head」的语义：先发变异组（必 miss，不消耗首轮
+// 留下的 head），再发对照组（必 hit 首轮 head）——若顺序反了，对照组先把
+// head 消费掉，变异组即使撞指纹也必 miss，测试就假绿。
 func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
 	resetConversationTestState(t)
 	rtMu.Lock()
@@ -417,25 +420,26 @@ func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
 	if fcID == "" {
 		t.Fatalf("first turn must emit a functionCall with an id: %v", first)
 	}
-	// 对照组次轮：回放首轮 + 含同一份 …992 functionCall（带真实 id）与
-	// functionResponse 的 model/user 轮 + 新 user —— 与首轮 head 同前缀，必须
-	// 命中续接（turn 1）。
-	post(`{"contents":[` +
-		`{"role":"user","parts":[{"text":"look it up"}]},` +
-		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740992}}}]},` +
-		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
-		`{"role":"user","parts":[{"text":"again"}]}` +
-		`]` + tools + `}`)
-	// 变异组第三轮：其余完全相同，仅 args.id 改为 …993 —— 前缀指纹不同必须冷
-	// 启动（turn 0）；若入口把 args 解成 float64，两组撞同指纹会错误续接。
+	// 变异组次轮（先发）：其余与首轮相同，仅 args.id 改为 …993 —— 必须 miss
+	// （turn 0）且不消耗首轮 head。若入口把 args 解成 float64，…993 与首轮存的
+	// …992 撞同一份指纹，这里就会错误续接（turn 1）露出假阳。
 	post(`{"contents":[` +
 		`{"role":"user","parts":[{"text":"look it up"}]},` +
 		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740993}}}]},` +
 		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
 		`{"role":"user","parts":[{"text":"again"}]}` +
 		`]` + tools + `}`)
-	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
-		t.Fatalf("identical replay must continue, >2^53 args mutation must cold-start: turns=%v", turns)
+	// 对照组第三轮：回放首轮 + 含同一份 …992 functionCall（带真实 id）与
+	// functionResponse 的 model/user 轮 + 新 user —— 首轮 head 还在（变异组
+	// miss 没消费它），必须命中续接（turn 1）。
+	post(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"look it up"}]},` +
+		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740992}}}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
+		`{"role":"user","parts":[{"text":"again"}]}` +
+		`]` + tools + `}`)
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
+		t.Fatalf("args mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
 	}
 }
 

@@ -8,6 +8,11 @@ import (
 // textPartTypes 是 content/output 数组里算纯文本的 part 类型。
 var textPartTypes = map[string]bool{"text": true, "input_text": true, "output_text": true}
 
+// textPartKeys 是纯文本 part 允许出现的全部键。普通业务 JSON 对象（比如
+// {"type":"text","name":"username","value":"alice"}）也带 "type":"text"，
+// 多出业务字段就必须走序列化保数据，不能当文本 part 拍平。
+var textPartKeys = map[string]bool{"type": true, "text": true, "annotations": true, "logprobs": true}
+
 // mediaPartTypes 是 content/output 数组里算媒体 part 的已知类型，跟
 // rejectUnsupported / collectImages 的 case 名单一致。判不准的后果要么把
 // 媒体数组拍平丢图（绕过匿名校验），要么把普通 JSON 数据数组误当媒体保留，
@@ -57,6 +62,8 @@ func nonTextParts(content interface{}) bool {
 
 // allTextParts 判断数组是否全部是 map 形态的纯文本 part（text / input_text /
 // output_text）。空数组返回 false —— 空数组按普通数据走序列化，不当纯文本。
+// 每个元素还必须真的带 string 型 "text" 键且不含其它业务字段：只认 type 会把
+// {"type":"text","name":"username","value":"alice"} 这类业务对象误拍成 ""。
 func allTextParts(content interface{}) bool {
 	parts, ok := content.([]interface{})
 	if !ok || len(parts) == 0 {
@@ -66,6 +73,14 @@ func allTextParts(content interface{}) bool {
 		cm, ok := c.(map[string]interface{})
 		if !ok || !textPartTypes[getStr(cm, "type")] {
 			return false
+		}
+		if _, hasText := cm["text"].(string); !hasText {
+			return false
+		}
+		for k := range cm {
+			if !textPartKeys[k] {
+				return false
+			}
 		}
 	}
 	return true
@@ -155,7 +170,16 @@ func responsesToMessages(req map[string]interface{}) []map[string]interface{} {
 			assistant = map[string]interface{}{"role": "assistant", "content": ""}
 			messages = append(messages, assistant)
 		}
-		assistant["content"] = getStr(assistant, "content") + text
+		if existing, ok := assistant["content"].([]interface{}); ok {
+			// content 已被保留成 part 数组（含媒体）时绝不能按字符串覆写：覆写会把
+			// 媒体与已存文本一起丢掉、让 rejectUnsupported 看不见媒体。text 为空就原样
+			// 保留；非空则补一个 text part 追加，不丢已保留的 part。
+			if text != "" {
+				assistant["content"] = append(existing, map[string]interface{}{"type": "text", "text": text})
+			}
+		} else {
+			assistant["content"] = getStr(assistant, "content") + text
+		}
 		if len(calls) > 0 {
 			existing, _ := assistant["tool_calls"].([]interface{})
 			assistant["tool_calls"] = append(existing, calls...)

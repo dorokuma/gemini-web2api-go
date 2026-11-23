@@ -345,10 +345,12 @@ func TestResponsesInputSyntheticCallIDsAvoidExplicit(t *testing.T) {
 	}
 }
 
-// 探针 2B：多轮回放里 function_call_output.output 对象的大整数不能经
+// 探针 2B：多轮回放里 function_call / function_call_output 的大整数不能经
 // float64 提前舍入 —— 9007199254740993 与 …992 在续接前缀指纹里必须不同。
 // 若解码/序列化丢了精度（output 数组被误当媒体保留除外），两条不同历史的
 // 前缀会撞同一份指纹导致串话续接；精度保住时对照组命中续接、变异组冷启动。
+// 均利用 convTake「仅命中才删 head」：先发变异组（必 miss、不消耗已存 head），
+// 再发对照组（必 hit）；反序则对照组先消费 head，变异组拍平也必 miss，假绿。
 func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 	resetConversationTestState(t)
 	rtMu.Lock()
@@ -363,7 +365,9 @@ func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 		st.turn++
 		text := "ok"
 		if len(prompts) == 1 {
-			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{}}\n```"
+			// 会话1首轮回 …992 大整数 arguments 的 fence：对照组回放同一份才命中，
+			// 变异组 …993 必须 miss。arguments 若被解成 float64 会撞指纹。
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{\"id\":9007199254740992}}\n```"
 		}
 		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
 	})
@@ -403,26 +407,73 @@ func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 		t.Fatalf("first turn must emit a function_call output item: %#v", first["output"])
 	}
 	callID := output[0].(map[string]interface{})["call_id"]
-	replay := func(id string) []interface{} {
-		return []interface{}{firstUser, output[0],
+
+	// ── arguments 覆盖：function_call.arguments 大整数进指纹 ──
+	// Turn 2 变异组（先发）：arguments …993 必须 miss（turn 0）且不消耗首轮 head；
+	// 若 arguments 被解成 float64，…993 与首轮存的 …992 撞同指纹会错误续接。
+	// 首轮 head 只有 [user, assistant] 两层，function_call_output/user 后缀不算。
+	callHead := map[string]interface{}{"type": "function_call", "call_id": callID,
+		"name": "lookup", "arguments": `{"id":9007199254740992}`}
+	callReplay := func(fc map[string]interface{}, id string) []interface{} {
+		return []interface{}{firstUser, fc,
 			map[string]interface{}{"type": "function_call_output", "call_id": callID,
 				"output": map[string]interface{}{"id": json.Number(id)}},
 			map[string]interface{}{"role": "user", "content": "again"}}
 	}
-	// 对照组次轮：回放首轮 + 真实 function_call + output 大整数 …992 + 新 user ——
-	// 与 head 同前缀，必须命中续接（turn 1）。
-	req["input"] = replay("9007199254740992")
+	// 变异组换 call_id：撞不进首轮 head（arguments …993 也不同），必 cold-start
+	// 且不消耗首轮 head。若 arguments 被解成 float64，…993 会同 …992 撞指纹，
+	// 但 call_id 不同仍冷启动——本条只能验 arguments 精度，靠对照组回合续接。
+	mutationCall := map[string]interface{}{"type": "function_call", "call_id": "call_mut",
+		"name": "lookup", "arguments": `{"id":9007199254740993}`}
+	req["input"] = callReplay(mutationCall, "1")
 	call()
-	// 变异组第三轮：其余完全相同，仅 output 大整数改为 …993 —— 前缀指纹不同必须
-	// 冷启动（turn 0）；若 output 被提前舍入或拍平，两组撞同指纹会错误续接。
-	req["input"] = replay("9007199254740993")
+	// Turn 3 对照组：回放首轮 + arguments …992 + 新 user —— 首轮 head 还在（变异组
+	// miss 没消费它），必须命中续接（turn 1）。
+	req["input"] = callReplay(callHead, "1")
 	call()
-	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
-		t.Fatalf("identical replay must continue, >2^53 mutation must cold-start: turns=%v", turns)
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
+		t.Fatalf("arguments mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
 	}
-	// output 里的大整数也要以精确字符串进上游 prompt（不许舍成 …992）。
-	if !strings.Contains(prompts[2], "9007199254740993") || strings.Contains(prompts[2], "9007199254740992") {
-		t.Fatalf("large integer output must stay exact in prompt: %q", prompts[2])
+
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
+		t.Fatalf("arguments mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
+	}
+
+	// ── output 覆盖：function_call_output.output 大整数进指纹 ──
+	// 另起一条会话专测 output：user2 作新首轮，回放会话1真实 function_call 让
+	// [u2,A2] 与后续前缀一致。T4 输入 [u2,A2,fco(992),u] 建 head（落末尾键=
+	// [u2,A2,t,u,"ok"]）；fco 自此进指纹。T5 变异（fco …993）先发必 miss 不耗
+	// head；T6 对照（fco …992）后发 hit（prefix=5）。若 output 被提前舍入/拍
+	// 平，变异组会与对照组撞同指纹错误续接——是真断言。
+	user2 := map[string]interface{}{"role": "user", "content": "output-session"}
+	fco992 := map[string]interface{}{"type": "function_call_output", "call_id": callID,
+		"output": map[string]interface{}{"id": json.Number("9007199254740992")}}
+	fco993 := map[string]interface{}{"type": "function_call_output", "call_id": callID,
+		"output": map[string]interface{}{"id": json.Number("9007199254740993")}}
+	assistantOK := map[string]interface{}{"role": "assistant", "content": "ok"}
+	newTail := map[string]interface{}{"role": "user", "content": "more"}
+	// T4：会话2首轮输入（未命中任何 head，cold-start）落 [u2,A2,fco,u,"ok"]。
+	req["input"] = []interface{}{user2, output[0], fco992,
+		map[string]interface{}{"role": "user", "content": "again"}}
+	call()
+	history2 := func(f map[string]interface{}) []interface{} {
+		return []interface{}{user2, output[0], f,
+			map[string]interface{}{"role": "user", "content": "again"}, assistantOK, newTail}
+	}
+	// T5 变异组（先发）：fco …993 必 miss（turn 0）、不消耗 T4 落的 head。
+	req["input"] = history2(fco993)
+	call()
+	// T6 对照组：5 条前缀（含 fco …992）命中 T4 落键（prefix=5，st.turn=1）。
+	req["input"] = history2(fco992)
+	call()
+	if len(turns) != 6 || !reflect.DeepEqual(turns, []int{0, 0, 1, 0, 0, 1}) {
+		t.Fatalf("output mutation must cold-start, identical replay must continue: turns=%v", turns)
+	}
+	// output 大整数要精确进 prompt：T5 变异组冷启动发全量，tool result 里的
+	// {"id":…993} 不许舍成 …992（历史 output[0].arguments 的 …992 是回放值，
+	// 与 tool result 的 id 分开断言）。
+	if !strings.Contains(prompts[4], `Tool result for lookup]: {"id":9007199254740993}`) {
+		t.Fatalf("mutation output must stay exact in prompt: %q", prompts[4])
 	}
 }
 
@@ -456,7 +507,7 @@ func TestRejectUnsupportedNAboveOneUseNumber(t *testing.T) {
 		"chat completions": "/v1/chat/completions",
 		"responses":        "/v1/responses",
 	} {
-		for _, n := range []string{"3", "2.5", "1e20"} {
+		for _, n := range []string{"3", "2.5", "1e20", "1e309"} {
 			t.Run(label+" n="+n, func(t *testing.T) {
 				var body string
 				if path == "/v1/chat/completions" {
@@ -490,6 +541,11 @@ func TestRejectUnsupportedNAboveOneUseNumber(t *testing.T) {
 	}
 	if err := rejectUnsupported(map[string]interface{}{"n": float64(3)}, nil); err == nil {
 		t.Fatal("float64 n=3 (Gemini candidateCount path) must still be rejected")
+	}
+	// 溢出 float64 的 n（1e309 → ErrRange）以前 err!=nil 就跳过拒绝，等于放行
+	// 一个 >1 的 n；解析失败 / 大于 1 一律拒。
+	if err := rejectUnsupported(map[string]interface{}{"n": json.Number("1e309")}, nil); err == nil {
+		t.Fatal("json.Number n=1e309 (float64 overflow) must still be rejected")
 	}
 }
 
@@ -562,6 +618,8 @@ func TestResponsesInputFunctionCallOutputDataArrays(t *testing.T) {
 // Must-Fix 2B：回放里 function_call_output.output 数据数组改了内容就必须冷启动
 // —— 旧实现把数组当媒体保留，contentToString 全拍成空串，两份不同 output 撞同
 // 一份指纹串话续接。对照组保持 alpha 必须命中续接。
+// 同样先发变异组（miss、不消耗 Turn 2 落的 head）再发对照组（hit）：若先发对照组，
+// head 被消费后变异组怎么改都 miss，数据数组被拍平也照样绿灯。
 func TestResponsesInputFunctionCallOutputFingerprint(t *testing.T) {
 	resetConversationTestState(t)
 	rtMu.Lock()
@@ -613,22 +671,38 @@ func TestResponsesInputFunctionCallOutputFingerprint(t *testing.T) {
 		t.Fatalf("first turn must emit a function_call output item: %#v", first["output"])
 	}
 	callID := output[0].(map[string]interface{})["call_id"]
-	replay := func(val string) []interface{} {
-		return []interface{}{firstUser, output[0],
-			map[string]interface{}{"type": "function_call_output", "call_id": callID,
-				"output": []interface{}{map[string]interface{}{"id": 1, "val": val}}},
-			map[string]interface{}{"role": "user", "content": "again"}}
+	fco := func(val string) map[string]interface{} {
+		return map[string]interface{}{"type": "function_call_output", "call_id": callID,
+			"output": []interface{}{map[string]interface{}{"id": 1, "val": val}}}
 	}
-	// 对照组次轮：回放首轮 + 真实 function_call + output alpha + 新 user —— 与
-	// head 同前缀，必须命中续接（turn 1）。
-	req["input"] = replay("alpha")
+	// Turn 2 带 fco(alpha) 命中首轮 head（turn=1）并把 5 消息历史落为新 head：
+	// [user go, assistant(call), tool(alpha), user again, assistant "ok"]（落键=
+	// 客户端输入+回复）——fco(alpha) 自此进入已存指纹（旧测试先跑对照组消费
+	// head，fco 从未进过指纹）。
+	req["input"] = []interface{}{firstUser, output[0], fco("alpha"),
+		map[string]interface{}{"role": "user", "content": "again"}}
 	call()
-	// 变异组第三轮：其余完全相同，仅 output 数据数组内容改 beta —— 数据数组若被
-	// 拍平成空串，两组指纹相同会错误续接；序列化保住内容则前缀不同必须冷启动。
-	req["input"] = replay("beta")
+	// 6 项客户端输入：5 条已存前缀 [u,A(call),t(fco),u,A"ok"] + 新 user。命中后
+	// 新增只有末尾 user，续接增量非空。
+	assistantOK := map[string]interface{}{"role": "assistant", "content": "ok"}
+	history := func(f map[string]interface{}) []interface{} {
+		return []interface{}{firstUser, output[0], f,
+			map[string]interface{}{"role": "user", "content": "again"}, assistantOK,
+			map[string]interface{}{"role": "user", "content": "more"}}
+	}
+	// Turn 3 变异组（先发）：fco 数据数组内容改 beta 且换 call_id，必 miss
+	// （turn 0）不消耗 Turn 2 落的 head；数据数组若被拍平成空串，也只能靠
+	// 对照组回合续接验证（call_id 不同，撞不进任何已存 head）。
+	mutationFco := map[string]interface{}{"type": "function_call_output", "call_id": "call_mut",
+		"output": []interface{}{map[string]interface{}{"id": 1, "val": "beta"}}}
+	req["input"] = history(mutationFco)
 	call()
-	if len(turns) != 3 || turns[0] != 0 || turns[1] != 1 || turns[2] != 0 {
-		t.Fatalf("identical replay must continue, changed data output must cold-start: turns=%v", turns)
+	// Turn 4 对照组：前缀全同（含 fco(alpha)）必须命中 Turn 2 head 续接
+	//（prefix=5，st.turn=2）。
+	req["input"] = history(fco("alpha"))
+	call()
+	if len(turns) != 4 || !reflect.DeepEqual(turns, []int{0, 1, 0, 2}) {
+		t.Fatalf("changed data output must cold-start, identical replay must continue: turns=%v", turns)
 	}
 }
 
@@ -671,6 +745,140 @@ func TestResponsesInputAssistantMediaRejects(t *testing.T) {
 	]}`)
 	if len(messages) != 1 || getStr(messages[0], "content") != "hello there" {
 		t.Fatalf("pure-text assistant replay must still flatten: %#v", messages)
+	}
+}
+
+// Must-Fix：appendAssistant 不能把已保留媒体的 assistant content 数组覆写成
+// 字符串 —— 覆写会把媒体与已存文本一起丢掉、让 rejectUnsupported 看不见
+// input_audio。媒体数组原样保留（拒 400），后续文本也只能追加成 text part。
+func TestResponsesInputAssistantMediaPreservedAcrossFollowUps(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var upstream int
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		upstream++
+		st.cid = "assistant-media-followup-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "ok")}, nil
+	})
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer assistant-media-followup")
+		w := httptest.NewRecorder()
+		handleResponses(w, r)
+		return w
+	}
+	// 媒体 assistant（output_text + input_audio）后接顶层 function_call（带
+	// text=""）+ user：空文本不许把媒体数组覆写成 ""，input_audio 必须仍被
+	// rejectUnsupported 拒成 400，不触上游。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"role":"assistant","content":[{"type":"output_text","text":"part1"},{"type":"input_audio","data":"AAAA"}]},
+		{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 400 || !strings.Contains(w.Body.String(), "audio input not supported") {
+		t.Fatalf("assistant media + top-level function_call must still be rejected: %d %s", w.Code, w.Body.String())
+	}
+	// 媒体 assistant 后接普通文本 assistant（part2）+ user：文本追加成 part，
+	// 不丢媒体、仍拒 400。
+	if w := post(`{"model":"gemini-3.5-flash-lite","input":[
+		{"role":"assistant","content":[{"type":"output_text","text":"part1"},{"type":"input_audio","data":"AAAA"}]},
+		{"role":"assistant","content":"part2"},
+		{"role":"user","content":"go"}
+	]}`); w.Code != 400 || !strings.Contains(w.Body.String(), "audio input not supported") {
+		t.Fatalf("assistant media + text assistant must still be rejected: %d %s", w.Code, w.Body.String())
+	}
+	if upstream != 0 {
+		t.Fatalf("rejected requests must not reach upstream: %d calls", upstream)
+	}
+	// 归一化后 part1 / part2 与媒体 part 都要留住：part1 仍是 output_text，part2
+	// 追加成 text part，input_audio 不被字符串覆写丢掉。
+	messages := responseInputFixture(t, `{"input":[
+		{"role":"assistant","content":[{"type":"output_text","text":"part1"},{"type":"input_audio","data":"AAAA"}]},
+		{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},
+		{"role":"assistant","content":"part2"},
+		{"role":"user","content":"go"}
+	]}`)
+	if len(messages) != 2 || getStr(messages[0], "role") != "assistant" {
+		t.Fatalf("media + call + text must coalesce into one assistant turn: %#v", messages)
+	}
+	parts, ok := messages[0]["content"].([]interface{})
+	if !ok {
+		t.Fatalf("media content must stay a []interface{}, got %#v", messages[0]["content"])
+	}
+	var sawPart1, sawPart2, sawAudio bool
+	for _, raw := range parts {
+		part, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch getStr(part, "type") {
+		case "output_text":
+			if getStr(part, "text") == "part1" {
+				sawPart1 = true
+			}
+		case "text":
+			if getStr(part, "text") == "part2" {
+				sawPart2 = true
+			}
+		case "input_audio":
+			sawAudio = true
+		}
+	}
+	if !sawPart1 || !sawPart2 || !sawAudio {
+		t.Fatalf("media and text parts must all be preserved: %#v", parts)
+	}
+	if calls, _ := messages[0]["tool_calls"].([]interface{}); len(calls) != 1 {
+		t.Fatalf("top-level function_call must stay on the assistant turn: %#v", messages[0]["tool_calls"])
+	}
+}
+
+// Should-Fix：allTextParts 只认带 string 型 "text" 键且无业务字段的标准文本
+// part —— {"type":"text","name":"username","value":"alice"} 是普通业务
+// JSON，不能被拍平成 "" 丢数据、也不能打出「无输出」。
+func TestResponsesInputFunctionCallOutputBusinessTextPartKeepsData(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var prompts []string
+	stubConversationTestTurn(t, func(_ context.Context, prompt string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		prompts = append(prompts, prompt)
+		st.cid = "business-text-conversation"
+		st.turn++
+		return &StreamResult{Raw: conversationTestRaw(t, "ok")}, nil
+	})
+	body := `{"model":"gemini-3.5-flash-lite","input":[
+		{"type":"function_call","call_id":"c1","name":"get_user","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[{"type":"text","name":"username","value":"alice"}]},
+		{"role":"user","content":"go"}
+	]}`
+	r := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer business-text-caller")
+	w := httptest.NewRecorder()
+	handleResponses(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+	}
+	// messages 层也不能把业务对象拍成空串。
+	messages := responseInputFixture(t, body)
+	if len(messages) != 3 || getStr(messages[1], "role") != "tool" {
+		t.Fatalf("messages=%#v", messages)
+	}
+	toolContent, ok := messages[1]["content"].(string)
+	if !ok || !strings.Contains(toolContent, "username") || !strings.Contains(toolContent, "alice") {
+		t.Fatalf("business JSON must be serialized, not flattened: %#v", messages[1]["content"])
+	}
+	if strings.Contains(toolContent, "无输出") {
+		t.Fatalf("business JSON must not claim empty output: %#v", toolContent)
+	}
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "username") || !strings.Contains(prompts[0], "alice") {
+		t.Fatalf("business JSON must reach the prompt intact: %v", prompts)
+	}
+	if strings.Contains(prompts[0], "无输出") {
+		t.Fatalf("prompt must not claim empty tool output: %s", prompts[0])
 	}
 }
 

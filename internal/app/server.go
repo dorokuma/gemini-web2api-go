@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -109,8 +110,11 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 			return fmt.Errorf("n=%v not supported: upstream returns a single candidate", n)
 		}
 	case json.Number:
-		if v, err := n.Float64(); err == nil && v > 1 {
-			return fmt.Errorf("n=%v not supported: upstream returns a single candidate", n)
+		// 1e309 之类溢出 float64 时 Float64() 返回 ErrRange —— 旧写法 err!=nil 就跳过
+		// 拒绝，等于放行了一个 >1 的 n。解析失败 / NaN / 大于 1 一律拒（不引入
+		// math/big：无限长数字串会放大成内存 DoS）。
+		if v, err := n.Float64(); err != nil || math.IsNaN(v) || v > 1 {
+			return fmt.Errorf("n=%s not supported: upstream returns a single candidate", n.String())
 		}
 	}
 	for _, m := range messages {
