@@ -3832,11 +3832,10 @@ func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
 	t.Run("resident race clears nothing and late-event timeout leaks no once", func(t *testing.T) {
 		srv := newFakeCDPServer(t)
 		defer srv.close()
-		client, bridge := newTestClientAndBridge(t, srv)
 
 		// 驻留号 seedID 绑定一个不存在的代理 → resolveResidentExit 判
 		// 绑定失效需清 Jar；进 jarRW 复核时驻留已并发切到 acct2（启用、
-		// 锁定直连=绑定有效）→ 必须按 acct2 的直连出口导航、绝不发
+		// 绑定可用代理）→ 必须按 acct2 的绑定出口对齐、绝不发
 		// Network.clearBrowserCookies 抹掉刚切好的驻留 Jar。
 		seedID, err := accountInsert("stale-resident",
 			"SAPISID=sa; __Secure-1PSID=sp; SID=s", "")
@@ -3854,26 +3853,54 @@ func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
 			t.Fatalf("insert swapped resident: %v", err)
 		}
 		defer accountDelete(acct2)
+		pxID, err := proxyCreate("race-exit", "http://127.0.0.1:18090", 1)
+		if err != nil {
+			t.Fatalf("create race proxy: %v", err)
+		}
+		defer proxyDelete(pxID)
 		if _, err := getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`,
-			proxyIDDirect, acct2); err != nil {
-			t.Fatalf("lock swapped resident to direct: %v", err)
+			pxID, acct2); err != nil {
+			t.Fatalf("bind swapped resident to race proxy: %v", err)
 		}
 
-		m := &browserManager{}
+		// 用全局 browserMgr + 真 bridge：syncBridgeUpstream 经
+		// currentBridge() 只认 browserMgr.bridge，局部 m.bridge 测不到
+		// 真实 SetUpstream。fakeCDPServer 只 Accept 一次——wire 用它
+		// 自带的 dial，不能再复用 newTestClientAndBridge 的连接。
+		bridge, err := newBrowserProxyBridge()
+		if err != nil {
+			t.Fatalf("newBrowserProxyBridge: %v", err)
+		}
+		defer bridge.Shutdown(context.Background())
+		unwire := wireTestBrowserBridge(t, srv, bridge)
+		defer unwire()
+		m := browserMgr
 		m.mu.Lock()
 		m.seed = browserSeedState{AccountID: seedID}
-		m.bridge = bridge
 		m.mu.Unlock()
-		// 模拟并发同身份快路径已在拿到 jarRW 之前完成切号：复核时
-		// m.seed.AccountID 已是 acct2——clearResidentJarIfNeeded 锁内
-		// 按实时驻留号重算，绝不按旧快照清 Jar。
+
+		// 主协程先持 jarRW.RLock：alignResidentAndNavigate 按旧快照
+		// seedID 判得 clearJar==true 后进 clearResidentJarIfNeeded 时
+		// 必然阻塞在 jarRW.Lock() 上——这段窗口就是「拿到锁前并发切号」
+		// 的注入口（旧实现复核段的双重 Unlock 会在此后 panic）。
+		m.jarRW.RLock()
+		entered := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			defer close(entered)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			done <- m.alignResidentAndNavigate(ctx, m.client, "fake-session-1")
+		}()
+		time.Sleep(150 * time.Millisecond) // 让子协程确实阻塞在 jarRW.Lock
+		// 模拟并发同身份快路径在清 Jar 拿到锁之前完成切号：锁内复核
+		// 必须读实时 m.seed=acct2，直接按它的绑定出口对齐、绝不清 Jar。
 		m.mu.Lock()
 		m.seed = browserSeedState{AccountID: acct2}
 		m.mu.Unlock()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := m.alignResidentAndNavigate(ctx, client, "fake-session-1"); err != nil {
+		m.jarRW.RUnlock()
+		<-entered
+		if err := <-done; err != nil {
 			t.Fatalf("alignResidentAndNavigate: %v", err)
 		}
 		for {
@@ -3893,19 +3920,19 @@ func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
 		if gotSeed != acct2 {
 			t.Fatalf("并发切号后 seed 被覆写：got %d want %d", gotSeed, acct2)
 		}
-		// 按 acct2 锁定直连的出口对齐：bridgeActiveURL="" + allowDirect。
+		// 桥真实切到了 acct2 绑定的代理出口。
 		m.bridgeMu.Lock()
-		activeURL, activeDirect := m.bridgeActiveURL, m.bridgeActiveDirect
+		activeURL := m.bridgeActiveURL
 		m.bridgeMu.Unlock()
-		if activeURL != "" || !activeDirect {
-			t.Fatalf("对齐出口 = (%q,%v)，acct2 锁定直连应得 (\"\",true)",
-				activeURL, activeDirect)
+		wantURL := proxyURLByID(pxID)
+		if activeURL != wantURL {
+			t.Fatalf("bridgeActiveURL = %q，acct2 绑定出口应得 %q", activeURL, wantURL)
 		}
 		bridge.mu.Lock()
 		up := bridge.upstream
 		bridge.mu.Unlock()
-		if up != "" {
-			t.Fatalf("桥 upstream = %q，锁定直连应为 \"\"", up)
+		if up != wantURL {
+			t.Fatalf("桥 upstream = %q，acct2 绑定出口应得 %q", up, wantURL)
 		}
 
 		// navigateAndWaitApp：navDelay 远大于 navCtx 使 origin 恒停 null；
@@ -3937,8 +3964,108 @@ func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
 		if onceLeft != 0 {
 			t.Fatalf("navigateAndWaitApp 超时退出残留 %d 条 OnceSession 监听器（defer 值捕获泄漏回归）", onceLeft)
 		}
-		if onceLeft != 0 {
-			t.Fatalf("navigateAndWaitApp 超时退出残留 %d 条 OnceSession 监听器（defer 值捕获泄漏回归）", onceLeft)
+	})
+
+	// R4-M1 回归：Target.createTarget 失败是 recreateTab 的第 5 个失败
+	// 出口，必须走 recreateFailDead 整机回收——绝不留下 m.sessionID 仍指
+	// 旧死会话的僵尸实例（旧实现该分支只 logf 后 return）。
+	t.Run("createTarget failure reclaims instance", func(t *testing.T) {
+		cleanup := resetMgrForLifecycle(t)
+		defer cleanup()
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		conn, err := dialCDPWebsocket(context.Background(), srv.wsURL)
+		if err != nil {
+			t.Fatalf("dial fake cdp: %v", err)
+		}
+		defer conn.Close()
+		client := newCDPClient(conn)
+		defer client.Close()
+
+		m := browserMgr
+		m.mu.Lock()
+		m.proc = &browserProc{PID: 0x7fffffff, PGID: 0x7fffffff,
+			exitedCh: make(chan struct{})}
+		m.client = client
+		m.sessionID = "old-session"
+		m.targetID = "old-target"
+		m.started = true
+		m.starting = false
+		m.ready.Store(true)
+		m.mu.Unlock()
+
+		oldKill := killProcGroupFn
+		killProcGroupFn = func(pid, pgid int, d time.Duration) {}
+		defer func() { killProcGroupFn = oldKill }()
+
+		srv.failMethods.Store("Target.createTarget", true)
+		m.recreateTab()
+
+		m.mu.Lock()
+		started := m.started
+		sess := m.sessionID
+		cleaned := m.client == nil && m.proc == nil
+		m.mu.Unlock()
+		if started || !cleaned || sess != "" {
+			t.Fatalf("createTarget 失败未整机回收：started=%v cleaned=%v sessionID=%q（僵尸实例）",
+				started, cleaned, sess)
+		}
+	})
+
+	// R4-M2 回归：alignResidentAndNavigate 阻塞在 navigateAndWaitApp 的
+	// select 时 CDP 断连（client.Close）必须毫秒级退出并释放桥出口租约
+	// ——旧实现不监听 client.Done()，旧代际会死占 m.bridgeInFlight 挂满
+	// 25s navCtx，新实例同出口请求跳过 syncBridgeUpstream 泄漏 Cookie、
+	// 跨出口请求被堵到超时。
+	t.Run("align navigate exits fast on client close", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, bridge := newTestClientAndBridge(t, srv)
+		// 导航后 20s 才切 origin/推 load：select 纯阻塞，只能靠
+		// client.Done() 唤醒。
+		srv.pageNavDelay.Store(int64(20 * time.Second))
+		m := &browserManager{}
+		m.mu.Lock()
+		m.bridge = bridge
+		m.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			done <- m.alignResidentAndNavigate(ctx, client, "fake-session-1")
+		}()
+		// 等 Page.navigate 发出后模拟断连（Stop/崩溃同路径）。
+		deadline := time.After(5 * time.Second)
+	waitNav:
+		for {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Page.navigate" {
+					break waitNav
+				}
+			case <-deadline:
+				t.Fatal("5s 内未见 Page.navigate")
+			}
+		}
+		client.Close()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("断连后 alignResidentAndNavigate 必须返回 error")
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("断连后 500ms 内未返回（旧实现会死等 25s navCtx 并死占桥出口租约）")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("断连退出耗时 %v，应毫秒级", elapsed)
+		}
+		m.bridgeMu.Lock()
+		inFlight := m.bridgeInFlight
+		m.bridgeMu.Unlock()
+		if inFlight != 0 {
+			t.Fatalf("退出后 bridgeInFlight = %d，桥出口租约未释放（跨代际残留）", inFlight)
 		}
 	})
 

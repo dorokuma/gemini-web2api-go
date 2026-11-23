@@ -885,7 +885,8 @@ func coldStartUpstreamForAccount(a *CookieAccount) (string, bool, error) {
 //     clearBrowserCookies 清掉不认识的 Cookie，再按匿名首航出口导航 /app——
 //     绝不让陌生 Cookie 从默认出口发出去。
 //
-// 导航失败只记日志不清 Jar（下次主请求会走正常鉴权失效路径）。
+// 导航失败 fail-closed 返回 error（由 doStart 中止本轮冷启动并清理；
+// 不清 Jar——残留身份下次启动仍会先走上面的匹配/清理防线）。
 func (m *browserManager) alignColdStartJar(ctx context.Context, client *cdpClient,
 	sess string, bridge *browserProxyBridge, profileDir string, res *startResult) error {
 
@@ -1436,8 +1437,9 @@ func (m *browserManager) recreateTab() {
 	m.recreating = true
 	client := m.client
 	oldTarget := m.targetID
-	m.targetID = "" // 先清：closeTarget 回推的事件据此被忽略
-	m.generation++  // 旧会话期注册的回调全部失效
+	m.targetID = ""  // 先清：closeTarget 回推的事件据此被忽略
+	m.sessionID = "" // 同步清：重建全程不留指向已死旧会话的 ID，并发请求被 5 处 sess=="" 守卫拦住
+	m.generation++   // 旧会话期注册的回调全部失效
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
@@ -1455,8 +1457,12 @@ func (m *browserManager) recreateTab() {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	if oldTarget != "" {
-		_ = client.Call(ctx, "", "Target.closeTarget",
+		// 独立 5s 子预算（同 recreateFailDead）：旧崩溃渲染器可能挂死
+		// closeTarget，绝不能让它耗尽共享的 40s 重建预算。
+		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = client.Call(cctx, "", "Target.closeTarget",
 			map[string]interface{}{"targetId": oldTarget}, nil)
+		ccancel()
 	}
 	var created struct {
 		TargetID string `json:"targetId"`
@@ -1467,6 +1473,7 @@ func (m *browserManager) recreateTab() {
 	if err := client.Call(ctx, "", "Target.createTarget",
 		map[string]interface{}{"url": "about:blank"}, &created); err != nil {
 		logf("[browser] recreate target failed: %v", err)
+		m.recreateFailDead(client, "", err)
 		return
 	}
 	var attached struct {
@@ -1851,6 +1858,8 @@ func (m *browserManager) waitPageLoad(ctx context.Context, client *cdpClient, se
 	case <-done:
 	case <-lctx.Done():
 		logf("[browser] 等页面 load 超时（继续，桥将在下次导航时注入）")
+	case <-client.Done():
+		// CDP 断连/关机：立即退出，死连接上绝不干等 15s。
 	}
 }
 
@@ -1902,6 +1911,11 @@ func (m *browserManager) navigateAndWaitApp(ctx context.Context, client *cdpClie
 	// 绝不退回 waitPageLoad 在 "complete" 的 about:blank 上秒回。
 	for {
 		select {
+		case <-client.Done():
+			// CDP 断连/崩溃/Stop()：毫秒级退出，立即触发外层
+			// defer m.releaseBridgeExit() 归还桥出口租约——旧代际绝不
+			// 死占 m.bridgeInFlight 阻塞新实例或泄漏跨出口 Cookie。
+			return browserErr("navigate /app: cdp client closed")
 		case <-loadCh:
 			// 唤醒后先在 Runtime.evaluate 往返之前重挂下一轮监听——旧监听
 			// 已被触发摘除，此时若立刻去 evaluate，真目标页的 loadEventFired
@@ -2454,7 +2468,8 @@ func (s *browserStream) Abort(m *browserManager) {
 	client := m.client
 	sess := m.sessionID
 	m.mu.Unlock()
-	if client == nil {
+	if client == nil || sess == "" {
+		// 重建期 session 为空：向根连接发 Runtime.evaluate 无意义。
 		return
 	}
 	expr := fmt.Sprintf("window.__gwBridge && window.__gwBridge.abort(%q)", s.reqID)
