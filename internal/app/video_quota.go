@@ -76,15 +76,23 @@ func handleAdminVideoQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
-// viaSlot 让统计的每一次上游请求都先过 acquireSlot：跟正式请求同一套出口规则
-// （配了代理池就不直连，除非开了 fallback_direct），也记进同一份单 IP 预算。
-// 优先用账号绑的出口；拿不到 slot 就报错，不排队等。
+// viaSlot 让统计的每一次上游请求都先过 acquireClaimedSlot：跟正式请求同一套
+// 出口规则（配了代理池就不直连，除非开了 fallback_direct），也记进同一份单 IP
+// 预算，严格绑定下还参与首绑仲裁——并发请求已赢下的绑定绝不会被这里的陈旧
+// 快照绕过。优先用账号绑的出口；拿不到 slot 就报错，不排队等。
 func viaSlot(a *CookieAccount, fn func(proxyURL string) error) error {
-	p, ok, err := acquireSlot(a.ProxyID)
-	if !ok {
+	// 调用方手上可能是 accountList() 的陈旧快照：并发请求或手动改绑之后，
+	// 库里的绑定可能已经变了，必须先按库里当前值走，绝不能拿旧 ProxyID 去挑出口。
+	if a.ID > 0 {
+		if cur := accountByID(a.ID); cur != nil {
+			a.ProxyID = cur.ProxyID
+		}
+	}
+	p, release, err := acquireClaimedSlot(a.ID, a.ProxyID)
+	if p == nil {
 		return fmt.Errorf("no outbound slot: %w", err)
 	}
-	defer releaseSlot(p.ID)
+	defer release()
 	// 挑到的出口跟记的不一样就写库同步：首次绑定（旧值 0）、绑定出口
 	// 被删/禁用后的重绑都靠这一步落库，同一次查询的后续 RPC 继续沿用
 	// 这个号记忆里的出口，不在多个 IP 之间漂移。

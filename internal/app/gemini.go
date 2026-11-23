@@ -380,11 +380,11 @@ type StreamResult struct {
 	// 不往 StreamResult 留原文（含内部 token，不能进 502 body 或 requests 表）。
 	// 成功路径不填：Raw 本身已完整带回给正常消费者。
 	Diag upstreamDiagMeta
-	// UpstreamTouched 为 true 表示本轮已经把请求发往上游（调用过
-	// doGeminiRequestStopMode）；false = 本地就失败了（挑号、限流、取 XSRF、
-	// ctx 取消）。多轮续接靠它判断被 convTake 消费的会话 head 能否安全归还：
-	// 没碰上游，那轮就没发生，head 没被推进、仍然有效。
-	UpstreamTouched bool
+	// CanRestoreConvHead 是 fail-closed 的续接 head 归还许可：仅在发往上游之前
+	// 的确定性本地失败（入口 ctx.Err、出口拿不到 slot/claim 仲裁失败）才置
+	// true；零值 false 表示本轮可能已碰上游（或与本路无关），被 convTake
+	// 消费的会话 head 绝不归还复用。多轮续接靠它判断被消费的 head 能否安全归还。
+	CanRestoreConvHead bool
 }
 
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
@@ -463,6 +463,39 @@ const maxCookieTries = 3
 // releaseSlot 释放占用。proxyID=0 表示直连。
 func releaseSlot(proxyID int64) {
 	slotRelease(proxyID)
+}
+
+// acquireClaimedSlot 统一「拿 slot + 严格绑定首绑仲裁 + 安全所有权转移」。
+// 返回 (proxy, release, err)：release 幂等，最多真正释放一次最后占有的 slot；
+// 失败返回 (nil, func(){}, err)——绝不双释放，也绝不误释放 slots[0]。
+//
+// strict_proxy_binding 首绑仲裁必须在任何出站请求之前：拿到的出口跟
+// preferProxyID 不一致时先 claimAccountProxy——胜者不是手上的出口时，先释放
+// 手上的、再按胜者重取 slot；重取失败（如胜者恰在此刻满/冷却）原样报错，
+// 败方的 slot 已归还，胜者的归属由绑定结果保证，同一个账号绝不从两个 IP 外发。
+func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) {
+	p, ok, err := acquireSlot(preferProxyID)
+	if !ok {
+		return nil, func() {}, err
+	}
+	held, heldID := true, p.ID
+	release := func() {
+		if held {
+			held = false
+			releaseSlot(heldID)
+		}
+	}
+	if rtCfg().StrictProxyBinding && accountID > 0 && p.ID > 0 && p.ID != preferProxyID {
+		if winner := claimAccountProxy(accountID, p.ID); winner != p.ID {
+			release()
+			p2, ok2, err2 := acquireSlot(winner)
+			if !ok2 {
+				return nil, func() {}, err2
+			}
+			p, heldID, held = p2, p2.ID, true
+		}
+	}
+	return &p, release, nil
 }
 
 // deltaTracker 把上游的累积帧转成增量。
@@ -609,24 +642,25 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	var cookieID int64
 	var cookieLabel string
 	var lastDiag upstreamDiagMeta
-	// upstreamTouched 一旦置位就闭合：表示本轮已经把请求发往上游。
-	// 闭包捕获，attrib 把当时的值带回给调用方（多轮续接靠它判断 head 可否归还）。
-	upstreamTouched := false
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
 			ProxyID: picked.ID, ProxyName: picked.Name,
 			Diag: lastDiag, UpstreamModel: lastDiag.Model,
-			UpstreamTouched: upstreamTouched,
 		}, err
 	}
 
-	// 通过限流器拿一个 slot（代理或直连）。所有 slot 满 → 直接 429。
-	p, slotOK, slotErr := acquireSlot(preferProxy)
+	// 通过限流器拿一个 slot（代理或直连），严格绑定下顺带完成首绑仲裁。
+	// 所有 slot 满 → 直接 429。
+	var pickedAcctID int64
+	if acct != nil {
+		pickedAcctID = acct.ID
+	}
+	pp, release, slotErr := acquireClaimedSlot(pickedAcctID, preferProxy)
 	// strict_proxy_binding：这个号绑的出口用不上，就换一个号（它有自己的出口），不换 IP。
 	// 换不到号就报绑定出口不可用（429），不能落到 pickAccountForModel 的「全池降级」那个错。
 	var bindErr *RateLimitError
-	if !slotOK && acct != nil && mc.PinAccountID == 0 && errors.As(slotErr, &bindErr) && bindErr.Bound {
+	if pp == nil && acct != nil && mc.PinAccountID == 0 && errors.As(slotErr, &bindErr) && bindErr.Bound {
 		busy := map[int64]bool{}
 		for id := range skip {
 			busy[id] = true
@@ -640,7 +674,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				busy[id] = true
 			}
 		}
-		for !slotOK && errors.As(slotErr, &bindErr) && bindErr.Bound {
+		for pp == nil && errors.As(slotErr, &bindErr) && bindErr.Bound {
 			busy[acct.ID] = true
 			// M1 × strict_proxy_binding：受阻的驻留号必须并进 exclude——外层换号
 			// 重试时 stickyResidentAccountFor 读的是 exclude，只记在 skip 里它还会
@@ -653,17 +687,23 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				break
 			}
 			acct = next
-			p, slotOK, slotErr = acquireSlot(acct.ProxyID)
+			pp, release, slotErr = acquireClaimedSlot(acct.ID, acct.ProxyID)
 		}
 		skip = busy
 	}
-	if !slotOK {
+	if pp == nil {
 		return attrib(slotErr)
 	}
-	picked = p
-	// 闭包读取 picked 的终值：claimAccountProxy 仲裁败方会释放手上的 slot
-	// 改占胜者那侧，picked 在函数中途可能被换掉。
-	defer func() { releaseSlot(picked.ID) }() // picked.ID=0 表示直连 slot
+	picked = *pp
+	// release 闭包内部已按「最后实际占有的 slot」记账：仲裁败方先归还、
+	// 胜者过户，defer 只调一次，绝不双释放也绝不泄漏胜者 slot。
+	defer release()
+	// 仲裁/轮询后的实际出口立即同步进内存快照：后续 getXSRF / rotateAccount(*acct)
+	// 都按 acct.ProxyID 取出口 URL，不同步的话重绑/仲裁后的请求还会按旧绑定
+	// 打向已禁用或别人的出口，甚至退回直连。
+	if acct != nil {
+		acct.ProxyID = picked.ID
+	}
 
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
@@ -688,19 +728,8 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		// strict_proxy_binding 首次绑定仲裁必须在任何出站请求之前：两个并发请求
-		// 同时拿到同一未绑定账号时各自挑了出口，claimAccountProxy 只允许一个胜出——
-		// 败方释放手上的 slot、改占胜者那一侧，同一账号绝不从两个 IP 外发。
-		if rtCfg().StrictProxyBinding && picked.ID > 0 && picked.ID != acct.ProxyID {
-			if winner := claimAccountProxy(acct.ID, picked.ID); winner != picked.ID {
-				releaseSlot(picked.ID)
-				p2, ok2, err2 := acquireSlot(winner)
-				if !ok2 {
-					return attrib(err2)
-				}
-				picked, pickedOK, proxyURL = p2, p2.ID > 0, p2.URL
-			}
-		}
+		// 严格绑定首绑仲裁已在 acquireClaimedSlot 里原子完成（先于一切出站请求），
+		// acct.ProxyID 也已就地同步成实际出口——这里不再重复仲裁/换 slot。
 		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
@@ -1030,7 +1059,6 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			statusCode, raw, ttfb, setCookie, err = doWebChannelRequest(ctx, wcReq, proxyURL, lh.cb, &lh.stop)
 		} else {
 			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop, mc.TaskMode)
-			upstreamTouched = true
 		}
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookieForHost(cookieStr, setCookie, reqEndpoint, geminiCookieTargetHost); merged != cookieStr {
@@ -1189,7 +1217,6 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			AccountLabel:     cookieLabel,
 			TTFBMs:           ttfb,
 			TotalMs:          time.Since(t0).Milliseconds(),
-			UpstreamTouched:  upstreamTouched,
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -315,6 +316,11 @@ func TestStrictBindingM1BoundSwitchSkipsCoolingAccount(t *testing.T) {
 	if res.AccountID == cooling {
 		t.Fatalf("Bound 换号绕过了 strict_model 冷却：挑中了冷却号 #%d", cooling)
 	}
+	// 加严断言（R2）：冷却号必须从未被挑中——既没被首绑仲裁写库（ProxyID 仍为 0），
+	// 也没被挑号记录过 last_used_at（仍 0）。任何一次误挑都会留下这两者之一。
+	if acc := accountByID(cooling); acc == nil || acc.ProxyID != 0 || acc.LastUsedAt != 0 {
+		t.Fatalf("冷却号绝不能被挑中/绑定：%+v", acc)
+	}
 
 	// 健康号也没了：只剩绑 A 的驻留号 + 冷却号 → 全阻应报 Bound 429（A 满），
 	// 绝不能报 ModelDowngradedError（排除集里塞的是 Bound 受阻号，不是降级号）。
@@ -374,11 +380,142 @@ func TestClaimAccountProxyConcurrentFirstBind(t *testing.T) {
 	if w := claimAccountProxy(acct, map[bool]int64{true: a, false: b}[winner != a]); w != winner {
 		t.Fatalf("已绑定的账号不能再被覆写：winner=%d got=%d", winner, w)
 	}
+
+	// R2 修复 1 回归：冷却中的已启用绑定绝不覆写——绑定仍是绑定，冷却后还要回到它。
+	// proxyUsableByID 把冷却误判成「绑定失效」会让并发请求把账号抢绑到别的出口。
+	setProxyField(winner, func(p *Proxy) { p.FailCount, p.LastUsed = proxyFailThreshold, time.Now().Unix() })
+	other := map[bool]int64{true: a, false: b}[winner == a]
+	if w := claimAccountProxy(acct, other); w != winner {
+		t.Fatalf("冷却中的绑定绝不能被覆写：winner=%d got=%d", winner, w)
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != winner {
+		t.Fatalf("冷却中的绑定必须保持 %d：%+v", winner, acc)
+	}
+	// 冷却恢复前恢复状态，接着测原有「失效后重绑」断言。
+	setProxyField(winner, func(p *Proxy) { p.FailCount, p.LastUsed = 0, 0 })
 	// 绑定出口被禁用后失效，新候选胜出并重绑。
 	setProxyField(winner, func(p *Proxy) { p.Enabled = false })
-	other := map[bool]int64{true: a, false: b}[winner == a]
 	if w := claimAccountProxy(acct, other); w != other {
 		t.Fatalf("绑定出口失效后应重绑新候选：got=%d want=%d", w, other)
+	}
+}
+
+// R2 修复 2 回归：streamGenerateOnce 败方仲裁后 acquireSlot(winner) 失败时
+// （胜者的出口恰在此刻满了）绝不双释放、绝不误释放 slots[0]——Bound 错误
+// 归属账号与胜者出口，slotUsage(A).Inflight 保持 1（外层手动占用的那一份）。
+// 用 claimMu 打同步门：先抢锁占住，goroutine 里跑真实 streamGenerateOnce 触发
+// claimAccountProxy 阻塞，主线程把 A 占满后放锁，败方重取 A 必然 !ok2。
+func TestStreamGenerateOnceClaimLoserFailDoubleRelease(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	acct := addTestAccount(t, "loserA")
+	// 预置并发首绑：另一个请求已把 A 绑给这个号（本请求拿到的 B 只是轮询到的）。
+	bindAccountProxy(acct, a)
+	mc := Models["gemini-3.6-flash"]
+
+	// 用 claimMu 做同步门：主线程先抢锁，goroutine 里跑 streamGenerateOnce 在
+	// claimAccountProxy 临界区里阻塞；主线程把 A 占满后放锁，败方重取 A 必然
+	// !ok2——这条路径旧实现会多 releaseSlot(picked.ID) 一次（B 被双释放）。
+	claimMu.Lock()
+	done := make(chan struct{})
+	var res *StreamResult
+	var err error
+	go func() {
+		defer close(done)
+		res, err = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+			mc, nil, nil, nil, nil, map[int64]bool{})
+	}()
+	// 等 goroutine 确定进入 claimAccountProxy（阻塞在 claimMu 上）后再动 A。
+	time.Sleep(50 * time.Millisecond)
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 1 // 占满胜者 A：败方重取 A 必然失败
+	s.mu.Unlock()
+	claimMu.Unlock()
+	<-done
+
+	var rle *RateLimitError
+	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+		t.Fatalf("败方重取胜者出口失败应报 Bound 429(出口 %d)，得到 err=%v res=%+v", a, err, res)
+	}
+	// 归属不能误填已释放的败方 B。
+	if res != nil && res.ProxyID == b {
+		t.Fatalf("错误归属不能记在已释放的败方 B 上：res=%+v", res)
+	}
+	// 胜者 A 的并发计数保持主线程占的 1：goroutine 没从 A 拿成过、更没多释放。
+	if u := slotUsage(a); u.Inflight != 1 {
+		t.Fatalf("胜者 A 的并发计数应保持 1（不多不少）：%+v", u)
+	}
+	// 败方 B 的计数必须为 0：B 被仲裁归还后释放一次，绝不双释放成负数。
+	if u := slotUsage(b); u.Inflight != 0 {
+		t.Fatalf("败方 B 的并发计数应为 0（双释放会成负数）：%+v", u)
+	}
+	// slots[0]（直连）绝不能被误释放成负数。
+	if u := slotUsage(0); u.Inflight < 0 {
+		t.Fatalf("直连 slot 被误释放：%+v", u)
+	}
+}
+
+// R2 修复 2 回归：仲裁后 acct.ProxyID 必须立即同步成实际出口——否则
+// getXSRF 失败触发的 rotateAccount(*acct) 会按旧绑定（已禁用的 A）取 URL，
+// 请求从已禁用的出口甚至直连外发。这里禁用 A 后靠并发首绑重绑到 B，
+// 断言整个调用绝不向已禁用的 A 的 URL 发任何请求。
+func TestStreamGenerateOnceRotateUsesClaimedProxy(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	acct := addTestAccount(t, "rotclaim")
+	// getXSRF 失败会走 rotateAccount(*acct)：它按 acct.ProxyID 取代理 URL。
+	// 带 __Secure-1PSID 让 browserAccountFromHeaders 能反查到账号（避免被
+	// 误判成「带 Cookie 的非池请求」）；这里没开 BrowserTransport，不影响。
+	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+		"SAPISID=rotclaim; SID=x; __Secure-1PSID=rotclaim", acct)
+	bindAccountProxy(acct, a)
+	// A 被管理员禁用：acquireSlot(a) 轮询到 B，claimAccountProxy 重绑到 B。
+	setProxyField(a, func(p *Proxy) { p.Enabled = false })
+	// 两个假出口独立端口：A=127.0.0.1:1、B=127.0.0.1:2，各自记录是否被使用。
+	setProxyField(b, func(p *Proxy) { p.URL = "http://127.0.0.1:2" })
+	var mu sync.Mutex
+	hitA, hitB := false, false
+	// getStdlibClient / getStdlibStreamClient 两个 key（RequestTimeout 与 0）都要钉。
+	timeout := rtCfg().RequestTimeout
+	for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+		stdlibClientCache.Store("http://127.0.0.1:1"+suf, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			hitA = true
+			mu.Unlock()
+			return nil, errors.New("dial refused")
+		})})
+		stdlibClientCache.Store("http://127.0.0.1:2"+suf, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			hitB = true
+			mu.Unlock()
+			return nil, errors.New("dial refused")
+		})})
+	}
+	defer func() {
+		for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+			stdlibClientCache.Delete("http://127.0.0.1:1" + suf)
+			stdlibClientCache.Delete("http://127.0.0.1:2" + suf)
+		}
+	}()
+
+	_, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+		Models["gemini-3.6-flash"], nil, nil, nil, nil, map[int64]bool{})
+	if err == nil {
+		t.Fatal("假出口不可达，请求不该成功")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hitA {
+		t.Fatal("旋转/XSRF 绝不能打向已禁用的 A 出口")
+	}
+	if !hitB {
+		t.Fatal("重绑后的请求应只打向 B 出口")
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != b {
+		t.Fatalf("禁用后应重绑到 B 并落库：%+v", acc)
 	}
 }
 

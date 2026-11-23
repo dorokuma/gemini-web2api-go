@@ -258,29 +258,31 @@ func getAnonSession(proxyURL string) (string, error) {
 // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
 func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	// CanRestoreConvHead 是 fail-closed：只在「还没碰上游」的确定性本地失败
+	//（入口取消、拿不到出口/仲裁失败）显式置 true，head 才允许归还复用。
 	if err := ctx.Err(); err != nil {
-		return &StreamResult{}, err
+		return &StreamResult{CanRestoreConvHead: true}, err
 	}
-	p, slotOK, slotErr := acquireSlot(conv.proxyID)
-	if !slotOK {
-		// AccountID 带上会话绑的号：strict_proxy_binding 的 Bound 错误要靠它
-		// 把这个号并进外层 exclude 换号（见 retryOnAnotherAccount）。
-		return &StreamResult{AccountID: conv.accountID}, slotErr
-	}
-	defer releaseSlot(p.ID)
-
-	// 首次绑定原子仲裁：必须在任何出站请求之前（同 streamGenerateOnce）。
-	// 登录会话的并发首次绑定只允许一个请求胜出，败方让出 slot 改占胜者那侧。
-	if rtCfg().StrictProxyBinding && conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID {
-		if winner := claimAccountProxy(conv.accountID, p.ID); winner != p.ID {
-			releaseSlot(p.ID)
-			p2, ok2, err2 := acquireSlot(winner)
-			if !ok2 {
-				return &StreamResult{AccountID: conv.accountID}, err2
-			}
-			p = p2
+	prefer := conv.proxyID
+	if conv.isLogin && conv.accountID > 0 {
+		// 会话内存快照可能陈旧：管理员改绑或并发请求已写入新绑定后，
+		// acquireSlot 必须按库里的当前值走（严格绑定的承诺按库兑现）。
+		if a := accountByID(conv.accountID); a != nil && a.ProxyID != conv.proxyID {
+			prefer = a.ProxyID
 		}
 	}
+	acctID := int64(0)
+	if conv.isLogin {
+		acctID = conv.accountID
+	}
+	pp, release, slotErr := acquireClaimedSlot(acctID, prefer)
+	if pp == nil {
+		// AccountID 带上会话绑的号：strict_proxy_binding 的 Bound 错误要靠它
+		// 把这个号并进外层 exclude 换号（见 retryOnAnotherAccount）。
+		return &StreamResult{AccountID: conv.accountID, CanRestoreConvHead: true}, slotErr
+	}
+	defer release()
+	p := *pp
 
 	// 绑定持久化：挑到的出口跟记的不一样就写库同步——含首次绑定（旧值 0）、
 	// 绑定出口被删/禁用后的重绑、以及管理员在面板上改绑后被本轮仲裁纠正回
@@ -418,7 +420,6 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	}
 
 	t0 := time.Now()
-	touched := false // 本轮是否已把请求发往上游（续接 head 归还靠它判）
 	var lastErr error
 	var lastDiag upstreamDiagMeta
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
@@ -428,7 +429,6 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		// 同 streamGenerateOnce：每轮先清上一轮现场，防帧数污染最后一轮。
 		lastDiag = upstreamDiagMeta{}
 		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil, mc.TaskMode)
-		touched = true // 只要调到 doGeminiRequestStopMode 就算碰过上游
 		if len(raw) > 0 {
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
 		}
@@ -531,7 +531,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		}, nil
 	}
 	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
-		Diag: lastDiag, UpstreamModel: lastDiag.Model, UpstreamTouched: touched}, lastErr
+		Diag: lastDiag, UpstreamModel: lastDiag.Model}, lastErr
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
@@ -577,10 +577,10 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
 			fresh = true
 			conv = nil
-		case rtCfg().StrictProxyBinding && a.ProxyID > 0 && conv.proxyID > 0 && a.ProxyID != conv.proxyID:
-			// 管理员在面板上改了绑定：新绑定的出口才是这个号的合法出口，
-			// 会话记忆里那个旧出口绝不能再外发（严格绑定的核心承诺）。
-			// 强制冷启动，不能带着旧出口的会话记忆续接。
+		case rtCfg().StrictProxyBinding && a.ProxyID > 0 && a.ProxyID != conv.proxyID:
+			// 账号绑定出口变了（管理员改绑、或并发首绑仲裁后落库）：新绑定的出口
+			// 才是这个号的合法出口，会话记忆里那个旧出口（含直连 0）绝不能再外发
+			//（严格绑定的核心承诺）。强制冷启动，不能带着旧出口的会话记忆续接。
 			logf("[conv] 账号 #%d 绑定出口已从 #%d 改为 #%d，回退冷启动", conv.accountID, conv.proxyID, a.ProxyID)
 			fresh = true
 			conv = nil
@@ -619,13 +619,22 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	var res *StreamResult
 	var err error
 	var lastBoundErr *RateLimitError
-	maxTries := maxCookieTries
+	// 两条预算独立：上游模型降级换号严格保持 maxCookieTries=3（连着 3 个号
+	// 都降级说明池子整体见底）；Bound 受阻换号只在严格绑定下放宽到账号池
+	// 大小（绑定出口不可用不是降级，第 N 个号绑在空闲出口上就该被试到）。
+	// 分开计数互不放大：Bound 次数不能用来延长降级预算，反之亦然。
+	boundBudget := maxCookieTries
 	if rtCfg().StrictProxyBinding {
-		if total, _ := accountCount(); total+maxCookieTries > maxTries {
-			maxTries = total + maxCookieTries
+		if total, _ := accountCount(); total > boundBudget {
+			boundBudget = total
 		}
 	}
-	for try := 0; try < maxTries; try++ {
+	downgradeTries, boundTries := 0, 0
+	firstAttempt := true
+	// 物理上限防死循环：Bound 换号最多走遍全池 + 降级预算；预算内的独立上限
+	// 在循环尾按本次消耗的类型判定（互不放大）。
+	hardCap := maxCookieTries + boundBudget
+	for tries := 0; tries < hardCap; tries++ {
 		if fresh {
 			conv = &convState{}
 			// 有 cookie 池就用登录号（能力更全），否则匿名（首轮就地拿 session cookie）。
@@ -644,7 +653,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 					a, _, perr = pickAccountForModel(mc, exclude)
 					if perr != nil {
 						var last *ModelDowngradedError
-						if try > 0 && errors.As(err, &last) {
+						if !firstAttempt && errors.As(err, &last) {
 							// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
 							last.RetryAfter = perr.(*ModelDowngradedError).RetryAfter
 							break
@@ -669,20 +678,37 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 		}
 		res, err = runConversationTurn(ctx, prompt, mc, conv, onDelta, onReasoning)
 		if !fresh {
-			// 续接本地就失败了（没碰上游）：被消费的 head 仍然有效，按原键归还
-			// 让客户端重试能接着 turn 续接，而不是被误判作废逼回全量重发。
-			if err != nil && res != nil && !res.UpstreamTouched && takenKey != "" {
+			// 续接在发往上游之前就确定性本地失败（CanRestoreConvHead 为 true）：
+			// 被消费的 head 仍然有效，按原键归还，让客户端重试能接着 turn 续接。
+			if err != nil && res != nil && res.CanRestoreConvHead && takenKey != "" {
 				convPutIfAbsent(takenKey, &savedConv)
 			}
-			// !fresh 不换号的红线必须守在打换号日志之前：Bound 续接只返回错误，
+			// 续接降级：把降级登记进该号该模型的冷却（下次冷启动自动跳过它），
+			// 但绝不换号——续接绑死在原号上，换了续接就是另一条会话。
+			var mde *ModelDowngradedError
+			if errors.As(err, &mde) && mde.AccountID > 0 {
+				markDowngraded(mde.AccountID, mc)
+			}
+			// !fresh 不换号的红线必须守在打换号日志之前：Bound/降级续接只返回错误，
 			// 不能打「换下一个号」又把请求钉在原号上重发。
 			break
 		}
+		firstAttempt = false
 		var rle *RateLimitError
 		if errors.As(err, &rle) && rle.Bound {
 			lastBoundErr = rle
 		}
-		if !retryOnAnotherAccount(res, err, mc, exclude) {
+		var mde *ModelDowngradedError
+		var budgetOut bool
+		switch {
+		case errors.As(err, &rle) && rle.Bound:
+			boundTries++
+			budgetOut = boundTries >= boundBudget
+		case errors.As(err, &mde) && mde.AccountID > 0:
+			downgradeTries++
+			budgetOut = downgradeTries >= maxCookieTries
+		}
+		if !retryOnAnotherAccount(res, err, mc, exclude) || budgetOut {
 			break
 		}
 	}

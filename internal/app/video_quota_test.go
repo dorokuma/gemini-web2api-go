@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -112,5 +113,29 @@ func TestViaSlotPersistsRebind(t *testing.T) {
 	}
 	if ca2.ProxyID != b {
 		t.Fatalf("绑定出口可用时不该换：%d", ca2.ProxyID)
+	}
+}
+
+// R2 修复 2 回归：viaSlot 必须尊重库里已落库的绑定——陈旧快照（ProxyID=0）
+// 不能绕过并发/手动绑定去打别的出口。库里绑的是满载 A 时，陈旧 ProxyID=0
+// 的 viaSlot 必须报 Bound 429、fn 一次都不被调用、库里绑定保持 A。
+func TestViaSlotStrictBindingRespectsExistingClaim(t *testing.T) {
+	a, _ := withTwoProxies(t, true) // A 被占满
+	acct := addTestAccount(t, "viaslotclaim")
+	bindAccountProxy(acct, a) // 库里已绑满载 A
+
+	// 陈旧快照：调用方手上是 accountList() 之前的 ProxyID=0。
+	stale := CookieAccount{ID: acct, ProxyID: 0}
+	called := false
+	err := viaSlot(&stale, func(string) error { called = true; return nil })
+	var rle *RateLimitError
+	if err == nil || !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
+		t.Fatalf("陈旧快照绝不能绕过已绑定的满载 A：err=%v", err)
+	}
+	if called {
+		t.Fatal("Bound 受阻时 fn 绝不能被调用（不能外发）")
+	}
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
+		t.Fatalf("库里绑定必须保持 A：%+v", acc)
 	}
 }

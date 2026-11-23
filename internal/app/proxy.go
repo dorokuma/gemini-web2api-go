@@ -516,6 +516,22 @@ func strictBoundElsewhere(a *CookieAccount, proxyID int64) bool {
 	return false
 }
 
+// proxyEnabledByID 只看这个出口是否仍然存在且 enabled（不看 FailCount/冷却）。
+// claimAccountProxy 用它判绑定是否还有效：冷却中的绑定仍然是绑定，绝不能被覆写。
+func proxyEnabledByID(id int64) bool {
+	if id <= 0 {
+		return false
+	}
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	for _, p := range proxyCache {
+		if p.ID == id {
+			return p.Enabled
+		}
+	}
+	return false
+}
+
 // proxyUsableByID 这个出口现在还能不能用（存在 + enabled + 没熔断或已过冷却）。
 // 判断账号绑定的出口是不是还有效，无效才该重新绑。
 func proxyUsableByID(id int64) bool {

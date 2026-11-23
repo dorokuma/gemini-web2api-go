@@ -565,11 +565,11 @@ type CookieCheck struct {
 // 只抓页面，不发对话，不消耗生成配额。
 func checkAccountCookie(a CookieAccount) CookieCheck {
 	t0 := time.Now()
-	picked, ok, err := acquireSlot(a.ProxyID)
-	if !ok {
+	picked, release, err := acquireClaimedSlot(a.ID, a.ProxyID)
+	if picked == nil {
 		return CookieCheck{Detail: "拿不到出口：" + err.Error()}
 	}
-	defer releaseSlot(picked.ID)
+	defer release()
 	proxyURL := picked.URL
 	name := picked.Name
 	if name == "" {
@@ -590,7 +590,9 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
 	}
 	markAccountResult(a.ID, true, "")
-	if picked.ID > 0 && a.ProxyID != picked.ID {
+	// 严格绑定下绑定仲裁已在 acquireClaimedSlot 里完成：这里再无条件覆写会把
+	// 已仲裁出的胜者改成本次挑到的出口。非严格模式保留原写库语义（首次绑定/失效重绑）。
+	if !rtCfg().StrictProxyBinding && picked.ID > 0 && a.ProxyID != picked.ID {
 		bindAccountProxy(a.ID, picked.ID)
 	}
 	detail := "登录态有效"
@@ -633,8 +635,10 @@ func bindAccountProxy(accountID, proxyID int64) {
 var claimMu sync.Mutex
 
 // claimAccountProxy 原子决定这个账号本次该走哪个出口（strict_proxy_binding 首绑仲裁）。
-//   - 已绑定且绑定出口仍然有效（存在 + enabled + 没熔断）：返回绑定值，不覆写；
-//   - 未绑定 / 绑定已失效：把 candidateProxyID 写库并返回它（本次请求胜出）。
+//   - 已绑定且绑定出口仍然存在且 enabled：返回绑定值，不覆写——熔断冷却中的绑定
+//     照样算数（冷却会过），绝不能因为暂时不可用就覆写（否则并发请求会把一个
+//     还在冷却的号的绑定抢改成自己的出口）；
+//   - 未绑定 / 绑定已失效（删除或禁用）：把 candidateProxyID 写库并返回它（本次请求胜出）。
 //
 // 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
 // 必须释放手上的 slot、按返回值重新 acquireSlot——胜者是别的并发请求绑的。
@@ -645,7 +649,7 @@ func claimAccountProxy(accountID, candidateProxyID int64) int64 {
 	if a := accountByID(accountID); a != nil {
 		cur = a.ProxyID
 	}
-	if cur > 0 && proxyUsableByID(cur) {
+	if cur > 0 && proxyEnabledByID(cur) {
 		return cur
 	}
 	bindAccountProxy(accountID, candidateProxyID)
