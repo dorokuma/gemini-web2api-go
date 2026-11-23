@@ -2,6 +2,102 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 6.4.0 - 2026-11-23
+
+### 新增
+
+- **`/v1/responses` 多轮会话与工具调用续接**（`responses_input.go`、
+  `conversation_history.go`、`conversation.go`）：把 Responses `input` 回放
+  规范化为 Chat 消息形态——`instructions` 归位 system、`function_call` /
+  `function_call_output` 还原成 `tool_calls` / `tool` 消息（两遍扫描按
+  `call_id` 反查函数名，合成 `call_%d` 避开回放中出现过的全部 wire ID
+  防碰撞）；assistant 消息的媒体 part（`input_audio` 等）保留
+  `[]interface{}` 数组形态追加而不是拍平成字符串，保证
+  `rejectUnsupported` / `collectImages` 看得见媒体；`function_call_output`
+  的媒体 output 同样保留数组、纯文本 part 照旧拍平、普通 JSON 数据一律
+  `json.Marshal` 精确序列化不丢数据。会话状态改走 `convTake`/`convPut`
+  快照语义——`convTake` 原子消费最长匹配前缀 head，`convPutIfAbsent`
+  只在发往上游之前的确定性本地失败（Bound 429 / ctx 取消，即
+  `CanRestoreConvHead`）按原样归还；`convScopeKey` 纳入 `TaskMode` +
+  `Upstream` 等更多字段区分会话作用域；全链路 `unmarshalJSONUseNumber`
+  把数字解成 `json.Number` 保真大整数，并对 tool_calls 下标做溢出防护；
+  续接前 `ctx.Err()` 前置拦截已取消请求，续接账号已停用/删除或绑定出口
+  变更时回退冷启动重挑健康账号；非空 `cid` 才入库门控——上游没给 `cid`
+  的会话不落库，避免下一路同前缀请求撞进死会话。
+- **`stream_idle_timeout_sec` 配置与 `stallWatch` 两阶段融合**：开流吐字后
+  块间沉默窗口独立计时（默认 0 关闭，0 < 值且小于 `request_timeout_sec`
+  或总超时为 0 时生效），保持无总超时策略不变——排队阶段沉默照旧报
+  `*StallError` 走切换，首字后块间沉默报新的 `errStreamIdle` 当瞬时抖动
+  无条件重试；`webchannel.go` 同步换 `newStallWatchIdle`；`runtime.go`
+  校验上限 600s、`request_timeout_sec` 上限由 600 放宽到 1200；管理面板
+  `RT_GROUPS` 与 `I18N_EN` 词典同步收录新配置项与诊断文案。
+- **`strict_proxy_binding` 严格代理绑定 + 后台手动绑出口**：开启后账号绑定
+  的代理满了或在冷却就换号而不是降级裸连；管理面板账号编辑器新增绑定
+  出口下拉框，`POST/PATCH /admin/api/cookies` 写前对 `proxy_id` 做
+  `proxyExists` 400 校验；4 条出站路径统一走 `acquireClaimedSlot`
+  「拿 slot + 严格绑定首绑仲裁 + 安全所有权转移」，`claimMu` 把
+  「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作，手动改绑与请求
+  侧首绑互斥；XSRF 循环仲裁与非严格模式下的首绑持久化保留；
+  `strict_model` 冷却合并走 `coolingAccounts(mc)`，视频生成
+  `callOnVideoAccount` Bound 429 走换号重试。
+- **OSID Cookie 识别与诊断**：账号 cookie 检测 `OSID`（精确匹配，
+  `__Secure-OSID` 不算）——管理面板账号列表加 `has_osid` 徽标、
+  新增/编辑 cookie 时弹「缺 OSID」提醒（只提醒不拦），`POST /admin/api/cookies`
+  回执把 `缺 OSID` 原因翻成可操作文案并经 `I18N_EN` 国际化；/app 302
+  跳登录页时按 `MissingOSID` 诊断提示重新导出。
+- **`UpstreamAliases` 与 `ModelConfig.Retired` 淘汰模型框架**：`strict_model`
+  校验放行已确认的上游原位改名/升级别名（修复别名映射）；`Retired` 非空
+  的模型不进模型列表、点名请求直接报 retired 原因，`mcpWebSearch` 同步
+  过滤淘汰模型。
+
+### 变更
+
+- **浏览器请求头单一来源重构**：stdlib 与 fhttp 两种请求统一经
+  `writeBrowserHeaders` 写入——UA / `Sec-CH-UA` 客户端提示
+  （`chromeClientHints`）跟 `chromeMajor()` 从实际 TLS 指纹 profile 名
+  动态读 Chrome 大版本，`Sec-Fetch-Site` 按目标主机经 `fetchSite(host)`
+  计算（同源 `same-origin`、同站 `same-site`、跨站 `cross-site`）；
+  每请求 `snapshotBrowserHeaders()` 一次读 `rtCfg()` 定版，消除分次读
+  把两版配置拼进同一请求的竞态（如 Chrome/133 UA 配 Chrome/120
+  client hints）；`appPageHeaders()` 统一 /app 抓取头；`webchannel.go`
+  直连分支同步接入同一份浏览器头；`firefox_fingerprint` 实验开关保留
+  （Firefox 指纹不发 `Sec-CH-UA` 组）。
+- **SIDCC 保活按服务端退避**：`rotateSIDCC` 命中 RotateCookies 429 时读
+  服务端 Retry-After，`noteSIDCCBackoff` 记该号退避窗口，窗口内不再
+  请求 SIDCC 端点，日志带剩余等待时间。
+- **`recordProxyResult` 纳入 `errStreamIdle`**：开流后断流/黑洞的坏代理
+  照常累计失败次数（不因瞬时抖动语义漏记）；`streamContentInLine`
+  只认清洗后的有效内容帧（生图占位链/纯代码产物占位帧不算开流）；
+  诊断 `diagHint` 给 `errStreamIdle` 归 `upstream_timeout` 并出人话提示。
+
+### 修复
+
+- **`stallWatch` 两阶段竞态与 `pause()` 缺陷**：`timerIdle` 阶段标志改为
+  只走互斥锁读写（不再锁外读原子标志），杜绝「排队计时器已到期、回调
+  还没跑，中途 `markStreaming` 把 `*StallError` 错挂成 `errStreamIdle`」
+  的窗口；暂停期进入 idle 阶段只记 `timerIdle=true` 不建计时器，由
+  `resume` 按阶段补回 idle 计时器。
+- **严格绑定并发与预算正确性**：`claimAccountProxy` 首绑仲裁全部收进
+  `claimMu`，消除「核库 → 写库」之间被并发请求/手动改绑插入的竞态；
+  Bound 429 重试预算从 `maxCookieTries` 拆成独立的 `downgradeTries` /
+  `boundTries` 两本账（绑满换号不消耗降级预算）；`mc.PinAccountID > 0`
+  时 Bound 429 不并入 exclude 也不换号（会话钉住的号绝不换）；
+  `acquireClaimedSlot` 严格模式锁外绝不写库覆写绑定；`convTake` 消费的
+  head 只在 `CanRestoreConvHead` fail-closed 许可下归还，发往上游后
+  失败绝不放回让重试撞同一路会话。
+- **`/v1/responses` 回放健壮性**：`function_call` 缺 `arguments` 回退
+  `{}`、非字符串 arguments 重序列化；`call_id` 缺失时从 `id` 兜底并
+  避开已用 ID；assistant 媒体 content 不被字符串覆写丢 part；
+  `unmarshalJSONUseNumber` 防大整数经 `float64` 舍入击穿工具参数指纹。
+
+### 文档
+
+- **双语 README 重构**（`docs/readme-redesign`）：README.md / README_EN.md
+  全面重写（各精简约一半篇幅），新增 `assets/logo-dark.svg` /
+  `logo-light.svg` 主题自适应 logo。
+
+> **启用门控状态**：`internal/app/gemini.go` 中 `useWC := false` 保持锁定不变。
+
 ## 6.3.1 - 2026-11-21
 
 ### 新增
