@@ -494,6 +494,7 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 	// 可能推翻它），绝不能以 p.ID == preferProxyID 为由跳过核库。
 	// 最多 2 轮有界循环：第 2 轮覆盖「claim 出的胜者在 acquireSlot 期间被禁用、
 	// slot 实际落到第 3 个出口」的窗口——那个出口同样要仲裁一次才能外发。
+	var lastWinner int64
 	for i := 0; i < 2; i++ {
 		var winner int64
 		if p.ID == 0 {
@@ -525,8 +526,12 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 		// 也可能是 fallback_direct 的直连槽 0）：回圈顶对它再仲裁一次——p.ID==0
 		// 时走「核库当前绑定」分支，库里的 winner 若仍有效就再试一次它的 slot，
 		// 满了/冷却原样报 Bound，绝不直连外发已绑定账号。
+		lastWinner = winner
 	}
-	return &p, release, nil
+	// 2 轮未收敛（出口连续翻转）：fail-closed——释放手上未仲裁的出口报 Bound，
+	// 绝不把手上那个跟库里胜者不一致的出口直接外发（fail-open）。
+	release()
+	return nil, func() {}, &RateLimitError{Reason: "rebound", ProxyID: lastWinner, Bound: true}
 }
 
 // currentBoundEnabledProxy 在 claimMu 下取这个号当前绑定的、仍然存在且 enabled 的
@@ -762,6 +767,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	cookieStr, sapisid, xsrfToken := "", "", ""
 	authUser := 0 // 最终用上的那个号的账号序号（/u/N），匿名为 0
 	var lastCookieErr error
+	var lastBoundErr *RateLimitError
 	tried := map[int64]bool{}
 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
 	rotatedOnce := map[int64]bool{}
@@ -769,19 +775,34 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		if err := ctx.Err(); err != nil {
 			return attrib(err)
 		}
-		tried[acct.ID] = true
-		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
-		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
 		// 严格绑定下换号不换出口：XSRF 换号循环挑出的第 2+ 个号还拿着自己在库里的
 		// 绑定值，必须先仲裁——并发请求/管理员已把它绑到别的出口时，绝不能拿
 		// picked 出口替它外发（那等于「换号不换出口」不变量被反着破坏）。
 		// acct.ID>0 是匿名兜底防御（acct 恒来自池，但判空成本为零）。
-		if rtCfg().StrictProxyBinding && acct.ID > 0 && picked.ID > 0 {
-			if winner := claimAccountProxy(acct.ID, picked.ID); winner != picked.ID {
+		//
+		// 仲裁排在 tried/cookieID 之前：被并发绑走跳过的健康号不算「试过一个坏号」
+		//（不消耗 maxCookieTries 预算），归属也不记它——错不在 cookie 在绑定。
+		// picked.ID>0 走 claimAccountProxy 仲裁；picked.ID==0（fallback_direct 直连
+		// 兜底）时库里绑在启用出口上的号同样绝不能从本机 IP 外发。
+		if rtCfg().StrictProxyBinding && acct.ID > 0 {
+			var conflictID int64
+			if picked.ID > 0 {
+				if w := claimAccountProxy(acct.ID, picked.ID); w != picked.ID {
+					conflictID = w
+				}
+			} else {
+				conflictID = currentBoundEnabledProxy(acct.ID)
+			}
+			if conflictID != 0 {
 				// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
+				if skip == nil {
+					skip = map[int64]bool{}
+				}
+				skip[acct.ID] = true // 挡回挑号；不写 tried，不占换号预算
+				lastBoundErr = &RateLimitError{Reason: "rebound", ProxyID: conflictID, Bound: true}
 				if mc.PinAccountID > 0 {
-					acct = nil
-					continue
+					// 会话钉住的号被绑走：直接报 Bound，绝不能换号，也绝不能匿名下发。
+					return &StreamResult{AccountID: acct.ID}, lastBoundErr
 				}
 				next := map[int64]bool{}
 				for id := range skip {
@@ -798,6 +819,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				continue
 			}
 		}
+		tried[acct.ID] = true
+		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
+		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
 		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
@@ -827,9 +851,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
 			// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
 			rotAcct := *acct
-			if picked.ID > 0 {
-				rotAcct.ProxyID = picked.ID
-			}
+			// picked.ID==0（fallback_direct 直连兜底）时也必须清掉旧绑定：直连就是
+			// 本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
+			rotAcct.ProxyID = picked.ID
 			if _, _, rerr := rotateAccount(rotAcct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
 					if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
@@ -869,6 +893,11 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			next[acct.ID] = true
 			acct, _ = pickCookieAccountExcept(next)
 		}
+	}
+	if cookieStr == "" && lastCookieErr == nil && lastBoundErr != nil {
+		// 循环里只遇到并发改绑冲突、没试过任何 cookie：绝不能绕过
+		// FallbackAnon=false 静默匿名外发——报真实的 Bound 冲突。
+		return attrib(lastBoundErr)
 	}
 	if lastCookieErr != nil && cookieStr == "" {
 		if mc.PinAccountID > 0 {

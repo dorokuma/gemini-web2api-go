@@ -119,6 +119,9 @@ func withTwoProxies(t *testing.T, strict bool) (a, b int64) {
 		slotsMu.Lock()
 		delete(slots, a)
 		delete(slots, b)
+		// 直连哨兵槽（如 R4 用例的 slots[0].inflight=1）也不能留在共享 map 里
+		// 污染后续测试——slotUsage(0) 的读数必须是本用例自己的。
+		delete(slots, 0)
 		slotsMu.Unlock()
 	})
 	return a, b
@@ -560,33 +563,214 @@ func TestXSRSwitchRotateUsesPickedNotStaleBinding(t *testing.T) {
 		mc, nil, nil, nil, nil, map[int64]bool{})
 	mu.Lock()
 	defer mu.Unlock()
-	for _, p := range bPaths {
-		t.Fatalf("任何请求都绝不能打向已禁用的 B：path=%s", p)
+	// 精确断言：已禁用的 B 零命中；/RotateCookies 必须打向选定出口 A。
+	if len(bPaths) != 0 {
+		t.Fatalf("任何请求都绝不能打向已禁用的 B：paths=%v", bPaths)
 	}
-	rotateHit := false
+	var rotateHits int
 	for _, p := range aPaths {
-		if strings.Contains(p, "RotateCookies") {
-			rotateHit = true
+		if strings.Contains(p, "/RotateCookies") {
+			rotateHits++
 		}
 	}
-	if !rotateHit {
+	if rotateHits == 0 {
 		t.Fatalf("acct2（绑已禁用 B）的轮转必须打向选定出口 A：A paths=%v", aPaths)
 	}
 }
 
-// R3-S1 回归：StrictProxyBinding + FallbackDirect 全开且代理 A 满载时，
+// R4-M2 回归：直连兜底（picked.ID == 0）下 getXSRF 失败触发的 rotateAccount
+// 必须走本轮出口——picked.ID==0 意味着「直连就是本轮出口」，若留着库里的旧绑定
+// B（已禁用）就会从禁用出口外发。哨兵：slots[0].inflight=1 → 借出变 2、释放回 1。
+func TestStrictFallbackDirectRotateNeverUsesStaleBinding(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	rtMu.Lock()
+	rtVal.FallbackDirect = true
+	rtVal.PerIPConcurrent = 2
+	rtVal.FallbackAnon = true
+	rtMu.Unlock()
+	// A、B 全部满载：acquireSlot(0) 只能落 fallback_direct 直连兜底。
+	for _, id := range []int64{a, b} {
+		s := getSlot(id)
+		s.mu.Lock()
+		s.inflight = 2
+		s.mu.Unlock()
+	}
+	s0 := getSlot(0)
+	s0.mu.Lock()
+	s0.inflight = 1 // 哨兵：兜底借出 2、defer 释放回 1
+	s0.mu.Unlock()
+	acct := addTestAccount(t, "rotdirect")
+	// 带 __Secure-1PSID 触发轮转；库绑已禁用的 B（满载的 A 也不可用）。
+	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+		"SAPISID=rotdirect; SID=x; __Secure-1PSID=rotdirect", acct)
+	bindAccountProxy(acct, b)
+	setProxyField(b, func(p *Proxy) { p.Enabled = false; p.URL = "http://127.0.0.1:2" })
+	mc := Models["gemini-3.6-flash"]
+
+	var mu sync.Mutex
+	var bPaths []string
+	timeout := rtCfg().RequestTimeout
+	for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+		stdlibClientCache.Store("http://127.0.0.1:2"+suf, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			bPaths = append(bPaths, req.URL.Path)
+			mu.Unlock()
+			return nil, errors.New("dial refused")
+		})})
+	}
+	defer func() {
+		for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+			stdlibClientCache.Delete("http://127.0.0.1:2" + suf)
+		}
+	}()
+
+	res, _ := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+		mc, nil, nil, nil, nil, map[int64]bool{})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bPaths) != 0 {
+		t.Fatalf("直连兜底下轮转绝不能打向已禁用/满载的旧绑定 B：paths=%v", bPaths)
+	}
+	if res != nil && res.ProxyID != 0 {
+		t.Fatalf("出口应是直连兜底（ProxyID=0）：res=%+v", res)
+	}
+	if u := slotUsage(0); u.Inflight != 1 {
+		t.Fatalf("直连槽哨兵应回 1（借出后单释放）：%+v", u)
+	}
+}
+
+// R4-M1 回归：严格模式 + FallbackAnon=false + PinAccountID>0 下，拿到出口之后、
+// XSRF 循环内仲裁前的窗口里钉住的号被并发改绑到别的启用出口——绝不能拿 picked
+// 出口替它外发，也绝不能落到匿名：必须直接返回 *RateLimitError{Bound:true}。
+//
+// 确定性调度（锁接力，不用 sleep 猜时机）：
+//   - 主线程持 claimMu + B 的 slot 锁（sB.mu，B inflight=0）：goroutine 占 A 后
+//     claim1 阻塞在 claimMu；主线程落库 acct→B、放 claimMu → claim1 判出 B，
+//     goroutine 去 acquireSlot(B) → pickBoundProxy(B).trySlotAcquire(B) 阻塞在
+//     sB.mu（严格绑定的重取只走 bound 分支，必然点这把锁）；
+//   - 主线程先 bindAccountProxy(acct,a) 把号绑回 A（claimMu 此刻无人持有，
+//     立刻完成），再放 sB.mu：goroutine 拿到 B 的 slot → acquire 收敛
+//     picked=B → XSRF 循环 claim2 读库 cur=A（启用）≠ picked=B → 冲突；
+//   - claim2 严格排在「绑回 A」之后：goroutine 拿到 sB.mu 时这次写库早已完成，
+//     无时序侥幸。PinAccountID>0 → 前置仲裁直接 return Bound(A)。
+func TestStrictPinnedReboundConflictNeverAnon(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	// A 腾出容量：acct 绑 A、prefer=A 直接拿 A；B 保持空闲但由主线程持锁挡驾。
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0
+	s.mu.Unlock()
+	sB := getSlot(b)
+	sB.mu.Lock()
+	sB.inflight = 0 // 空闲：goroutine 的重取必然卡在 sB.mu 上而不是因满载失败
+	sB.mu.Unlock()
+	// 直连槽零负载：若逻辑破防匿名/直连外发，必然从这里借出——
+	// slots[0] 任何活动都是红线被踩的铁证。
+	s0 := getSlot(0)
+	s0.mu.Lock()
+	s0.inflight = 0
+	s0.mu.Unlock()
+	acct := addTestAccount(t, "pinnedrebound")
+	bindAccountProxy(acct, a)
+	mc := Models["gemini-3.6-flash"]
+	mc.PinAccountID = acct // 续接语义：换号与匿名都不允许
+
+	claimMu.Lock()
+	sB.mu.Lock() // goroutine 的 acquireSlot(B) 必然在 trySlotAcquire 压这把锁
+	done := make(chan struct{})
+	var res *StreamResult
+	var err error
+	go func() {
+		defer close(done)
+		res, err = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+			mc, nil, nil, nil, nil, map[int64]bool{})
+	}()
+	// 同步点：goroutine 占 A（inflight 0→1）后唯一锁点是 claim1 的 claimMu。
+	deadline := time.Now().Add(5 * time.Second)
+	for slotUsage(a).Inflight != 1 {
+		select {
+		case <-done:
+			t.Fatal("goroutine 在拿到 A 的 slot 之前就退出了")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine 未在 5s 内拿到 A 的 slot：%+v", slotUsage(a))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("goroutine 在拿到 A 后未经 claimMu 阻塞就退出了——同步点失效")
+	default:
+	}
+	// 改绑第一拍：acct→B。claim1 判出 B → 释放 A → acquireSlot(B) 压 sB.mu。
+	bindAccountProxyLocked(acct, b)
+	claimMu.Unlock()
+	// 等败方 A 归还（inflight 1→0）= goroutine 已离开 claimMu 临界区，正在
+	// sB.mu 前排队。此刻把号绑回 A：claim2 必然在 sB.mu 释放之后才运行，
+	// 而绑回 A 一定先于 sB.mu 释放——读序确定性成立。
+	deadline = time.Now().Add(5 * time.Second)
+	for slotUsage(a).Inflight != 0 {
+		select {
+		case <-done:
+			t.Fatal("goroutine 在归还 A 之前就退出了")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine 未在 5s 内归还 A：%+v", slotUsage(a))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	bindAccountProxy(acct, a) // 锁外入口会拿 claimMu（此刻空闲）：原子落库
+	sB.mu.Unlock()            // 放行 goroutine 的 trySlotAcquire(B)
+	<-done
+
+	var rle *RateLimitError
+	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a || rle.Reason != "rebound" {
+		t.Fatalf("钉住号被并发绑回 A 后必须报 Bound 429(出口 %d, rebound)，得到 err=%v res=%+v", a, err, res)
+	}
+	if res == nil || res.AccountID != acct {
+		t.Fatalf("归属必须记在钉住号 %d 上：res=%+v", acct, res)
+	}
+	// 归属出口是冲突返回的零值：picked=B 的 slot 已被 defer release() 归还，
+	// 绝不能把冲突胜者 A 或未结算的 B 记进结果。
+	if res.ProxyID != 0 {
+		t.Fatalf("Bound 冲突返回不携带已释放的出口：res=%+v", res)
+	}
+	// 匿名/直连零借出：FallbackAnon=false 的静默降级红线没被踩。
+	if u := slotUsage(0); u.RPM != 0 || u.Inflight != 0 {
+		t.Fatalf("绝不能发出匿名/直连请求（slots[0] 必须零活动）：%+v", u)
+	}
+	// 库里最终绑定保持 A（并发写序的最后一写），没被 picked=B 覆写。
+	if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
+		t.Fatalf("库里绑定必须保持并发写的结果 A：%+v", acc)
+	}
+}
+
+// R3-S1 回归：StrictProxyBinding + FallbackDirect 全开且代理全部满载时，
 // acquireClaimedSlot(boundAcct, 0) 落到直连兜底后必须先核库——已绑启用出口的
 // 号绝不能从本机 IP 外发：释放直连槽去占绑定的 A，满则返回 Bound 429，
 // 绝不返回直连槽（ID==0）。
+// R4-S2：A 和 B 全部占满（PerIPConcurrent=2）是必然落兜底的铁证，slots[0]
+// 的 RPM==1 + Inflight 回 1 同时证明「进去过直连槽」且「正确归还」，
+// slotUsage(b).RPM==0 证明败方归还后没有误占别的出口。
 func TestStrictFallbackDirectNeverDirectsBoundAccount(t *testing.T) {
-	a, _ := withTwoProxies(t, true) // A 哨兵满载（inflight=1、上限 1）
+	a, b := withTwoProxies(t, true)
 	rtMu.Lock()
 	rtVal.FallbackDirect = true
+	rtVal.PerIPConcurrent = 2
 	rtMu.Unlock()
+	// A、B 全部满载：acquireSlot(0) 必然落 fallback_direct 直连兜底。
+	for _, id := range []int64{a, b} {
+		s := getSlot(id)
+		s.mu.Lock()
+		s.inflight = 2
+		s.mu.Unlock()
+	}
 	acct := addTestAccount(t, "bounddirect")
 	bindAccountProxy(acct, a) // 库里已绑启用（但满载）的 A
 	// 预置直连哨兵：acquireClaimedSlot 落兜底时必须先释放再核库，
-	// 哨兵回 1 证明直连槽被正确归还（0 = 没释放，2 = 释放后又借出）。
+	// Inflight 回 1 证明直连槽被正确归还（0 = 双释放，2 = 没释放）。
 	s0 := getSlot(0)
 	s0.mu.Lock()
 	s0.inflight = 1
@@ -601,8 +785,11 @@ func TestStrictFallbackDirectNeverDirectsBoundAccount(t *testing.T) {
 	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
 		t.Fatalf("应报 Bound 429(出口 %d)，得到 err=%v", a, err)
 	}
-	if u := slotUsage(0); u.Inflight != 1 {
-		t.Fatalf("直连槽必须先释放再去占绑定出口（哨兵应回 1）：%+v", u)
+	if u := slotUsage(0); u.RPM != 1 || u.Inflight != 1 {
+		t.Fatalf("直连槽必须先借入再释放（RPM=1）且归还（Inflight 回 1）：%+v", u)
+	}
+	if u := slotUsage(b); u.RPM != 0 {
+		t.Fatalf("败方重取绝不能误占 B（RPM 必须为 0）：%+v", u)
 	}
 	if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
 		t.Fatalf("库里绑定必须保持 A：%+v", acc)

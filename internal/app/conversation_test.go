@@ -1275,8 +1275,8 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 		}()
 		_, _, _, err := callGeminiConv(ctx, next, mc, nil, nil, nil, nil,
 			conversationOptions{requestScope: "cancel-scope"})
-		if err == nil {
-			t.Fatal("流中取消应返回错误")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("流中取消应返回 context.Canceled，得到 %v", err)
 		}
 		// 被消费的 head 绝不能归还：cancel-scope 这一路在 convTake 后必须留空
 		//（A 子例冷启动成功落的 head 属于另一 scope，不在此断言范围内）。
