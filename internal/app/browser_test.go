@@ -3818,6 +3818,130 @@ func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
 		}
 	})
 
+	// R4-B 回归：
+	//  1. alignResidentAndNavigate 按旧快照判定需清 Jar、进 jarRW 复核时
+	//     驻留号已被并发切成另一个启用且绑定有效的账号，必须按新驻留
+	//     号的绑定出口对齐、绝不发 Network.clearBrowserCookies——旧实现
+	//     在复核分支里先 Unlock 一次、落到结尾又 Unlock 第二次，必然
+	//     sync: unlock of unlocked RWMutex panic（该 panic 会炸掉整个
+	//     测试进程，跑过即证明无双重解锁）。
+	//  2. navigateAndWaitApp 被迟到事件唤醒后立即核 origin 仍不过、随即
+	//     navCtx 超时退出：重挂的 OnceSession 必须被函数出口的 defer
+	//     精确摘除，onceHandlers 零残留——旧实现 defer 按值捕获首个
+	//     cancelOnce，循环里重挂的监听器永远摘不掉。
+	t.Run("resident race clears nothing and late-event timeout leaks no once", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, bridge := newTestClientAndBridge(t, srv)
+
+		// 驻留号 seedID 绑定一个不存在的代理 → resolveResidentExit 判
+		// 绑定失效需清 Jar；进 jarRW 复核时驻留已并发切到 acct2（启用、
+		// 锁定直连=绑定有效）→ 必须按 acct2 的直连出口导航、绝不发
+		// Network.clearBrowserCookies 抹掉刚切好的驻留 Jar。
+		seedID, err := accountInsert("stale-resident",
+			"SAPISID=sa; __Secure-1PSID=sp; SID=s", "")
+		if err != nil {
+			t.Fatalf("insert stale resident: %v", err)
+		}
+		defer accountDelete(seedID)
+		if _, err := getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`,
+			int64(99999), seedID); err != nil {
+			t.Fatalf("bind stale resident to dead proxy: %v", err)
+		}
+		acct2, err := accountInsert("swapped-resident",
+			"SAPISID=oa; __Secure-1PSID=op; SID=o", "")
+		if err != nil {
+			t.Fatalf("insert swapped resident: %v", err)
+		}
+		defer accountDelete(acct2)
+		if _, err := getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`,
+			proxyIDDirect, acct2); err != nil {
+			t.Fatalf("lock swapped resident to direct: %v", err)
+		}
+
+		m := &browserManager{}
+		m.mu.Lock()
+		m.seed = browserSeedState{AccountID: seedID}
+		m.bridge = bridge
+		m.mu.Unlock()
+		// 模拟并发同身份快路径已在拿到 jarRW 之前完成切号：复核时
+		// m.seed.AccountID 已是 acct2——clearResidentJarIfNeeded 锁内
+		// 按实时驻留号重算，绝不按旧快照清 Jar。
+		m.mu.Lock()
+		m.seed = browserSeedState{AccountID: acct2}
+		m.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.alignResidentAndNavigate(ctx, client, "fake-session-1"); err != nil {
+			t.Fatalf("alignResidentAndNavigate: %v", err)
+		}
+		for {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Network.clearBrowserCookies" {
+					t.Fatal("驻留已切到绑定有效账号仍发 clearBrowserCookies（误清新驻留 Jar）")
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+		m.mu.Lock()
+		gotSeed := m.seed.AccountID
+		m.mu.Unlock()
+		if gotSeed != acct2 {
+			t.Fatalf("并发切号后 seed 被覆写：got %d want %d", gotSeed, acct2)
+		}
+		// 按 acct2 锁定直连的出口对齐：bridgeActiveURL="" + allowDirect。
+		m.bridgeMu.Lock()
+		activeURL, activeDirect := m.bridgeActiveURL, m.bridgeActiveDirect
+		m.bridgeMu.Unlock()
+		if activeURL != "" || !activeDirect {
+			t.Fatalf("对齐出口 = (%q,%v)，acct2 锁定直连应得 (\"\",true)",
+				activeURL, activeDirect)
+		}
+		bridge.mu.Lock()
+		up := bridge.upstream
+		bridge.mu.Unlock()
+		if up != "" {
+			t.Fatalf("桥 upstream = %q，锁定直连应为 \"\"", up)
+		}
+
+		// navigateAndWaitApp：navDelay 远大于 navCtx 使 origin 恒停 null；
+		// 50ms 时推迟到事件唤醒循环 → 重挂 OnceSession → origin 核不过
+		// → 回 select 等 navCtx 到期走超时返回。重挂的那条监听器必须
+		// 被函数出口的 defer 摘干净（旧实现 defer 按值捕获首个
+		// cancelOnce，重挂的监听器永远摘不掉）。
+		srv2 := newFakeCDPServer(t)
+		defer srv2.close()
+		client2, _ := newTestClientAndBridge(t, srv2)
+		srv2.pageNavDelay.Store(int64(2 * time.Second))
+		m2 := &browserManager{}
+		navCtx, navCancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		defer navCancel()
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			srv2.pushEvent("fake-session-1", "Page.loadEventFired",
+				map[string]interface{}{"timestamp": 0})
+		}()
+		if err := m2.navigateAndWaitApp(navCtx, client2, "fake-session-1"); err == nil {
+			t.Fatal("navCtx 超时且 origin 不到目标页必须 fail-closed")
+		}
+		client2.evtMu.Lock()
+		onceLeft := 0
+		for _, v := range client2.onceHandlers {
+			onceLeft += len(v)
+		}
+		client2.evtMu.Unlock()
+		if onceLeft != 0 {
+			t.Fatalf("navigateAndWaitApp 超时退出残留 %d 条 OnceSession 监听器（defer 值捕获泄漏回归）", onceLeft)
+		}
+		if onceLeft != 0 {
+			t.Fatalf("navigateAndWaitApp 超时退出残留 %d 条 OnceSession 监听器（defer 值捕获泄漏回归）", onceLeft)
+		}
+	})
+
 	t.Run("navigate errorText fails closed", func(t *testing.T) {
 		srv := newFakeCDPServer(t)
 		defer srv.close()
