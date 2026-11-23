@@ -676,11 +676,28 @@ func TestChatCompletionsMultiTurnNoContentFrame(t *testing.T) {
 	t.Cleanup(func() { rtMu.Lock(); rtVal.MultiTurn = saveMT; rtMu.Unlock() })
 
 	const probe = "diag-mt-noframe-probe"
+	const mtReply = "first reply padded to clear the 200-byte textsInLine minimum line length gate, enough padding here."
 	t.Cleanup(func() {
-		// 清理 convStore 里本测试建的两路指纹，不留给下一个用例。
-		convDelete(convChildKey([]map[string]interface{}{
+		// 清理 convStore 里本测试落的两路指纹（新机制按 scope+历史前缀哈希）。
+		// postChat 不带凭据/prompt_cache_key/user → requestScope 与空请求一致。
+		scope := convScopeKey(Models["gemini-3.6-flash"], nil, nil,
+			conversationRequestScope(httptest.NewRequest("POST", "/v1/chat/completions", nil), "", ""))
+		// 首轮落库 head：[user(probe), assistant(mtReply)] 的最长前缀键。
+		if keys := convPrefixKeys([]map[string]interface{}{
 			{"role": "user", "content": probe},
-		}, "first reply padded to clear the 200-byte textsInLine minimum line length gate, enough padding here."))
+			{"role": "assistant", "content": mtReply},
+		}, scope); len(keys) > 0 {
+			convDelete(keys[len(keys)-1])
+		}
+		// 续接轮（若走到落库）head：再追加 assistant 空回复一轮的键。
+		if keys := convPrefixKeys([]map[string]interface{}{
+			{"role": "user", "content": probe},
+			{"role": "assistant", "content": mtReply},
+			{"role": "user", "content": probe},
+			{"role": "assistant", "content": ""},
+		}, scope); len(keys) > 0 {
+			convDelete(keys[len(keys)-1])
+		}
 	})
 	since := requestWatermark(t)
 	// 首轮建会话（parentKey 为空 → fresh，服务端历史落 convStore）。

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -101,8 +102,20 @@ func buildUsageWithReasoning(prompt, text, reasoning string, responsesAPI bool) 
 // 让模型答非所问。采样类参数（temperature/top_p/max_tokens/...）上游根本
 // 没有对应旋钮，收下忽略即可，报错反而会挡住正常客户端。
 func rejectUnsupported(req map[string]interface{}, messages []map[string]interface{}) error {
-	if n, ok := req["n"].(float64); ok && n > 1 {
-		return fmt.Errorf("n=%d not supported: upstream returns a single candidate", int(n))
+	// OpenAI 入口用 UseNumber() 解码，req["n"] 是 json.Number；Gemini 入口
+	// 直接传 float64（见 prepareGemini）。两种都要认，否则 n>1 静默漏过。
+	switch n := req["n"].(type) {
+	case float64:
+		if n > 1 {
+			return fmt.Errorf("n=%v not supported: upstream returns a single candidate", n)
+		}
+	case json.Number:
+		// 1e309 之类溢出 float64 时 Float64() 返回 ErrRange —— 旧写法 err!=nil 就跳过
+		// 拒绝，等于放行了一个 >1 的 n。解析失败 / NaN / 大于 1 一律拒（不引入
+		// math/big：无限长数字串会放大成内存 DoS）。
+		if v, err := n.Float64(); err != nil || math.IsNaN(v) || v > 1 {
+			return fmt.Errorf("n=%s not supported: upstream returns a single candidate", n.String())
+		}
 	}
 	for _, m := range messages {
 		parts, ok := m["content"].([]interface{})
@@ -254,7 +267,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalJSONUseNumber(body, &req); err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
@@ -339,7 +352,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var res *StreamResult
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
-		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
+		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
 		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, onReasoning)
 	}
@@ -507,7 +520,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := unmarshalJSONUseNumber(body, &req); err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
@@ -522,79 +535,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var messages []map[string]interface{}
-	if instr := getStr(req, "instructions"); instr != "" {
-		messages = append(messages, map[string]interface{}{"role": "system", "content": instr})
-	}
-
-	switch input := req["input"].(type) {
-	case string:
-		messages = append(messages, map[string]interface{}{"role": "user", "content": input})
-	case []interface{}:
-		for _, raw := range input {
-			switch item := raw.(type) {
-			case string:
-				messages = append(messages, map[string]interface{}{"role": "user", "content": item})
-			case map[string]interface{}:
-				if t := getStr(item, "type"); t == "function_call_output" {
-					messages = append(messages, map[string]interface{}{
-						"role":         "tool",
-						"tool_call_id": getStr(item, "call_id"),
-						"name":         getStr(item, "name"),
-						"content":      getStr(item, "output"),
-					})
-					continue
-				}
-				role := getStr(item, "role")
-				if role == "assistant" || (getStr(item, "type") == "message" && role == "assistant") {
-					var textAcc strings.Builder
-					var tcList []map[string]interface{}
-					if cp, ok := item["content"].([]interface{}); ok {
-						for _, c := range cp {
-							cm, ok := c.(map[string]interface{})
-							if !ok {
-								continue
-							}
-							switch getStr(cm, "type") {
-							case "output_text":
-								textAcc.WriteString(getStr(cm, "text"))
-							case "function_call":
-								tcList = append(tcList, cm)
-							}
-						}
-					} else if s, ok := item["content"].(string); ok {
-						textAcc.WriteString(s)
-					}
-					m := map[string]interface{}{"role": "assistant", "content": textAcc.String()}
-					if len(tcList) > 0 {
-						var tcs []map[string]interface{}
-						for i, tc := range tcList {
-							id := getStr(tc, "call_id")
-							if id == "" {
-								id = fmt.Sprintf("call_%d", i)
-							}
-							tcs = append(tcs, map[string]interface{}{
-								"id":   id,
-								"type": "function",
-								"function": map[string]interface{}{
-									"name":      getStr(tc, "name"),
-									"arguments": getStr(tc, "arguments"),
-								},
-							})
-						}
-						m["tool_calls"] = tcs
-					}
-					messages = append(messages, m)
-				} else {
-					if role == "" {
-						role = "user"
-					}
-					content := contentToString(item["content"])
-					messages = append(messages, map[string]interface{}{"role": role, "content": content})
-				}
-			}
-		}
-	}
+	// 顶层 function_call / function_call_output / reasoning 统一在
+	// responsesToMessages 归一化：回放历史里的工具调用并进 assistant
+	// tool_calls，不再掉进空 user 消息（multi_turn 开关无关，都生效）。
+	messages := responsesToMessages(req)
 
 	toolsRaw, _ := req["tools"].([]interface{})
 	var tools []map[string]interface{}
@@ -734,7 +678,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var toolCalls []ToolCall
 	var res *StreamResult
 	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
-		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
+		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
 		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, nil)
 	}

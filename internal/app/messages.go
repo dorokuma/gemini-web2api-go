@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,30 @@ import (
 	"slices"
 	"strings"
 )
+
+// unmarshalJSONUseNumber 同 json.Unmarshal，但数字解成 json.Number 而不是
+// float64：大整数（>2^53）的 tool_call 参数 / 工具输出在入口就会被提前
+// 舍入，击穿 canonicalToolArguments 的 UseNumber() 防碰撞保证（参数指纹、
+// 回给上游/客户端的 JSON 都靠精确十进制串）。错误语义跟 Unmarshal 一致
+// （空输入报 unexpected end of JSON input）。
+func unmarshalJSONUseNumber(data []byte, dst interface{}) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		if err == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("invalid character after top-level value")
+		}
+		return err
+	}
+	return nil
+}
 
 // randHex returns n random hex chars. Equivalent to Python's
 // `uuid.uuid4().hex[:n]` — produces a pure hex string of length n.
@@ -284,7 +309,7 @@ func contentToString(content interface{}) string {
 				continue
 			}
 			t := getStr(cm, "type")
-			if t == "text" || t == "input_text" {
+			if t == "text" || t == "input_text" || t == "output_text" {
 				bits = append(bits, getStr(cm, "text"))
 			}
 		}
@@ -496,7 +521,7 @@ func parseToolCalls(text string) (string, []ToolCall) {
 		clean.WriteString(rest[:i])
 		rest = after[next:]
 		var raw map[string]interface{}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(after[:body])), &raw); err != nil || raw == nil {
+		if err := unmarshalJSONUseNumber([]byte(strings.TrimSpace(after[:body])), &raw); err != nil || raw == nil {
 			continue
 		}
 		name := toolCallName(raw)
@@ -573,7 +598,7 @@ func argsObject(v interface{}) (string, bool) {
 	case map[string]interface{}:
 		m = t
 	case string:
-		if json.Unmarshal([]byte(strings.TrimSpace(t)), &m) != nil || m == nil {
+		if unmarshalJSONUseNumber([]byte(strings.TrimSpace(t)), &m) != nil || m == nil {
 			return "", false
 		}
 	default:
@@ -618,7 +643,7 @@ func toolCallComplete(tools []map[string]interface{}) func(string) bool {
 			return false
 		}
 		var raw map[string]interface{}
-		if json.Unmarshal([]byte(strings.TrimSpace(after[:body])), &raw) != nil || raw == nil {
+		if unmarshalJSONUseNumber([]byte(strings.TrimSpace(after[:body])), &raw) != nil || raw == nil {
 			return false
 		}
 		return names[toolCallName(raw)]

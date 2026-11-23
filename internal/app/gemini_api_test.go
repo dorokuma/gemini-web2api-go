@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -360,6 +363,114 @@ func TestV1GeminiAction(t *testing.T) {
 	}
 }
 
+// 探针 2A：generateContent 入口的 functionCall.args 大整数不能经 float64
+// 提前舍入。多轮续接前缀里，9007199254740992 与 …993 在 canonicalToolArguments
+// 里是不同参数：入口若先解成 float64 就都成 …992，变异历史会撞同一份前缀
+// 指纹错误续接。对照组回放相同历史必须命中续接，变异组必须冷启动。
+// 利用 convTake「仅命中才删 head」的语义：先发变异组（必 miss，不消耗首轮
+// 留下的 head），再发对照组（必 hit 首轮 head）——若顺序反了，对照组先把
+// head 消费掉，变异组即使撞指纹也必 miss，测试就假绿。
+func TestGeminiHandlerLargeIntArgumentsKeepDistinctFingerprints(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var turns []int
+	stubConversationTestTurn(t, func(_ context.Context, _ string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		turns = append(turns, st.turn)
+		st.cid = "bigint-gemini-conversation"
+		st.turn++
+		text := "ok"
+		if len(turns) == 1 {
+			// 首轮回 tool_call 围栏，存 head 的逻辑回复是 assistant(tool_calls)。
+			text = "```tool_call\n{\"name\":\"lookup\",\"arguments\":{\"id\":9007199254740992}}\n```"
+		}
+		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
+	})
+	tools := `,"tools":[{"functionDeclarations":[{"name":"lookup","parameters":{"type":"object"}}]}]`
+	post := func(body string) map[string]interface{} {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/v1beta/models/gemini-3.5-flash-lite:generateContent", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer gemini-bigint")
+		w := httptest.NewRecorder()
+		handleGeminiModelItem(w, r)
+		if w.Code != 200 {
+			t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("response: %s", w.Body.String())
+		}
+		return resp
+	}
+	// 首轮：带 tools 的 user 请求，stub 回围栏，head=[user, assistant(tool_calls)]。
+	first := post(`{"contents":[{"role":"user","parts":[{"text":"look it up"}]}]` + tools + `}`)
+	// 从响应里取真实的 functionCall.id（客户端回放会带上它）。
+	cands, _ := first["candidates"].([]interface{})
+	if len(cands) == 0 {
+		t.Fatalf("first response must have candidates: %v", first)
+	}
+	parts, _ := cands[0].(map[string]interface{})["content"].(map[string]interface{})["parts"].([]interface{})
+	var fcID string
+	for _, p := range parts {
+		if fc, ok := p.(map[string]interface{})["functionCall"].(map[string]interface{}); ok {
+			fcID = getStr(fc, "id")
+		}
+	}
+	if fcID == "" {
+		t.Fatalf("first turn must emit a functionCall with an id: %v", first)
+	}
+	// 变异组次轮（先发）：其余与首轮相同，仅 args.id 改为 …993 —— 必须 miss
+	// （turn 0）且不消耗首轮 head。若入口把 args 解成 float64，…993 与首轮存的
+	// …992 撞同一份指纹，这里就会错误续接（turn 1）露出假阳。
+	post(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"look it up"}]},` +
+		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740993}}}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
+		`{"role":"user","parts":[{"text":"again"}]}` +
+		`]` + tools + `}`)
+	// 对照组第三轮：回放首轮 + 含同一份 …992 functionCall（带真实 id）与
+	// functionResponse 的 model/user 轮 + 新 user —— 首轮 head 还在（变异组
+	// miss 没消费它），必须命中续接（turn 1）。
+	post(`{"contents":[` +
+		`{"role":"user","parts":[{"text":"look it up"}]},` +
+		`{"role":"model","parts":[{"functionCall":{"id":"` + fcID + `","name":"lookup","args":{"id":9007199254740992}}}]},` +
+		`{"role":"user","parts":[{"functionResponse":{"id":"` + fcID + `","name":"lookup","response":{"result":"r1"}}}]},` +
+		`{"role":"user","parts":[{"text":"again"}]}` +
+		`]` + tools + `}`)
+	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
+		t.Fatalf("args mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
+	}
+}
+
+// 出站 functionCall.args 也要用大整数精确解码（callParts）：解析 tool_call
+// 围栏后回给客户端的 args 不能把 9007199254740993 舍成 …992。
+func TestGeminiCallPartsKeepLargeIntPrecision(t *testing.T) {
+	calls := []ToolCall{{ID: "call_1", Type: "function",
+		Function: ToolCallFunction{Name: "lookup", Arguments: `{"id":9007199254740993}`}}}
+	parts := callParts(calls)
+	if len(parts) != 1 {
+		t.Fatalf("parts=%v", parts)
+	}
+	fc := parts[0].(map[string]interface{})["functionCall"].(map[string]interface{})
+	args, _ := fc["args"].(map[string]interface{})
+	switch v := args["id"].(type) {
+	case json.Number:
+		if v.String() != "9007199254740993" {
+			t.Fatalf("args.id precision lost: %v", v)
+		}
+	case float64:
+		t.Fatalf("args.id decoded as float64 (precision lost): %v", v)
+	default:
+		t.Fatalf("unexpected args.id type %T: %v", v, v)
+	}
+	// 序列化出去必须是原始十进制串，不是舍入值。
+	b, _ := json.Marshal(parts)
+	if !strings.Contains(string(b), "9007199254740993") || strings.Contains(string(b), "9007199254740992") {
+		t.Fatalf("serialized args must carry the exact integer: %s", b)
+	}
+}
+
 // Task-mode pre-bunking regression via the stable HTTP entrypoint.
 //
 // Chat-mode prompts pre-bunk the platform's own "built-in tools 0 remaining"
@@ -435,6 +546,119 @@ func TestGeminiAPIToolPromptTailSkipsPlatformNoticeForTaskMode(t *testing.T) {
 					t.Errorf("%s: chat-mode prompt missing platform notice %q\n---\n%s",
 						m.name, want, prompt)
 				}
+			}
+		}
+	}
+}
+
+// Gemini clients may omit function-call IDs when replaying contents. Exercise
+// the real generate/stream handlers across three turns so regenerated adapter
+// IDs cannot silently force each new tool result into a fresh conversation.
+func TestGeminiHandlerContinuesToolHistoryWithoutCallIDs(t *testing.T) {
+	resetConversationTestState(t)
+	rtMu.Lock()
+	rtVal.MultiTurn = true
+	rtMu.Unlock()
+	var prompts []string
+	var turns []int
+	stubConversationTestTurn(t, func(_ context.Context, prompt string, _ ModelConfig, st *convState) (*StreamResult, error) {
+		prompts = append(prompts, prompt)
+		turns = append(turns, st.turn)
+		st.cid = "gemini-handler-conversation"
+		st.turn++
+		text := "Third turn complete."
+		switch len(prompts) {
+		case 1:
+			text = "```tool_call\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"one\"}}\n```\n```tool_call\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"two\"}}\n```"
+		case 2:
+			text = "Both Gemini tool results received."
+		}
+		return &StreamResult{Raw: conversationTestRaw(t, text)}, nil
+	})
+	firstUser := map[string]interface{}{"role": "user", "parts": []interface{}{map[string]interface{}{"text": "original-gemini-question"}}}
+	contents := []interface{}{firstUser}
+	req := map[string]interface{}{
+		"systemInstruction": map[string]interface{}{"parts": []interface{}{map[string]interface{}{"text": "stable-gemini-system"}}},
+		"tools": []interface{}{map[string]interface{}{"functionDeclarations": []interface{}{
+			map[string]interface{}{"name": "read_file", "parameters": map[string]interface{}{"type": "object"}},
+		}}},
+	}
+	call := func(action string) []interface{} {
+		t.Helper()
+		req["contents"] = contents
+		body, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/v1beta/models/gemini-3.5-flash-lite:" + action
+		if action == "streamGenerateContent" {
+			path += "?alt=sse"
+		}
+		r := httptest.NewRequest("POST", path, bytes.NewReader(body))
+		r.Header.Set("Authorization", "Bearer gemini-test-caller")
+		w := httptest.NewRecorder()
+		handleGeminiModelItem(w, r)
+		if w.Code != 200 {
+			t.Fatalf("%s handler status=%d: %s", action, w.Code, w.Body.String())
+		}
+		var chunks []map[string]interface{}
+		if action == "streamGenerateContent" {
+			chunks = sseChunks(t, w.Body.String())
+		} else {
+			var chunk map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &chunk); err != nil {
+				t.Fatal(err)
+			}
+			chunks = append(chunks, chunk)
+		}
+		var parts []interface{}
+		for _, chunk := range chunks {
+			parts = append(parts, chunkParts(chunk)...)
+		}
+		return parts
+	}
+	firstParts := call("generateContent")
+	if len(firstParts) != 2 {
+		t.Fatalf("want two actual Gemini function calls, got %#v", firstParts)
+	}
+	var results []interface{}
+	for i, raw := range firstParts {
+		part := raw.(map[string]interface{})
+		fc, ok := part["functionCall"].(map[string]interface{})
+		if !ok || getStr(fc, "name") != "read_file" {
+			t.Fatalf("missing actual Gemini functionCall: %#v", part)
+		}
+		// SDKs commonly replay only name/args, although our response also offers id.
+		delete(fc, "id")
+		results = append(results, map[string]interface{}{"functionResponse": map[string]interface{}{
+			"name": fc["name"], "response": map[string]interface{}{"result": []string{"gemini-result-one", "gemini-result-two"}[i]},
+		}})
+	}
+	contents = append(contents,
+		map[string]interface{}{"role": "model", "parts": firstParts},
+		map[string]interface{}{"role": "user", "parts": results},
+	)
+	secondParts := call("streamGenerateContent")
+	contents = append(contents,
+		map[string]interface{}{"role": "model", "parts": secondParts},
+		map[string]interface{}{"role": "user", "parts": []interface{}{map[string]interface{}{"text": "final-gemini-followup"}}},
+	)
+	call("generateContent")
+	if !reflect.DeepEqual(turns, []int{0, 1, 2}) {
+		t.Fatalf("ID-less tool replay and action changes must retain one upstream conversation, turns=%v", turns)
+	}
+	for _, want := range []string{"gemini-result-one", "gemini-result-two"} {
+		if !strings.Contains(prompts[1], want) {
+			t.Errorf("second turn dropped %q: %s", want, prompts[1])
+		}
+	}
+	if !strings.Contains(prompts[2], "final-gemini-followup") {
+		t.Errorf("third turn dropped final user message: %s", prompts[2])
+	}
+	for i := 1; i < len(prompts); i++ {
+		for _, old := range []string{"original-gemini-question", "stable-gemini-system", "Available tools"} {
+			if strings.Contains(prompts[i], old) {
+				t.Errorf("turn %d resent old context %q: %s", i+1, old, prompts[i])
 			}
 		}
 	}

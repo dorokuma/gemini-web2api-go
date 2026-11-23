@@ -45,7 +45,29 @@ var (
 	convStore = map[string]*convState{}
 )
 
-// convDelete 作废一路会话（续接失败时用，避免客户端重试还撞同一路死会话）。
+// convTake atomically consumes the longest matching proper prefix. A state is
+// never left under an old fingerprint after Google advances it: concurrent
+// duplicates and forks start fresh instead of mutating the same upstream turn.
+func convTake(keys []string) (*convState, int) {
+	convMu.Lock()
+	defer convMu.Unlock()
+	for i := len(keys) - 2; i >= 0; i-- {
+		st, ok := convStore[keys[i]]
+		if !ok {
+			continue
+		}
+		delete(convStore, keys[i])
+		if time.Since(st.updated) > convTTL {
+			continue
+		}
+		copy := *st
+		return &copy, i + 1
+	}
+	return nil, 0
+}
+
+// convDelete 删一路会话状态（仅测试清理用）：生产路径已换成 convTake
+// 原子消费——上游可能已推进，失败的续接不能把旧 head 放回去。
 func convDelete(key string) {
 	if key == "" {
 		return
@@ -55,24 +77,6 @@ func convDelete(key string) {
 	convMu.Unlock()
 }
 
-// convGet 取一路会话，顺带清掉过期的。
-func convGet(key string) *convState {
-	if key == "" {
-		return nil
-	}
-	convMu.Lock()
-	defer convMu.Unlock()
-	st, ok := convStore[key]
-	if !ok {
-		return nil
-	}
-	if time.Since(st.updated) > convTTL {
-		delete(convStore, key)
-		return nil
-	}
-	return st
-}
-
 // convPut 存一路会话，超量就按最旧的淘汰一批。
 func convPut(key string, st *convState) {
 	if key == "" {
@@ -80,8 +84,9 @@ func convPut(key string, st *convState) {
 	}
 	convMu.Lock()
 	defer convMu.Unlock()
-	st.updated = time.Now()
-	convStore[key] = st
+	snapshot := *st
+	snapshot.updated = time.Now()
+	convStore[key] = &snapshot
 	if len(convStore) > convMax {
 		// 简单淘汰：删掉过期的；还超就删最旧的一小批。
 		var oldestK string
@@ -102,39 +107,16 @@ func convPut(key string, st *convState) {
 	}
 }
 
-// canonicalMessages 把消息列表压成 role+text 的稳定串，用来算会话指纹。
-// 只取 role 和文本内容 —— 客户端每轮重发同样的历史，压出来的串一致才能识别续接。
+// canonicalMessages retains the semantic message structure, including tools.
+// JSON escaping makes embedded control characters unambiguous.
 func canonicalMessages(messages []map[string]interface{}) string {
-	var b strings.Builder
-	for _, m := range messages {
-		b.WriteString(getStr(m, "role"))
-		b.WriteByte(0x1f)
-		b.WriteString(contentToString(m["content"]))
-		b.WriteByte(0x1e)
-	}
-	return b.String()
+	b, _ := json.Marshal(normalizeConversationMessages(messages))
+	return string(b)
 }
 
 func hashStr(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
-}
-
-// convParentKey 是"这轮之前的历史"的指纹：除最后一条消息外的全部。
-// 命中 store 说明这是某路已知会话的延续，只要发最后一条新消息即可。
-func convParentKey(messages []map[string]interface{}) string {
-	if len(messages) < 2 {
-		return ""
-	}
-	return hashStr(canonicalMessages(messages[:len(messages)-1]))
-}
-
-// convChildKey 是"这轮之后的历史"的指纹：历史 + 本轮模型回复。
-// 下一轮请求的 parentKey 会正好等于它（客户端把我们的回复原样带回来），从而续上。
-func convChildKey(messages []map[string]interface{}, responseText string) string {
-	full := append(append([]map[string]interface{}{}, messages...),
-		map[string]interface{}{"role": "assistant", "content": responseText})
-	return hashStr(canonicalMessages(full))
 }
 
 var rcidRe = regexp.MustCompile(`"(rc_[A-Za-z0-9_-]{6,})"`)
@@ -510,16 +492,37 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。
-//   - 命中已知会话 → 只发最后一条新消息（user 或 tool 结果），历史留服务端（绕开字节墙）。
+//   - 命中已知历史前缀 → 发全部新增消息（user 或 tool 结果），历史留服务端（绕开字节墙）。
 //   - 没命中 → 新建会话，首轮发全量拼接的历史（含 tools 指令，把当前上下文交给服务端）。
 //
 // 支持 tools（续接里也解析 ```tool_call``` 围栏）；图片走原单轮路径（callGemini）。
+// ctx 全程透传：客户端取消/超时不能丢（本仓跟上游的分歧点，上游没有 ctx 参数）。
 func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc ModelConfig,
 	tools []map[string]interface{}, toolChoice interface{},
-	onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	parentKey := convParentKey(messages)
-	conv := convGet(parentKey)
+	onDelta, onReasoning func(string), options ...conversationOptions) (string, []ToolCall, *StreamResult, error) {
+	// 已取消的请求不许动会话存储和账号池：convTake 会销毁健康 head，
+	// pickAccountForModel 会白占一轮轮询。
+	if err := ctx.Err(); err != nil {
+		return "", nil, &StreamResult{}, err
+	}
+	messages = normalizeConversationMessages(messages)
+	var opt conversationOptions
+	if len(options) > 0 {
+		opt = options[0]
+	}
+	scope := convScopeKey(mc, tools, toolChoice, opt.requestScope)
+	conv, prefixLen := convTake(convPrefixKeys(messages, scope, opt.normalizeToolIDs))
 	fresh := conv == nil
+	if !fresh && conv.isLogin {
+		// 会话绑死的号被禁用/删除后不能再往上发：禁用的号发出去要么失败，
+		// 更糟的是在 BrowserTransport=true && BrowserFallbackHTTP=false 下
+		// 绕过常驻浏览器漏出 Go HTTP 指纹。强制冷启动让挑号逻辑重新选健康账号。
+		if a := accountByID(conv.accountID); a == nil || a.Status != "enabled" {
+			logf("[conv] 会话绑定账号 #%d 已禁用或删除，回退冷启动重挑账号", conv.accountID)
+			fresh = true
+			conv = nil
+		}
+	}
 
 	var prompt string
 	if fresh {
@@ -528,8 +531,20 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 		prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
 		logf("[conv] 新会话，首轮发 %d 字节（tools=%d）", len(prompt), len(tools))
 	} else {
-		prompt = formatNewTurn(messages[len(messages)-1])
-		logf("[conv] 续接命中 turn=%d，只发 %d 字节（历史留服务端）", conv.turn, len(prompt))
+		// 续接一次性发 messages[prefixLen:] 全部新增消息，跟首轮同一个格式化
+		// 通道（tool 结果带 [Tool result for …] 前缀）；mc.TaskMode 必须透传——
+		// Task 模式的工具锚点不收平台「0 remaining」免疫词。
+		prompt = buildPrompt(messages[prefixLen:], nil, nil, mc.TaskMode)
+		if strings.TrimSpace(prompt) == "" {
+			// 增量拼不出正文（新增消息全空）：发 0 字节 prompt 上游只会报
+			// 一个看不懂的错，回退全量历史冷启动。
+			fresh = true
+			conv = nil
+			prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
+			logf("[conv] 续接增量为空，回退新会话全量发 %d 字节", len(prompt))
+		} else {
+			logf("[conv] 续接命中 turn=%d，只发 %d 字节（新增 %d 条消息，历史留服务端）", conv.turn, len(prompt), len(messages)-prefixLen)
+		}
 	}
 
 	// strict_model 换号只对新会话做：续接的会话绑死在原来的号上，降级了只记冷却、
@@ -574,16 +589,14 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 				}
 			}
 		}
-		res, err = streamGenerateConv(ctx, prompt, mc, conv, onDelta, onReasoning)
+		res, err = runConversationTurn(ctx, prompt, mc, conv, onDelta, onReasoning)
 		if !retryOnAnotherAccount(res, err, mc, exclude) || !fresh {
 			break
 		}
 	}
 	if err != nil {
-		if !fresh {
-			// 续接失败：这路会话作废，客户端重试时会当新会话全量重发。
-			convDelete(parentKey)
-		}
+		// 旧 head 已在生成前被 convTake 消费：失败请求上游可能已推进，
+		// 不能把旧状态放回去让重试撞同一路会话——客户端重发全历史时会冷启动。
 		return "", nil, res, err
 	}
 	text := extractResponseText(res.Raw)
@@ -592,9 +605,6 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 		text, toolCalls = parseToolCalls(text)
 	}
 	if text == "" && len(toolCalls) == 0 {
-		if !fresh {
-			convDelete(parentKey)
-		}
 		// 跟 callGemini 同一套：有帧抽不出正文（坏围栏 / 只有思考链）是
 		// empty_content，真没帧才是 no_content_frame。
 		if hasContentFrame(res.Raw) {
@@ -606,18 +616,17 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
 			reason: reasonNoContentFrame, res: res}
 	}
-	// 存续接状态：客户端下一轮把这段回复原样带回来时，parentKey 会命中这里。
-	// 存的是解析掉围栏后的正文 —— 客户端把 assistant 消息带回来时 content 也是这段。
-	convPut(convChildKey(messages, text), conv)
+	// 存续接状态：按完整逻辑回复（含 tool_calls）发布新 head——客户端下一轮把
+	// 这段回复原样带回来时，convTake 会命中它的前缀键。只发新 head，旧键已消费，
+	// 纯工具回复（text 为空、只有 tool_calls）也能被区分开。
+	keys := convPrefixKeys(conversationMessagesWithReply(messages, text, toolCalls), scope, opt.normalizeToolIDs)
+	// 没拿到 cid 的会话不能落库：上游没给 cid 就永远续接不上，存了只会让
+	// 下一路同前缀请求撞进一条死会话（发的续接请求带空 cid）。
+	if len(keys) > 0 && conv.cid != "" {
+		convPut(keys[len(keys)-1], conv)
+	}
 	return text, toolCalls, res, nil
 }
 
-// formatNewTurn 把续接要发的那条新消息格式化，跟 messagesToPrompt 里各角色的写法对齐，
-// 好让服务端历史里的模型认得出这是工具结果还是用户新话。
-func formatNewTurn(msg map[string]interface{}) string {
-	content := contentToString(msg["content"])
-	if getStr(msg, "role") == "tool" {
-		return fmt.Sprintf("[Tool result for %s]: %s", getStr(msg, "name"), content)
-	}
-	return content
-}
+// runConversationTurn is the upstream seam used by continuation regression tests.
+var runConversationTurn = streamGenerateConv
