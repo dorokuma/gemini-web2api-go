@@ -82,7 +82,10 @@ func refreshBL(proxyURL string) {
 	var err error
 	// 浏览器传输模式：从常驻页面拿（页内 fetch /app 的 HTML 里有 cfb2h）。
 	// 匿名语义不变——这个值跟登录态无关，浏览器 jar 里登着谁也不影响。
-	if shouldUseBrowserTransport() {
+	// 但存在代理池（或浏览器已绑定特定出口）时绝不能为了抓 bl 去抢切共享
+	// 浏览器桥：匿名刷新按目标出口走纯 Go HTTP，避免一次后台抓取把桥的
+	// 出口从正在用的代理切走（跨出口泄漏，见 acquireBridgeExit 协调）。
+	if shouldUseBrowserTransport() && !hasProxyPool() && browserMgr.seedAccountBound() == 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
 		// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。

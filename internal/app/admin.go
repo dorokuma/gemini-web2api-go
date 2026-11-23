@@ -469,15 +469,28 @@ func handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 	for _, p := range listProxies() {
 		proxyNames[p.ID] = p.Name
 	}
+	// 直连槽（u.ProxyID == 0）出现在列表里、且存在启用账号锁定 -1 时，
+	// 它的真实用途就是「本机直连（锁定）」——标清，不与普通「直连」混淆。
+	lockedDirect := false
+	for _, a := range accountList() {
+		if a.Status == "enabled" && a.ProxyID == proxyIDDirect {
+			lockedDirect = true
+			break
+		}
+	}
 	out := make([]map[string]interface{}, 0, len(usage))
 	for _, u := range usage {
 		name := "直连"
-		if u.ProxyID > 0 {
+		if u.ProxyID == proxyIDDirect {
+			name = proxyDisplayName(proxyIDDirect) // "本机直连（锁定）"
+		} else if u.ProxyID > 0 {
 			if n, ok := proxyNames[u.ProxyID]; ok {
 				name = n
 			} else {
 				name = "(已删除)"
 			}
+		} else if lockedDirect {
+			name = proxyDisplayName(proxyIDDirect)
 		}
 		out = append(out, map[string]interface{}{
 			"proxy_id":         u.ProxyID,
@@ -491,6 +504,44 @@ func handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, 200, map[string]interface{}{"items": out})
+}
+
+// compatibleProbeAccount 为连通性测试挑一个与目标出口兼容的启用账号：
+// target==0（测直连）→ 锁定直连(-1)优先；池非空且关 fallback_direct 时**只允许**
+//
+//	锁定直连号（未绑定的 0 号在「绝不直连」的池规则下借本机 IP 同样是串出口），
+//	池规则允许直连时才退回未绑定(0)；
+//
+// target>0（测代理 #N）→ 绑 N 优先、其次未绑定(0)。
+// 找不到兼容号返回 nil——调用方走匿名探测，绝不借一个不兼容的号串出口。
+func compatibleProbeAccount(target int64) *CookieAccount {
+	// 测直连（target==0）时严格匿名：池非空且关 fallback_direct 只允许锁定
+	// 直连号——未绑定的 0 号在「绝不直连」的池规则下借本机 IP 同样是串出口。
+	directLockedOnly := target == 0 && hasProxyPool() && !rtCfg().FallbackDirect
+	var fallback *CookieAccount
+	for _, a := range accountList() {
+		if a.Status != "enabled" {
+			continue
+		}
+		if probeAcctMatches(a, target) {
+			cp := a
+			return &cp
+		}
+		if a.ProxyID == 0 && !directLockedOnly && fallback == nil {
+			cp := a
+			fallback = &cp
+		}
+	}
+	return fallback
+}
+
+// probeAcctMatches 判断账号是否精确匹配探测目标出口：
+// target==0 → 只认锁定直连（-1）；target>0 → 绑它才行。
+func probeAcctMatches(a CookieAccount, target int64) bool {
+	if target == 0 {
+		return a.ProxyID == proxyIDDirect
+	}
+	return a.ProxyID == target
 }
 
 func atoiDefault(s string, d int) int {
@@ -581,7 +632,8 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "bad proxy_id"})
 			return
 		}
-		if proxyID == 0 {
+		if proxyID <= 0 {
+			// proxy_id=0（旧语义）与 proxy_id=-1（锁定直连槽）都测本机直连
 			useDirect = true
 			proxyName = "直连"
 		} else {
@@ -604,8 +656,22 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		proxyURL = ""
 	}
 
+	// 测出口要挑与该出口兼容的账号，杜绝「点测试把 TR Cookie 从 JP 代理发出」：
+	//   - 测直连（proxy_id=0/-1）：优先锁直连的号，其次未绑定的号，
+	//     绝不挑绑着代理的号（它的 Cookie 从本机 IP 出去就是串出口）；
+	//   - 测某代理：优先绑它的号，其次未绑定的号，绝不挑锁定直连的号。
+	// 自动模式照旧（出口跟着第一个启用代理/直连走）。
+	var probeAcct *CookieAccount
+	switch {
+	case useDirect:
+		// 只要最终走直连就按直连挑兼容号（显式或自动模式同判）。
+		probeAcct = compatibleProbeAccount(0)
+	case proxyID > 0:
+		probeAcct = compatibleProbeAccount(proxyID)
+	}
+
 	t0 := time.Now()
-	res := probeGemini(prompt, proxyURL)
+	res := probeGeminiWithAccount(prompt, proxyURL, probeAcct, false)
 	res.TotalMs = time.Since(t0).Milliseconds()
 	res.ProxyID = proxyID
 	res.ProxyName = proxyName
@@ -679,7 +745,11 @@ func classifyError(errStr string) string {
 		// 上游返回 200 但一个内容帧都没有（或帧在但抽不出正文）。实测是瞬时拒绝，
 		// 隔几分钟自行恢复，跟频率/并发/累积次数都无关，重试即可。
 		return "upstream_rejected"
-	case strings.Contains(errStr, "slot full") || strings.Contains(errStr, "limit reached"):
+	case strings.Contains(errStr, "slot full") || strings.Contains(errStr, "limit reached") ||
+		strings.Contains(errStr, "locked direct exit unavailable") ||
+		strings.Contains(errStr, "bound proxy"):
+		// 锁定直连不可用 / 严格绑定出口不可用也是本地限流（Bound 429），
+		// 不是网络错误——归同类面板才能按「该加代理/解绑」行动。
 		return "rate_limited_local"
 	case strings.Contains(errStr, "proxy_unavailable"):
 		return "network"

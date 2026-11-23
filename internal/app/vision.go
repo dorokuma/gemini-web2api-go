@@ -85,6 +85,19 @@ func collectImages(messages []map[string]interface{}, proxyURL string) ([]pendin
 	return out, nil
 }
 
+// hasMediaInMessages 轻量预判 messages 里是否含媒体 part（不下载、不解码）。
+// 用于 compact 前的 multiTurnEligible/anonEligible 预判——不再为判定先跑一遍
+// collectImages 下载远程图（compact 前后各收一次会重复下载，且被裁轮次里
+// 失效外链图会让 compact 前就提前 400）。
+func hasMediaInMessages(messages []map[string]interface{}) bool {
+	for _, m := range messages {
+		if hasMediaParts(m["content"]) {
+			return true
+		}
+	}
+	return false
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {

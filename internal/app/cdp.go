@@ -45,10 +45,14 @@ type cdpClient struct {
 	// 事件分发：按 method 精确匹配注册。同一个 method 允许多个监听器
 	// （崩溃自愈和流式管道都要听 Inspector.targetCrashed 一类的信号时
 	// 不必互相覆盖）。onceHandlers 是触发一次就摘除的监听器（waitPageLoad
-	// 这类「等一次事件」的场景，反复注册会累积）。
+	// 这类「等一次事件」的场景，反复注册会累积）。每条 onceEntry 带单调
+	// 递增 id（cancel 按 id 精确摘除——同一函数字面量生成的多个闭包共享
+	// 相同代码指针，靠指针识别会跨协程误删）与可选的 sessionID 过滤
+	// （别的 session 的同名事件不该摘除本 session 的监听器）。
 	evtMu        sync.RWMutex
 	handlers     map[string][]func(cdpEvent)
-	onceHandlers map[string][]func(cdpEvent)
+	onceHandlers map[string][]onceEntry
+	nextOnceID   atomic.Uint64
 	anyHandler   func(cdpEvent) // 兜底监听器，nil = 不要
 
 	err     error // 连接死后的终态错误，给后续 Call 立刻返回
@@ -70,7 +74,7 @@ func newCDPClient(conn *cdpConn) *cdpClient {
 		conn:         conn,
 		pending:      map[int64]chan cdpReply{},
 		handlers:     map[string][]func(cdpEvent){},
-		onceHandlers: map[string][]func(cdpEvent){},
+		onceHandlers: map[string][]onceEntry{},
 		done:         make(chan struct{}),
 	}
 	go c.readLoop()
@@ -92,12 +96,44 @@ func (c *cdpClient) OnAny(fn func(cdpEvent)) {
 	c.evtMu.Unlock()
 }
 
+// onceEntry 是一条 Once 监听器：id 是注册序号（单调递增，cancel 按它
+// 精确摘除）；sessionID 非空时只响应同 session 的事件（"" = 不限 session）。
+type onceEntry struct {
+	id        uint64
+	sessionID string
+	fn        func(cdpEvent)
+}
+
 // Once 注册一个只触发一次的 method 监听器：第一次匹配事件到达时调用 fn 后
 // 自动摘除。用于「等一次事件」的场合（Page.loadEventFired），避免反复注册累积。
-func (c *cdpClient) Once(method string, fn func(cdpEvent)) {
+// 返回的 cancel 可在等待方放弃时提前摘除监听器（事件永不到达时防泄漏）。
+func (c *cdpClient) Once(method string, fn func(cdpEvent)) (cancel func()) {
+	return c.OnceSession("", method, fn)
+}
+
+// OnceSession 同 Once，但只响应 sessionID 匹配的事件（sessionID="" 时不限，
+// 仍要求监听器本身不绑定特定 session）。别的 session 发出的同名事件不会
+// 摘除本监听器——dispatch 按 entry.sessionID 精确过滤，只摘除命中者。
+func (c *cdpClient) OnceSession(sessionID, method string, fn func(cdpEvent)) (cancel func()) {
+	id := c.nextOnceID.Add(1)
 	c.evtMu.Lock()
-	c.onceHandlers[method] = append(c.onceHandlers[method], fn)
+	c.onceHandlers[method] = append(c.onceHandlers[method],
+		onceEntry{id: id, sessionID: sessionID, fn: fn})
 	c.evtMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.evtMu.Lock()
+			list := c.onceHandlers[method]
+			for i, e := range list {
+				if e.id == id {
+					c.onceHandlers[method] = append(list[:i:i], list[i+1:]...)
+					break
+				}
+			}
+			c.evtMu.Unlock()
+		})
+	}
 }
 
 // setOnClose 注册断连回调（只允许设一次，重复设置会覆盖旧值）。
@@ -257,9 +293,24 @@ func (c *cdpClient) dispatch(payload []byte) {
 	evt := cdpEvent{SessionID: head.SessionID, Method: head.Method, Params: head.Params}
 	c.evtMu.Lock()
 	fns := append([]func(cdpEvent){}, c.handlers[head.Method]...)
-	onces := c.onceHandlers[head.Method]
-	if len(onces) > 0 {
-		delete(c.onceHandlers, head.Method) // 触发即摘除，不管 fn 是否真用到
+	// onceHandlers 按 entry.sessionID 精确过滤：只摘除并触发匹配
+	// （不限 session 或与事件 session 一致）的条目；别的 session 的同名
+	// 监听器原样留在表里等自己的事件，绝不能被无关事件整键清空。
+	var onces []func(cdpEvent)
+	if list := c.onceHandlers[head.Method]; len(list) > 0 {
+		kept := list[:0]
+		for _, e := range list {
+			if e.sessionID == "" || e.sessionID == evt.SessionID {
+				onces = append(onces, e.fn)
+			} else {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.onceHandlers, head.Method)
+		} else {
+			c.onceHandlers[head.Method] = kept
+		}
 	}
 	any := c.anyHandler
 	c.evtMu.Unlock()

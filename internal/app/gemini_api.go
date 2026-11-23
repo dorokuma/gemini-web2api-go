@@ -490,6 +490,11 @@ type geminiCall struct {
 	prompt       string
 	pc           promptCtx
 	requestScope string
+	// multiTurn 是 prepareGemini 阶段算定的多轮资格（compact 落定后）：
+	// run() 直接复用它而不是重新按 len(g.images) 判定——compact 裁掉带图
+	// 轮次后 prepare 与 run 的判定必须一致，否则已注入 [System note] 的
+	// 裁剪结果会被反手切进 callGeminiConv（R2-M5）。
+	multiTurn bool
 }
 
 func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*geminiCall, bool) {
@@ -510,24 +515,55 @@ func prepareGemini(w http.ResponseWriter, r *http.Request, model string) (*gemin
 		writeGeminiError(w, 400, err.Error())
 		return nil, false
 	}
-	images, err := collectImages(messages, "")
-	if err != nil {
-		writeGeminiError(w, 400, err.Error())
+	prompt, pc := messagesToPrompt(messages, tools, toolChoice, modelCfg.TaskMode)
+	// context_overflow_mode=compact：Google 原生入口同 OpenAI 两入口接入结构化
+	// 裁剪；MultiTurn / anonFirstEligible 同样跳过（保护 convPrefixKeys 指纹）。
+	// 资格判定用轻量 hasMediaInMessages 预判（不重复下载远程图）。
+	g, images, ok2 := resolveGeminiGate(w, messages, prompt, pc, modelCfg, tools, toolChoice)
+	if !ok2 {
 		return nil, false
 	}
-	prompt, pc := messagesToPrompt(messages, tools, toolChoice, modelCfg.TaskMode)
+	messages, prompt, pc = g.messages, g.prompt, g.pc
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeGeminiError(w, 400, "contents is empty")
 		return nil, false
 	}
 	return &geminiCall{ctx: r.Context(), req: req, modelName: modelName, modelCfg: modelCfg, messages: messages,
 		tools: tools, toolChoice: toolChoice, images: images, prompt: prompt, pc: pc,
+		multiTurn:    g.multiTurnEligible,
 		requestScope: conversationRequestScope(r, "", "")}, true
 }
 
-// run 调上游；多轮开关的分流跟 /v1/chat/completions 一致。
+// resolveGeminiGate 收口 prepareGemini 的 compact 门与图片收集：返回
+// (gate 结果, 已收集图片, ok)。出错时已写好响应。
+func resolveGeminiGate(w http.ResponseWriter, messages []map[string]interface{}, prompt string, pc promptCtx, modelCfg ModelConfig, tools []map[string]interface{}, toolChoice interface{}) (promptGate, []pendingUpload, bool) {
+	g, cerr := applyCompactGate(promptGate{
+		messages: messages, prompt: prompt, pc: pc,
+		hasMedia: hasMediaInMessages(messages),
+	}, modelCfg, func(ms []map[string]interface{}) (string, promptCtx) {
+		return messagesToPrompt(ms, tools, toolChoice, modelCfg.TaskMode)
+	})
+	if cerr != nil {
+		var ptl *PromptTooLongError
+		if errors.As(cerr, &ptl) {
+			writeGeminiError(w, 400, ptl.Error())
+		} else {
+			writeGeminiError(w, 500, cerr.Error())
+		}
+		return promptGate{}, nil, false
+	}
+	images, err := collectImages(g.messages, "")
+	if err != nil {
+		writeGeminiError(w, 400, err.Error())
+		return promptGate{}, nil, false
+	}
+	return g, images, true
+}
+
+// run 调上游；多轮资格直接用 prepareGemini 算定的 g.multiTurn——compact 裁掉
+// 带图轮次后 prepare 与 run 的判定绝不失步（不再按 len(g.images) 重判）。
 func (g *geminiCall) run(onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	if rtCfg().MultiTurn && len(g.images) == 0 && g.modelCfg.Tool == 0 {
+	if g.multiTurn {
 		return callGeminiConv(g.ctx, g.messages, g.modelCfg, g.tools, g.toolChoice, onDelta, onReasoning,
 			conversationOptions{requestScope: g.requestScope, normalizeToolIDs: true})
 	}

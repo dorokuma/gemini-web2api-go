@@ -304,15 +304,44 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 图片先解出来带着，真正上传要等挑完账号和出口（见 streamGenerate）。
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+
+	// context_overflow_mode=compact：在结构化 messages[] 层裁掉最早的
+	// 原子消息组再重拼 prompt；裁不动时 err 是 *PromptTooLongError。
+	// MultiTurn 续接与 anonFirstEligible 匿名路径跳过：改了 messages 会破坏
+	// convPrefixKeys 前缀指纹（每轮退化为全量冷启动），续接轮次也不发全量
+	// prompt，compact 不适用。
+	// 资格判定用轻量 hasMediaInMessages 预判（不下载远程图）：compact 前后
+	// 各跑一次 collectImages 会重复下载远程图，且被裁轮次里的失效外链会让
+	// 请求在裁剪前提前 400。collectImages 只在判定落定的这里跑一次——已丢
+	// 轮次的图不再幽灵上传。
+	g, cerr := applyCompactGate(promptGate{
+		messages: messages, prompt: prompt, pc: pc,
+		hasMedia: hasMediaInMessages(messages),
+	}, modelCfg, func(ms []map[string]interface{}) (string, promptCtx) {
+		return messagesToPrompt(ms, tools, req["tool_choice"], modelCfg.TaskMode)
+	})
+	if cerr != nil {
+		var ptl *PromptTooLongError
+		if errors.As(cerr, &ptl) {
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
+			return
+		}
+		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
+		return
+	}
+	messages, prompt, pc = g.messages, g.prompt, g.pc
+	multiTurnEligible := g.multiTurnEligible
+
+	// 图片在 compact 落定后只收一次：真正上传要等挑完账号和出口（见 streamGenerate）。
 	images, err := collectImages(messages, "")
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
 			"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
-
-	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty prompt"}})
 		return
@@ -350,7 +379,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+	if multiTurnEligible {
 		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
 		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
@@ -358,43 +387,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	ka.Stop() // 之后的收尾回到单 goroutine 写；Started() 也要在保活停下后再看
 	if err != nil {
-		if clientGone(r, "chat.completions", modelName, prompt, res, stream) {
-			return
-		}
-		var mde *ModelDowngradedError
-		downgraded := errors.As(err, &mde)
-		status := 502
-		if downgraded {
-			status = 429
-		}
-		recordUpstreamFailure("chat.completions", modelName, prompt, res, status, err, stream)
-		if sse != nil && sse.Started() {
-			sse.Fail(err, res) // 已经开流，HTTP 状态码改不了了
-			return
-		}
-		if downgraded {
-			writeModelDowngraded(w, mde)
-			return
-		}
-		var ptl *PromptTooLongError
-		if errors.As(err, &ptl) {
-			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
-			// 一个答非所问的 200，根本看不出请求其实没送到。
-			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
-				"message": ptl.Error(), "type": "invalid_request_error",
-				"code": "context_length_exceeded"}})
-			return
-		}
-		var rle *RateLimitError
-		if errors.As(err, &rle) {
-			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-				"message": rle.Error(),
-				"type":    "rate_limit_exceeded",
-				"code":    "ip_slot_full",
-			}})
-			return
-		}
-		writeUpstreamError(w, err, res)
+		failChatRequest(w, r, modelName, prompt, res, err, stream, sse)
 		return
 	}
 
@@ -452,6 +445,128 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}},
 		"usage": usageOf(prompt, text, res),
 	})
+}
+
+// failChatRequest 是 handleChatCompletions 失败路径的统一收尾：客户端断开
+// 记 499、降级 429、超长 400、限流 429、已开流走 SSE 错误块、其余 502
+// 结构化诊断（从 handleChatCompletions 抽出，行为逐字不变）。
+func failChatRequest(w http.ResponseWriter, r *http.Request, modelName, prompt string,
+	res *StreamResult, err error, stream bool, sse *sseWriter) {
+	if clientGone(r, "chat.completions", modelName, prompt, res, stream) {
+		return
+	}
+	var mde *ModelDowngradedError
+	downgraded := errors.As(err, &mde)
+	status := 502
+	if downgraded {
+		status = 429
+	}
+	recordUpstreamFailure("chat.completions", modelName, prompt, res, status, err, stream)
+	if sse != nil && sse.Started() {
+		sse.Fail(err, res) // 已经开流，HTTP 状态码改不了了
+		return
+	}
+	if downgraded {
+		writeModelDowngraded(w, mde)
+		return
+	}
+	var ptl *PromptTooLongError
+	if errors.As(err, &ptl) {
+		// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
+		// 一个答非所问的 200，根本看不出请求其实没送到。
+		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+			"message": ptl.Error(), "type": "invalid_request_error",
+			"code": "context_length_exceeded"}})
+		return
+	}
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+			"message": rle.Error(),
+			"type":    "rate_limit_exceeded",
+			"code":    "ip_slot_full",
+		}})
+		return
+	}
+	writeUpstreamError(w, err, res)
+}
+
+// responsesFailedError 是 /v1/responses 流式 response.failed 事件的错误对象：
+// 同一份 upstreamErrorJSON 诊断字段，再按错误类型映射 type/code——
+// ModelDowngradedError→model_downgraded、PromptTooLongError→
+// invalid_request_error/context_length_exceeded、RateLimitError→
+// rate_limit_exceeded/ip_slot_full。
+func responsesFailedError(err error, res *StreamResult) map[string]interface{} {
+	errObj := upstreamErrorJSON(err, res)
+	var mde *ModelDowngradedError
+	if errors.As(err, &mde) {
+		errObj["code"] = "model_downgraded"
+	}
+	var ptl *PromptTooLongError
+	if errors.As(err, &ptl) {
+		errObj["type"] = "invalid_request_error"
+		errObj["code"] = "context_length_exceeded"
+	}
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		errObj["type"] = "rate_limit_exceeded"
+		errObj["code"] = "ip_slot_full"
+	}
+	return errObj
+}
+
+// failResponsesRequest 是 handleResponses 失败路径的统一收尾：客户端断开
+// 记 499；已开流（HTTP 200 已锁）走 response.failed 事件带同一份错误
+// 分类；未开流按 降级429/超长400/限流429/其余502 分流。
+func failResponsesRequest(w http.ResponseWriter, r *http.Request, modelName, prompt, rid string,
+	res *StreamResult, err error, stream bool, writeEvent func(string, interface{})) {
+	if clientGone(r, "responses", modelName, prompt, res, stream) {
+		return
+	}
+	var mde *ModelDowngradedError
+	downgraded := errors.As(err, &mde)
+	status := 502
+	if downgraded {
+		status = 429
+	}
+	recordUpstreamFailure("responses", modelName, prompt, res, status, err, stream)
+	if stream {
+		// Responses 流式状态码已锁 200，诊断走 response.failed 事件（同一份字段）。
+		writeEvent("response.failed", map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id":     rid,
+				"object": "response",
+				"status": "failed",
+				"model":  modelName,
+				"error":  responsesFailedError(err, res),
+			},
+		})
+		return
+	}
+	if downgraded {
+		writeModelDowngraded(w, mde)
+		return
+	}
+	var ptl *PromptTooLongError
+	if errors.As(err, &ptl) {
+		// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
+		// 一个答非所问的 200，根本看不出请求其实没送到。
+		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+			"message": ptl.Error(), "type": "invalid_request_error",
+			"code": "context_length_exceeded"}})
+		return
+	}
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+			"message": rle.Error(),
+			"type":    "rate_limit_exceeded",
+			"code":    "ip_slot_full",
+		}})
+		return
+	}
+	writeUpstreamError(w, err, res)
 }
 
 // statusClientClosed 是客户端先断开时记进 requests 表的状态码（沿用 nginx 的 499）。
@@ -568,14 +683,40 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
+
+	// context_overflow_mode=compact：同 handleChatCompletions 的结构化裁剪。
+	// MultiTurn 续接与 anonFirstEligible 匿名路径同样跳过（保护 convPrefixKeys）。
+	// 资格判定用轻量 hasMediaInMessages 预判（不下载远程图）；裁剪后资格已按
+	// 新媒体态重算（裁掉带图轮次后 anonEligible 可能翻回 true）。
+	g, cerr := applyCompactGate(promptGate{
+		messages: messages, prompt: prompt, pc: pc,
+		hasMedia: hasMediaInMessages(messages),
+	}, modelCfg, func(ms []map[string]interface{}) (string, promptCtx) {
+		return messagesToPrompt(ms, tools, req["tool_choice"], modelCfg.TaskMode)
+	})
+	if cerr != nil {
+		var ptl *PromptTooLongError
+		if errors.As(cerr, &ptl) {
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
+			return
+		}
+		writeJSON(w, 500, map[string]interface{}{"error": map[string]string{"message": cerr.Error()}})
+		return
+	}
+	messages, prompt, pc = g.messages, g.prompt, g.pc
+	multiTurnEligible := g.multiTurnEligible
+	anonEligible := g.anonEligible
+
+	// 图片在 compact 落定后只收一次（不重复下载远程图，已丢轮次不幽灵上传）。
 	images, err := collectImages(messages, "")
 	if err != nil {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
 			"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
-
-	prompt, pc := messagesToPrompt(messages, tools, req["tool_choice"], modelCfg.TaskMode)
 	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty input"}})
 		return
@@ -602,6 +743,19 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var onDelta func(string)
 	var ka *streamKeepalive
 	if stream {
+		// 开流前的确定性超长预检：命中后 WriteHeader 还没发，可以直接回
+		// 400——否则流式请求的超长会在 response.failed 里以 200 报，客户端
+		// 看不到 context_length_exceeded。MultiTurn 不发完整 prompt 不适用。
+		if ptlErr := responsesContextOverflowCheck(prompt, pc, multiTurnEligible,
+			anonEligible); ptlErr != nil {
+			var ptl *PromptTooLongError
+			if errors.As(ptlErr, &ptl) {
+				writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+					"message": ptl.Error(), "type": "invalid_request_error",
+					"code": "context_length_exceeded"}})
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
@@ -677,64 +831,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+	if multiTurnEligible {
 		text, toolCalls, res, err = callGeminiConv(r.Context(), messages, modelCfg, tools, req["tool_choice"], onDelta, nil, conversationOptions{requestScope: conversationRequestScope(r, getStr(req, "prompt_cache_key"), getStr(req, "user"))})
 	} else {
 		text, toolCalls, res, err = callGemini(r.Context(), prompt, pc, modelCfg, tools, images, onDelta, nil)
 	}
 	ka.Stop()
 	if err != nil {
-		if clientGone(r, "responses", modelName, prompt, res, stream) {
-			return
-		}
-		var mde *ModelDowngradedError
-		downgraded := errors.As(err, &mde)
-		status := 502
-		if downgraded {
-			status = 429
-		}
-		recordUpstreamFailure("responses", modelName, prompt, res, status, err, stream)
-		if stream {
-			// Responses 流式状态码已锁 200，诊断走 response.failed 事件（同一份字段）。
-			errObj := upstreamErrorJSON(err, res)
-			if downgraded {
-				errObj["code"] = "model_downgraded"
-			}
-			writeEvent("response.failed", map[string]interface{}{
-				"type": "response.failed",
-				"response": map[string]interface{}{
-					"id":     rid,
-					"object": "response",
-					"status": "failed",
-					"model":  modelName,
-					"error":  errObj,
-				},
-			})
-			return
-		}
-		if downgraded {
-			writeModelDowngraded(w, mde)
-			return
-		}
-		var ptl *PromptTooLongError
-		if errors.As(err, &ptl) {
-			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
-			// 一个答非所问的 200，根本看不出请求其实没送到。
-			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
-				"message": ptl.Error(), "type": "invalid_request_error",
-				"code": "context_length_exceeded"}})
-			return
-		}
-		var rle *RateLimitError
-		if errors.As(err, &rle) {
-			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-				"message": rle.Error(),
-				"type":    "rate_limit_exceeded",
-				"code":    "ip_slot_full",
-			}})
-			return
-		}
-		writeUpstreamError(w, err, res)
+		failResponsesRequest(w, r, modelName, prompt, rid, res, err, stream, writeEvent)
 		return
 	}
 

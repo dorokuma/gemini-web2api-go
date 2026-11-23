@@ -601,7 +601,7 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	// 严格绑定下绑定仲裁已在 acquireClaimedSlot 里完成：这里再无条件覆写会把
 	// 已仲裁出的胜者改成本次挑到的出口。非严格模式保留原写库语义（首次绑定/失效重绑）。
 	if !rtCfg().StrictProxyBinding && picked.ID > 0 && a.ProxyID != picked.ID {
-		bindAccountProxy(a.ID, picked.ID)
+		autoBindAccountProxy(a.ID, picked.ID)
 	}
 	detail := "登录态有效"
 	if extractSAPISID(a.Cookie) == "" {
@@ -648,6 +648,31 @@ func bindAccountProxy(accountID, proxyID int64) {
 	bindAccountProxyLocked(accountID, proxyID)
 }
 
+// autoBindAccountProxy 是**非管理员自动写绑**的统一入口：在 claimMu 锁内先
+// 重查 DB 当前绑定，绝不拿锁外陈旧快照决定写不写——管理员在 getXSRF 等
+// 网络 I/O 期间刚把账号锁成 proxyIDDirect（-1）时，这里能拦下不覆写。
+//
+// 绝不覆写的情形：
+//   - 账号已删（a == nil）或库里已锁 proxyIDDirect；
+//   - proxyID <= 0（自动写绑只认真实代理出口，不写 -1/0 哨兵）；
+//   - 库里已有仍有效的启用代理绑定（a.ProxyID > 0 且 proxyUsableByID）——
+//     粘性不能拿本轮撞到的别的出口打散。
+func autoBindAccountProxy(accountID, proxyID int64) {
+	if accountID <= 0 || proxyID <= 0 {
+		return
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	a := accountByID(accountID)
+	if a == nil || a.ProxyID == proxyIDDirect {
+		return // 已删 / 锁定直连：绝不覆写
+	}
+	if a.ProxyID > 0 && proxyUsableByID(a.ProxyID) {
+		return // 已有仍有效的启用代理绑定：不打散粘性
+	}
+	bindAccountProxyLocked(accountID, proxyID)
+}
+
 // claimMu 把「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作。
 // 不加锁时两个并发请求同时拿到同一未绑定账号、各自 acquireSlot 选了不同出口，
 // 发完 getXSRF 才先后写 bindAccountProxy——后写覆盖先写，这个号已经从两个 IP
@@ -658,6 +683,8 @@ var claimMu sync.Mutex
 //   - 已绑定且绑定出口仍然存在且 enabled：返回绑定值，不覆写——熔断冷却中的绑定
 //     照样算数（冷却会过），绝不能因为暂时不可用就覆写（否则并发请求会把一个
 //     还在冷却的号的绑定抢改成自己的出口）；
+//   - 绑定为 proxyIDDirect（锁定本机直连）：原样返回 proxyIDDirect，严禁覆写——
+//     这是显式的「绝不走代理」承诺，仲裁也不能把它改成别的出口；
 //   - 未绑定 / 绑定已失效（删除或禁用）：把 candidateProxyID 写库并返回它（本次请求胜出）。
 //
 // 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
@@ -668,6 +695,9 @@ func claimAccountProxy(accountID, candidateProxyID int64) int64 {
 	cur := int64(0)
 	if a := accountByID(accountID); a != nil {
 		cur = a.ProxyID
+	}
+	if cur == proxyIDDirect {
+		return proxyIDDirect // 锁定直连：任何候选出口都不得覆写
 	}
 	if cur > 0 && proxyEnabledByID(cur) {
 		return cur

@@ -259,6 +259,7 @@ type browserManager struct {
 	// 广播唤醒被暂缓的同出口请求恢复自由并发。
 	bridgeMu            sync.Mutex
 	bridgeActiveURL     string // 当前桥在飞请求的出口（"" = 直连）
+	bridgeActiveDirect  bool   // 当前在飞出口的 allowDirect 语义（与 URL 共同标识出口）
 	bridgeInFlight      int    // 当前出口的在飞浏览器流数
 	bridgeSwitchWaiters int    // 跨出口切换等待者计数：>0 时新 acquire 必须排队
 	bridgeWait          chan struct{}
@@ -490,7 +491,7 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 // 请求实际已同出口）也先撤销登记再走自由并发。最后一名登记等待者
 // 离开时关闭并重建广播 channel，唤醒被暂缓的同出口请求——否则一名
 // 跨出口等待者的取消会把健康同出口请求永久挡死。
-func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) error {
+func (m *browserManager) acquireBridgeExit(ctx context.Context, url string, allowDirect bool) error {
 	registered := false // 本请求当前持有 bridgeSwitchWaiters 登记名额
 	for {
 		m.bridgeMu.Lock()
@@ -510,13 +511,14 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 			if registered {
 				m.bridgeWaiterLeaveLocked()
 			}
-			syncBridgeUpstream(url)
+			syncBridgeUpstream(url, allowDirect)
 			m.bridgeActiveURL = url
+			m.bridgeActiveDirect = allowDirect
 			m.bridgeInFlight = 1
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		if m.bridgeActiveURL == url && registered {
+		if m.bridgeActiveURL == url && m.bridgeActiveDirect == allowDirect && registered {
 			// 退化：登记时跨出口，唤醒重查时在飞出口已变成 url——立即
 			// 撤销登记名额；若名额归零，本轮下一轮检查即命中下方同
 			// 出口自由并发分支直接返回，绝不掉入等待（那时 bridgeWait
@@ -524,14 +526,15 @@ func (m *browserManager) acquireBridgeExit(ctx context.Context, url string) erro
 			m.bridgeWaiterLeaveLocked()
 			registered = false
 		}
-		if m.bridgeActiveURL == url && m.bridgeSwitchWaiters == 0 {
+		if m.bridgeActiveURL == url && m.bridgeActiveDirect == allowDirect &&
+			m.bridgeSwitchWaiters == 0 {
 			// 同出口且无跨出口切换方在等：自由并发。registered 必为
 			// false——唤醒重查命中本分支前已按上方退化路径撤销登记。
 			m.bridgeInFlight++
 			m.bridgeMu.Unlock()
 			return nil
 		}
-		if m.bridgeActiveURL != url && !registered {
+		if (m.bridgeActiveURL != url || m.bridgeActiveDirect != allowDirect) && !registered {
 			// 仅真正的跨出口等待者登记计数；被暂缓的同出口请求只占
 			// bridgeWait 等待名额，绝不占 bridgeSwitchWaiters 计数。
 			m.bridgeSwitchWaiters++
@@ -777,9 +780,14 @@ func (m *browserManager) doStart(ctx context.Context) (res startResult) {
 	res.client = client
 	m.registerCDPEvents(client)
 
-	// attach 到 browser target 下创建的 page。主 Tab 必须停在
-	// https://gemini.google.com/app：页内 fetch 是同源请求，没有 CORS 拦截
-	// （about:blank origin 发 fetch 会被 Chromium 按跨域拒掉——Failed to fetch）。
+	// attach 到 browser target 下创建的 page。首标签页先开 about:blank——
+	// 持久 Jar 里的 Cookie 身份与绑定出口都还没核验，直接导航 /app 等于
+	// 用一个未经确认的出口把 Cookie 发出去（跨出口泄漏）。核验在
+	// alignColdStartJar 里完成：读持久 Jar → 匹配启用账号 → 按其绑定出口
+	// SetUpstream → 再导航 /app；不匹配或绑定失效先在 about:blank 清空 Jar。
+	// 主 Tab 最终必须停在 https://gemini.google.com/app：页内 fetch 是同源
+	// 请求，没有 CORS 拦截（about:blank origin 发 fetch 会被 Chromium 按
+	// 跨域拒掉——Failed to fetch）。
 	// flatten 模式让所有会话消息都走同一条 WS、用 sessionId 路由——
 	// 不开 flatten 每条 session 要单独连接，不符合我们单 WS 的假设。
 	var created struct {
@@ -787,7 +795,7 @@ func (m *browserManager) doStart(ctx context.Context) (res startResult) {
 	}
 	if err := client.callCDPWithTimeout(ctx, 15*time.Second, "",
 		"Target.createTarget",
-		map[string]interface{}{"url": "https://gemini.google.com/app"}, &created); err != nil {
+		map[string]interface{}{"url": "about:blank"}, &created); err != nil {
 		client.Close()
 		res.client = nil
 		cleanup()
@@ -831,7 +839,189 @@ func (m *browserManager) doStart(ctx context.Context) (res startResult) {
 	} else {
 		res.seed = seed
 	}
+	// 冷启动对齐：Jar 身份 → 匹配启用账号 → 按其绑定出口 SetUpstream →
+	// 导航 /app。不匹配或绑定失效时先在 about:blank 把 Jar 清空再导航
+	// （匿名 /app，绝不带着不认识的 Cookie 从某个默认出口发首航）。
+	if err := m.alignColdStartJar(ctx, client, res.sessionID, bridge, absProfileDir, &res); err != nil {
+		client.Close()
+		res.client = nil
+		cleanup()
+		res.err = err
+		return res
+	}
 	return res
+}
+
+// coldStartUpstreamForAccount 为冷启动匹配到的账号算（upstreamURL, allowDirect）：
+//   - ProxyID == proxyIDDirect（-1 锁定直连）：显式直连、显式允许直连——
+//     就算代理池非空且 fallback_direct=false，锁定直连也是账号级显式语义；
+//   - ProxyID > 0：绑定代理必须存在且 enabled，否则失败（fail-closed，
+//     绑定失效的 Cookie 绝不借别的出口发出）；
+//   - ProxyID == 0（未绑定）：按代理池与 fallback_direct 的首航规则。
+func coldStartUpstreamForAccount(a *CookieAccount) (string, bool, error) {
+	switch {
+	case a.ProxyID == proxyIDDirect:
+		return "", true, nil
+	case a.ProxyID > 0:
+		if !proxyEnabledByID(a.ProxyID) {
+			return "", false, fmt.Errorf("账号 #%d 绑定的出口 #%d 已删除或禁用",
+				a.ID, a.ProxyID)
+		}
+		return proxyURLByID(a.ProxyID), false, nil
+	default:
+		u, allow := initialBridgeUpstream()
+		return u, allow, nil
+	}
+}
+
+// alignColdStartJar 是冷启动的跨出口泄漏防线（首标签页还在 about:blank 上调用）：
+//
+//  1. Network.getCookies 读持久 Jar（profile 复用时里面可能留着上次的会话）；
+//  2. 按 cookieIdentity 匹配启用账号：匹配到且绑定有效 → 按该账号绑定出口
+//     SetUpstream（含锁定直连的显式 allowDirect）→ 导航 /app；
+//  3. Jar 无登录身份（匿名 profile）：首航保守出口 initialBridgeUpstream →
+//     导航 /app；
+//  4. 匹配不到启用账号、或账号绑定出口已失效：先在 about:blank
+//     clearBrowserCookies 清掉不认识的 Cookie，再按匿名首航出口导航 /app——
+//     绝不让陌生 Cookie 从默认出口发出去。
+//
+// 导航失败 fail-closed 返回 error（由 doStart 中止本轮冷启动并清理；
+// 不清 Jar——残留身份下次启动仍会先走上面的匹配/清理防线）。
+func (m *browserManager) alignColdStartJar(ctx context.Context, client *cdpClient,
+	sess string, bridge *browserProxyBridge, profileDir string, res *startResult) error {
+
+	jarCookie, jarErr, jarEmpty := readColdStartJar(ctx, client, sess)
+	jarID := cookieIdentity(jarCookie)
+
+	matched := matchJarAccount(jarID, jarErr, res.seed.AccountID)
+
+	upstream, allowDirect := "", true
+	var upErr error
+	switch {
+	case matched != nil:
+		var ad bool
+		upstream, ad, upErr = coldStartUpstreamForAccount(matched)
+		allowDirect = ad
+		if upErr == nil {
+			logf("[browser] 冷启动 Jar 匹配账号 #%d，按绑定出口导航", matched.ID)
+		}
+	default:
+		upstream, allowDirect = initialBridgeUpstream()
+	}
+	// 读 Jar 失败（jarErr）/ Jar 含任何非空 Cookie 但匹配不到合法启用账号 /
+	// 匹配到账号但绑定失效：全部 fail-closed——先清 Jar 再按匿名首航出口导航，
+	// 清失败直接中止冷启动（残留 Cookie 绝不从未经确认的出口发出）。
+	clearJar := (jarErr != nil || !jarEmpty) && (matched == nil || upErr != nil)
+	if jarErr != nil {
+		logf("[browser] 冷启动读 Jar 失败（fail-closed，清 Jar 后按匿名首航）: %v", jarErr)
+		upstream, allowDirect = initialBridgeUpstream()
+	} else if matched != nil && upErr == nil {
+		// 匹配成功：同步校正陈旧/缺失的 seed（同 cookieIdentity 多 authuser
+		// 消歧后，驻留身份登记为实际匹配到的号；AccountID 相同但
+		// CookieIdentity 为空/陈旧时也一并校正）。
+		if res.seed.AccountID != matched.ID || res.seed.CookieIdentity != jarID {
+			res.seed.AccountID = matched.ID
+			res.seed.CookieIdentity = jarID
+			res.seed.SeededAt = time.Now().Unix()
+		}
+	}
+	if clearJar {
+		if upErr != nil {
+			logf("[browser] 冷启动 Jar 账号绑定失效（%v），清空 Jar 后按匿名首航", upErr)
+		} else {
+			logf("[browser] 冷启动 Jar Cookie 匹配不到启用账号，清空后按匿名首航")
+		}
+		if err := clearJarAndResetSeed(ctx, client, sess, profileDir, res); err != nil {
+			return err
+		}
+		upstream, allowDirect = initialBridgeUpstream()
+	}
+
+	if err := bridge.SetUpstream(upstream, allowDirect); err != nil {
+		return browserErr("cold start SetUpstream: %w", err)
+	}
+	// 导航 + 等待就绪必须走 navigateAndWaitApp：Page.navigate 返回时活动文档
+	// 仍是 about:blank（readyState 恰为 "complete"），只看 readyState 会秒回
+	// 假就绪——首条页内 fetch 若在 about:blank origin 上发，被 CORS 拦成
+	// TypeError: Failed to fetch。导航未落到目标 origin 时 fail-closed
+	// 中止冷启动，绝不发布坏 Tab。
+	return m.navigateAndWaitApp(ctx, client, sess)
+}
+
+// readColdStartJar 读持久 Jar 并拼成 cookie 串。Network.* 必须传 page
+// session（sess）：浏览器顶层连接（sessionID=""）没有 Network 域，真实
+// Chromium 对根连接调 getCookies 恒报 -32601。
+// 返回 (cookie串, 读jar错误, jar是否为空)。
+func readColdStartJar(ctx context.Context, client *cdpClient, sess string) (string, error, bool) {
+	getCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	var jarRes struct {
+		Cookies []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"cookies"`
+	}
+	err := client.Call(getCtx, sess, "Network.getCookies",
+		map[string]interface{}{"urls": []string{
+			"https://gemini.google.com", "https://google.com"}},
+		&jarRes)
+	var jarLines []string
+	for _, c := range jarRes.Cookies {
+		jarLines = append(jarLines, c.Name+"="+c.Value)
+	}
+	return strings.Join(jarLines, "; "), err, len(jarRes.Cookies) == 0
+}
+
+// matchJarAccount 按 cookieIdentity 在启用账号里找匹配者：同 cookieIdentity
+// 可能多 authuser，优先按 seedID（res.seed.AccountID）消歧，找不着再取第一个
+// 匹配的启用号。jarErr 或非登录身份（空 / "|"）直接返回 nil。
+func matchJarAccount(jarID string, jarErr error, seedID int64) *CookieAccount {
+	if jarErr != nil || jarID == "" || jarID == "|" {
+		return nil
+	}
+	if a := firstEnabledWithIdentity(jarID, seedID); a != nil {
+		return a
+	}
+	if seedID != 0 {
+		return firstEnabledWithIdentity(jarID, 0)
+	}
+	return nil
+}
+
+// firstEnabledWithIdentity 返回第一个 cookieIdentity 匹配且（seedID 非 0 时）
+// ID 等于 seedID 的启用账号。
+func firstEnabledWithIdentity(jarID string, seedID int64) *CookieAccount {
+	for _, a := range accountList() {
+		if a.Status != "enabled" || cookieIdentity(a.Cookie) != jarID {
+			continue
+		}
+		if seedID != 0 && a.ID != seedID {
+			continue
+		}
+		cp := a
+		return &cp
+	}
+	return nil
+}
+
+// clearJarAndResetSeed 在 about:blank 清空 Jar 并把 res.seed 与持久
+// seed-state 一起复位。清失败返回错误（调用方中止冷启动——残留 Cookie
+// 绝不从未经确认的出口发出）。
+func clearJarAndResetSeed(ctx context.Context, client *cdpClient, sess string,
+	profileDir string, res *startResult) error {
+	clrCtx, clrCancel := context.WithTimeout(ctx, 8*time.Second)
+	err := client.Call(clrCtx, sess, "Network.clearBrowserCookies", nil, nil)
+	clrCancel()
+	if err != nil {
+		return browserErr("clearBrowserCookies (cold start): %w", err)
+	}
+	res.seed = browserSeedState{}
+	// 持久 seed-state 也复位，免得下次启动又拿旧身份去匹配。
+	if profileDir != "" {
+		_ = os.WriteFile(filepath.Join(profileDir, "seed-state.json"),
+			[]byte(`{"account_id":0,"cookie_identity":"","seeded_at":0}`), 0o600)
+	}
+	return nil
 }
 
 // initialBridgeUpstream 为桥选首航出口与直连许可：
@@ -862,28 +1052,51 @@ func initialBridgeUpstream() (string, bool) {
 }
 
 // syncBridgeUpstream 是业务入口的全链路代理接线：把本次有效 proxyURL 与
-// 「当前代理池配置下的允许直连语义」同步给桥。
-//
-// 允许直连的判据跟 acquireSlot 同构：
-//   - 代理池为空：本来就只有直连可走（fallback_direct 不约束无池场景）；
-//   - 池非空：仅 fallback_direct=true 才允许直连；fallback_direct=false
-//     时即便本次 proxyURL 为空（比如 slot 兜底直连），桥也绝不能直连——
-//     那是泄漏真实 IP，宁可让这次请求在桥上报 502。
-func syncBridgeUpstream(proxyURL string) {
+// 调用方算好的 allowDirect 语义同步给桥。allowDirect 由调用方按请求级出口
+// 语义显式计算（bridgeAllowDirect）：锁定直连账号显式 true；池空 true；
+// 池非空时随 fallback_direct。调用方不传池态——池态变化期间在飞出口的
+// allowDirect 由 acquireBridgeExit 的出口身份（URL+allowDirect）保证一致。
+func syncBridgeUpstream(proxyURL string, allowDirect bool) {
 	bridge := currentBridge()
 	if bridge == nil {
 		return
 	}
-	allowDirect := true
-	proxyMu.RLock()
-	hasPool := len(proxyCache) > 0
-	proxyMu.RUnlock()
-	if hasPool && !rtCfg().FallbackDirect {
-		allowDirect = false
-	}
 	if err := bridge.SetUpstream(proxyURL, allowDirect); err != nil {
 		logf("[browser] bridge SetUpstream(%q) 失败: %v", proxyURL, err)
 	}
+}
+
+// bridgeAllowDirect 是请求级出口的 allowDirect 语义：
+//   - 账号锁定直连（ProxyID == proxyIDDirect）：显式 true——锁定直连是
+//     账号级显式授权，代理池与 fallback_direct 都不收窄它；
+//   - 匿名/未点名账号：池空 → true（本来就只有直连）；池非空 → 随
+//     fallback_direct（关着时宁可桥上 502 也不漏真实 IP）；
+//   - 绑定代理的账号：proxyURL 非空走代理时 allowDirect 只作兜底语义，
+//     随池规则即可。
+func bridgeAllowDirect(account *CookieAccount) bool {
+	if account != nil && account.ProxyID == proxyIDDirect {
+		return true
+	}
+	if !hasProxyPool() {
+		return true
+	}
+	return rtCfg().FallbackDirect
+}
+
+// seedAccountBound 返回常驻浏览器当前驻留号绑定的出口（0=无驻留/未绑定，
+// proxyIDDirect=锁定直连，>0=绑定代理）。后台辅助流量据此决定是否该避开
+// 共享浏览器桥——已绑定特定出口的桥不该被匿名刷新抢切。
+func (m *browserManager) seedAccountBound() int64 {
+	m.mu.Lock()
+	sid := m.seed.AccountID
+	m.mu.Unlock()
+	if sid == 0 {
+		return 0
+	}
+	if a := accountByID(sid); a != nil {
+		return a.ProxyID
+	}
+	return 0
 }
 
 func currentBridge() *browserProxyBridge {
@@ -1224,8 +1437,9 @@ func (m *browserManager) recreateTab() {
 	m.recreating = true
 	client := m.client
 	oldTarget := m.targetID
-	m.targetID = "" // 先清：closeTarget 回推的事件据此被忽略
-	m.generation++  // 旧会话期注册的回调全部失效
+	m.targetID = ""  // 先清：closeTarget 回推的事件据此被忽略
+	m.sessionID = "" // 同步清：重建全程不留指向已死旧会话的 ID，并发请求被 5 处 sess=="" 守卫拦住
+	m.generation++   // 旧会话期注册的回调全部失效
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
@@ -1233,18 +1447,33 @@ func (m *browserManager) recreateTab() {
 		m.mu.Unlock()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 先判死在飞流：旧 Tab 的流在重建面前不可能成功，先唤醒它们别挂到
+	// 清 Jar+导航（最长 ~35s）结束才被错误覆盖；也保证在飞流归零后
+	// 对齐桥出口不与在飞出口并发交错。
+	m.failAllStreams(browserErr("tab recreated; previous streams aborted"))
+
+	// ctx 预算要盖过 清 Jar(8s) + SetUpstream + 导航(25s)：10s 会在
+	// alignResidentAndNavigate 的 25s 导航子窗口内提前截断。
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	if oldTarget != "" {
-		_ = client.Call(ctx, "", "Target.closeTarget",
+		// 独立 5s 子预算（同 recreateFailDead）：旧崩溃渲染器可能挂死
+		// closeTarget，绝不能让它耗尽共享的 40s 重建预算。
+		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = client.Call(cctx, "", "Target.closeTarget",
 			map[string]interface{}{"targetId": oldTarget}, nil)
+		ccancel()
 	}
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
+	// 重建同样先开 about:blank：Jar 身份要先核过驻留账号绑定出口才能
+	// 导航 /app（与冷启动同一条防线，防桥出口被并发请求切走期间把
+	// 驻留 Cookie 从错的出口发出去）。
 	if err := client.Call(ctx, "", "Target.createTarget",
-		map[string]interface{}{"url": "https://gemini.google.com/app"}, &created); err != nil {
+		map[string]interface{}{"url": "about:blank"}, &created); err != nil {
 		logf("[browser] recreate target failed: %v", err)
+		m.recreateFailDead(client, "", err)
 		return
 	}
 	var attached struct {
@@ -1253,24 +1482,179 @@ func (m *browserManager) recreateTab() {
 	if err := client.Call(ctx, "", "Target.attachToTarget",
 		map[string]interface{}{"targetId": created.TargetID, "flatten": true}, &attached); err != nil {
 		logf("[browser] reattach failed: %v", err)
+		m.recreateFailDead(client, created.TargetID, err)
 		return
 	}
 	m.mu.Lock()
-	// 重建期间实例可能已被换/停用：client 换了或 targetID 被别人填了都要放弃。
+	// 重建期间实例可能已被换/停用：client 换了要放弃。先把已发布的
+	// targetID/sessionID 清空——重建全程用局部 session，直到对齐并导航
+	// 就绪才重新发布；留着旧值会让并发请求切进还在 about:blank 的会话
+	// （CORS 失败），也防止桥出口被并发请求在重建中途抢占。
 	if m.client != client || m.shuttingDown {
 		m.mu.Unlock()
 		return
 	}
-	m.targetID = created.TargetID
-	m.sessionID = attached.SessionID
+	m.targetID = ""
+	m.sessionID = ""
 	m.mu.Unlock()
-	if err := m.enablePageDomain(); err != nil {
+	if err := m.enablePageDomainFor(ctx, client, attached.SessionID); err != nil {
 		logf("[browser] re-enable page: %v", err)
+		m.recreateFailDead(client, created.TargetID, err)
+		return
 	}
-	if err := m.installBridge(); err != nil {
+	if err := m.installBridgeFor(ctx, client, attached.SessionID); err != nil {
 		logf("[browser] re-install bridge: %v", err)
+		m.recreateFailDead(client, created.TargetID, err)
+		return
 	}
-	m.failAllStreams(browserErr("tab recreated; previous streams aborted"))
+	// 驻留账号绑定出口重对齐后再导航 /app（桥当前出口可能已被并发请求
+	// 切走；绑定失效则导航匿名 /app 前已在上面对齐函数里清 Jar）。
+	if err := m.alignResidentAndNavigate(ctx, client, attached.SessionID); err != nil {
+		logf("[browser] align resident after recreate: %v", err)
+		m.recreateFailDead(client, created.TargetID, err)
+		return
+	}
+	m.mu.Lock()
+	// 全部就绪后才发布：并发请求在此之前看到的是空 session 会走重试/
+	// 等下一拍，而不是切进半途的 about:blank 会话。
+	if m.client == client && !m.shuttingDown {
+		m.targetID = created.TargetID
+		m.sessionID = attached.SessionID
+	}
+	m.mu.Unlock()
+}
+
+// recreateFailDead 是 recreateTab 中途失败的保守整机自愈（Oracle 选项 B）：
+// best-effort 关掉刚创建的孤儿 Tab（防 Chromium 内 target 泄漏），再在当前
+// 实例仍是本 client 且未停机时交 handleDeadLocked 回收整实例退避重建——
+// 绝不留下 m.sessionID=="" 的永久僵尸态（ensureRunning 只看进程/CDP 存活，
+// 空 session 会让 ensureBridge 永远报 no page session 且再无自愈路径）。
+// 调用方不持锁。
+func (m *browserManager) recreateFailDead(client *cdpClient, orphanTarget string, cause error) {
+	if orphanTarget != "" {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = client.Call(cctx, "", "Target.closeTarget",
+			map[string]interface{}{"targetId": orphanTarget}, nil)
+		cancel()
+	}
+	m.mu.Lock()
+	gen := m.generation
+	ok := m.client == client && !m.shuttingDown
+	m.mu.Unlock()
+	if ok {
+		logf("[browser] recreateTab 失败，整机回收重建: %v", cause)
+		m.handleDeadLocked(client, gen)
+	}
+}
+
+// alignResidentAndNavigate 是 recreateTab 用的轻量对齐：按当前驻留账号
+// （m.seed）的绑定算 (upstream, allowDirect) 并把桥切到该出口，然后导航 /app。
+// 驻留号已不可用或绑定失效时先在 about:blank 清 Jar 再导航匿名 /app。
+//
+// 锁序与纪律（与 doBrowserStreamRequestCtx 的 jarRW → bridgeMu → m.mu 一致）：
+//   - clearBrowserCookies 持 m.jarRW.Lock() 执行——不持锁会与并发
+//     maybeSwitchAccount / doBrowserStreamRequestCtx 竞态（抹掉刚播种的
+//     账号 Cookie）；清成功后同步复位 m.seed 并把 seed-state.json 写回空状态，
+//     否则 shouldSwitch 会误判「已清 Jar 的启用账号仍驻留」而发起无 Cookie
+//     请求（no SNlM0e 直至误停用）；
+//   - 桥切换绝不裸调 bridge.SetUpstream：改走 acquireBridgeExit +
+//     releaseBridgeExit 的出口租约，桥切换、Page.navigate("/app") 与
+//     页面就绪等待全程独占该出口——并发请求不会在导航中途把桥切去别的
+//     出口，也不会看到「记账出口 ≠ 实际出口」的分裂态。
+func (m *browserManager) alignResidentAndNavigate(ctx context.Context,
+	client *cdpClient, sess string) error {
+	m.mu.Lock()
+	seedID := m.seed.AccountID
+	bridge := m.bridge
+	m.mu.Unlock()
+	if bridge == nil {
+		return browserErr("no bridge for resident align")
+	}
+	upstream, allowDirect, clearJar := resolveResidentExit(seedID)
+	if clearJar {
+		var err error
+		// jarRW 内以**实时**驻留号重算决策：拿到锁前并发同身份快路径
+		// 可能已把驻留切到另一个启用且出口有效的账号——绝不能按旧
+		// 快照清 Jar（见 clearResidentJarIfNeeded 锁内复核注释）。
+		upstream, allowDirect, err = m.clearResidentJarIfNeeded(ctx, client, sess)
+		if err != nil {
+			return err
+		}
+	}
+	// 桥出口切换经出口租约协调：acquireBridgeExit 持 bridgeMu 原子完成
+	// 「检查在飞→同步桥→登记 bridgeActiveURL/ActiveDirect→占出口」，
+	// 杜绝记账出口与实际出口分裂；导航与就绪等待全程持有租约，并发请求
+	// 不会在中途把桥切到别的出口（驻留 Cookie 跨出口泄露）。
+	if err := m.acquireBridgeExit(ctx, upstream, allowDirect); err != nil {
+		return err
+	}
+	defer m.releaseBridgeExit()
+	// 同冷启动：导航 + 等待目标 origin 就绪，防 about:blank 首航 CORS 回归。
+	// 导航未落到 gemini.google.com 时 fail-closed 报错——绝不把停在
+	// about:blank / chrome-error:// 的 Tab 发布为就绪主会话。
+	return m.navigateAndWaitApp(ctx, client, sess)
+}
+
+// resolveResidentExit 按给定驻留号 seedID 算出 recreateTab 对齐用的
+// (upstream, allowDirect) 以及是否必须先清 Jar 的纯计算决策：
+//   - seedID==0（无驻留）：匿名首航出口，不清 Jar；
+//   - 驻留号启用且绑定有效：按 coldStartUpstreamForAccount 的绑定出口，不清 Jar；
+//   - 驻留号停用/删除/绑定失效：清 Jar 走匿名首航出口（绝不带残留身份导航）。
+//
+// 纯查询、m 零读写，可由调用方在任意锁序下复核。
+func resolveResidentExit(seedID int64) (upstream string, allowDirect, clearJar bool) {
+	if a := accountByID(seedID); a != nil && a.Status == "enabled" && seedID != 0 {
+		if u, ad, err := coldStartUpstreamForAccount(a); err == nil {
+			return u, ad, false
+		}
+	}
+	// 无驻留号不必清 Jar；驻留号非零但停用/删除/绑定失效才需要清。
+	upstream, allowDirect = initialBridgeUpstream()
+	return upstream, allowDirect, seedID != 0
+}
+
+// clearResidentJarIfNeeded 持 jarRW 清 Jar 并按**锁内实时**驻留号重算对齐
+// 出口：调用方按旧快照判定需清 Jar 后才拿锁，拿到锁的瞬间并发同身份快
+// 路径可能已把 m.seed 切到另一个启用且出口有效的账号——此时绝不能按旧
+// 快照清掉刚播种的驻留 Jar，改按新驻留号的绑定出口对齐。
+//
+// 锁纪律：jarRW 入口唯一一次 Lock + defer Unlock（清 Jar 与身份复核同属
+// jar 写临界区，与 doBrowserStreamRequestCtx 的 jarRW 读段互斥）；锁内读
+// m.mu 下实时 m.seed.AccountID 走 resolveResidentExit 复核——!clearJar 时
+// 锁内直接返回新出口、零副作用；确认仍需清时在持锁期间执行
+// Network.clearBrowserCookies、复位 m.seed 与 seed-state.json。
+func (m *browserManager) clearResidentJarIfNeeded(ctx context.Context,
+	client *cdpClient, sess string) (upstream string, allowDirect bool, err error) {
+	m.jarRW.Lock()
+	defer m.jarRW.Unlock()
+	m.mu.Lock()
+	curID := m.seed.AccountID
+	m.mu.Unlock()
+	upstream, allowDirect, clearJar := resolveResidentExit(curID)
+	if !clearJar {
+		return upstream, allowDirect, nil
+	}
+	clrCtx, clrCancel := context.WithTimeout(ctx, 8*time.Second)
+	// Network.* 传 page session（sess）；清 Jar 失败绝不继续导航——残留
+	// Cookie 会从未经确认的出口发出。
+	err = client.Call(clrCtx, sess, "Network.clearBrowserCookies", nil, nil)
+	clrCancel()
+	if err == nil {
+		// 清 Jar 成功后必须同步复位驻留态：不然 shouldSwitch 会拿旧的
+		// m.seed 判定「驻留号仍是启用账号、无需切号」，带着已清空的匿名
+		// Jar 发请求触发 no SNlM0e 直至误停用。
+		m.mu.Lock()
+		m.seed = browserSeedState{}
+		profileDir := m.profileDir
+		m.mu.Unlock()
+		if profileDir != "" {
+			_ = os.WriteFile(filepath.Join(profileDir, "seed-state.json"),
+				[]byte(`{"account_id":0,"cookie_identity":"","seeded_at":0}`), 0o600)
+		}
+	} else {
+		err = browserErr("recreate clearBrowserCookies: %w", err)
+	}
+	return upstream, allowDirect, err
 }
 
 // ─── Page 域与桥注入 ────────────────────────────────────────────────────────
@@ -1412,6 +1796,12 @@ func (m *browserManager) ensureBridge(ctx context.Context) error {
 	if client == nil {
 		return browserErr("cdp client gone")
 	}
+	if sess == "" {
+		// recreateTab 重建窗口内 m.sessionID 已清空：向根连接发
+		// Runtime.evaluate 恒报 -32601 并会触发无意义的 installBridge
+		// 重试，如实报「无活动页会话」让上层走重试/换实例。
+		return browserErr("no active page session")
+	}
 	var out struct {
 		Result struct {
 			Value string `json:"value"`
@@ -1452,21 +1842,120 @@ func (m *browserManager) waitPageLoad(ctx context.Context, client *cdpClient, se
 		return
 	}
 	done := make(chan struct{}, 1)
-	// Once：触发即摘除，不会随 installBridge 重入累积。
-	client.Once("Page.loadEventFired", func(evt cdpEvent) {
-		if evt.SessionID == "" || evt.SessionID == sess {
-			select {
-			case done <- struct{}{}:
-			default:
-			}
+	// OnceSession：触发即摘除，不会随 installBridge 重入累积；别的 session
+	// 的 loadEventFired 不会误摘除/误触发本监听器。cancel 必须接手——
+	// 超时退出时残留监听器会一直挂在 onceHandlers 里泄漏。
+	cancelOnce := client.OnceSession(sess, "Page.loadEventFired", func(evt cdpEvent) {
+		select {
+		case done <- struct{}{}:
+		default:
 		}
 	})
+	defer cancelOnce()
 	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	select {
 	case <-done:
 	case <-lctx.Done():
 		logf("[browser] 等页面 load 超时（继续，桥将在下次导航时注入）")
+	case <-client.Done():
+		// CDP 断连/关机：立即退出，死连接上绝不干等 15s。
+	}
+}
+
+// navigateAndWaitApp 导航到 https://gemini.google.com/app 并等它真正就绪，
+// 严格 fail-closed 返回 error：Page.navigate 的 RPC 错 / errorText、早到的
+// about:blank loadEventFired、超时后仍不在 gemini.google.com origin，都如实
+// 报错——绝不回退到只看 readyState 的 waitPageLoad（about:blank 与
+// chrome-error:// 的 readyState 恰为 "complete"，会秒回假就绪），也绝不
+// 把坏 Tab 发布给调用方（页内 fetch 在 origin "null" 上被 CORS 永久拦成
+// TypeError: Failed to fetch）。
+//
+// 事件监听用 OnceSession 只认本 session 的事件：别的 session 发出的
+// Page.loadEventFired 不会误摘除/误唤醒本监听器；迟到的事件（如旧文档
+// about:blank 的 loadEventFired）导致 origin 复核不通过时，只要 navCtx
+// 未超时就重新挂 OnceSession 继续等目标页的 load。
+func (m *browserManager) navigateAndWaitApp(ctx context.Context, client *cdpClient, sess string) error {
+	if client == nil {
+		return browserErr("cdp client gone")
+	}
+	navCtx, navCancel := context.WithTimeout(ctx, 25*time.Second)
+	defer navCancel()
+	loadCh := make(chan struct{}, 1)
+	// 监听器必须在 Page.navigate 之前注册，消除「导航已 load 但监听器
+	// 还没挂上」的唤醒丢失窗口。
+	cancelOnce := client.OnceSession(sess, "Page.loadEventFired", func(evt cdpEvent) {
+		select {
+		case loadCh <- struct{}{}:
+		default:
+		}
+	})
+	// 必须按引用捕获：循环内会重新赋值 cancelOnce（重挂监听），直接
+	// defer cancelOnce() 会把首个闭包按值捕获住——navCtx 超时退出时
+	// 最后一次挂的监听器永远摘不掉，onceHandlers 泄漏。
+	defer func() { cancelOnce() }()
+	var navRes struct {
+		ErrorText string `json:"errorText"`
+	}
+	if err := client.Call(navCtx, sess, "Page.navigate",
+		map[string]interface{}{"url": "https://gemini.google.com/app"}, &navRes); err != nil {
+		return browserErr("navigate /app: %w", err)
+	}
+	if navRes.ErrorText != "" {
+		// 代理/网络错误时 CDP 返回成功但 errorText 非空，页面停在
+		// chrome-error://（origin "null"）——绝不能视为已导航。
+		return browserErr("navigate /app: %s", navRes.ErrorText)
+	}
+	// 事件到了就核一次 origin；迟到事件（旧文档/中间跳转）核不过且
+	// navCtx 未超时时重新挂 OnceSession 等下一条本 session 的 load——
+	// 绝不退回 waitPageLoad 在 "complete" 的 about:blank 上秒回。
+	for {
+		select {
+		case <-client.Done():
+			// CDP 断连/崩溃/Stop()：毫秒级退出，立即触发外层
+			// defer m.releaseBridgeExit() 归还桥出口租约——旧代际绝不
+			// 死占 m.bridgeInFlight 阻塞新实例或泄漏跨出口 Cookie。
+			return browserErr("navigate /app: cdp client closed")
+		case <-loadCh:
+			// 唤醒后先在 Runtime.evaluate 往返之前重挂下一轮监听——旧监听
+			// 已被触发摘除，此时若立刻去 evaluate，真目标页的 loadEventFired
+			// 可能在往返期间到达而没有任何监听器挂着，循环将空等到 navCtx
+			// 25s 超时（假死）。navCtx 已到期则不再重挂（反正接下来必走
+			// 超时返回，挂监听也是白泄漏一拍）。
+			if navCtx.Err() == nil {
+				cancelOnce()
+				cancelOnce = client.OnceSession(sess, "Page.loadEventFired", func(evt cdpEvent) {
+					select {
+					case loadCh <- struct{}{}:
+					default:
+					}
+				})
+			}
+		case <-navCtx.Done():
+		}
+		var out struct {
+			Result struct {
+				Value string `json:"value"`
+			} `json:"result"`
+		}
+		rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+		err := client.Call(rctx, sess, "Runtime.evaluate",
+			map[string]interface{}{
+				"expression":   `location.origin + "/" + document.readyState`,
+				"awaitPromise": false,
+			}, &out)
+		rcancel()
+		if err == nil && out.Result.Value == "https://gemini.google.com/complete" {
+			return nil
+		}
+		if navCtx.Err() != nil {
+			got := out.Result.Value
+			if err != nil {
+				got = "origin probe failed"
+			}
+			return browserErr("navigate /app did not reach gemini.google.com origin (got %q)", got)
+		}
+		// 未到目标页但仍在预算内（早到的非目标事件）：继续等下一拍。
 	}
 }
 
@@ -1518,6 +2007,11 @@ func (m *browserManager) seedAccount(ctx context.Context, a *CookieAccount) erro
 	m.mu.Unlock()
 	if client == nil {
 		return browserErr("cdp client gone")
+	}
+	if sess == "" {
+		// recreateTab 重建窗口内 m.sessionID 已被清空：向根连接发
+		// Network.* 恒报 -32601，如实报错让调用方走重试/换实例。
+		return browserErr("no active page session")
 	}
 	if err := client.Call(ctx, sess, "Network.setCookies",
 		map[string]interface{}{"cookies": cookies}, nil); err != nil {
@@ -1595,7 +2089,8 @@ func (m *browserManager) syncCookiesBackCtx(ctx context.Context, force bool) {
 	seed := m.seed
 	client, sess := m.client, m.sessionID
 	m.mu.Unlock()
-	if seed.AccountID == 0 || client == nil {
+	if seed.AccountID == 0 || client == nil || sess == "" {
+		// sess==""（重建窗口）时向根连接发 Network.* 恒报 -32601，直接跳过。
 		return
 	}
 	a := accountByID(seed.AccountID)
@@ -1710,6 +2205,11 @@ func (m *browserManager) maybeSwitchAccount(ctx context.Context, next *CookieAcc
 	m.mu.Unlock()
 	if client == nil {
 		return browserErr("cdp client gone")
+	}
+	if sess == "" {
+		// 重建窗口内无可用 page session：清 Jar 无从谈起，报错让上层走
+		// 换号/重试，绝不向根连接发 Network.*。
+		return browserErr("no active page session")
 	}
 	if err := client.Call(ctx, sess, "Network.clearBrowserCookies", nil, nil); err != nil {
 		return browserErr("clearBrowserCookies: %w", err)
@@ -1968,7 +2468,8 @@ func (s *browserStream) Abort(m *browserManager) {
 	client := m.client
 	sess := m.sessionID
 	m.mu.Unlock()
-	if client == nil {
+	if client == nil || sess == "" {
+		// 重建期 session 为空：向根连接发 Runtime.evaluate 无意义。
 		return
 	}
 	expr := fmt.Sprintf("window.__gwBridge && window.__gwBridge.abort(%q)", s.reqID)
@@ -2188,15 +2689,19 @@ func (m *browserManager) doBrowserStreamRequestCtx(ctx context.Context, proxyURL
 	residentSeed := m.seed.AccountID
 	residentIdentity := m.seed.CookieIdentity
 	m.mu.Unlock()
-	if client == nil {
+	if client == nil || sess == "" {
+		// sess==""（recreateTab 重建窗口）：Runtime.evaluate 会打向浏览器
+		// 根连接，如实报错让上层按 browser 暂不可用处理。
 		m.jarRW.RUnlock()
 		stopWatch()
-		s.fail(browserErr("cdp client gone"))
+		s.fail(browserErr("no active page session"))
 		return 0, nil, s.fatalErr
 	}
 	// 出口切换协调：同出口并发自由走，跨出口等旧在飞归零才切换——
 	// A 的 SetUpstream(B) 不会被并发 B 的 SetUpstream(C) 抢切隧道。
-	if err := m.acquireBridgeExit(ctx, proxyURL); err != nil {
+	// allowDirect 按本请求账号的绑定语义显式计算（锁定直连显式 true），
+	// 与 URL 共同构成出口身份参与并发分组。
+	if err := m.acquireBridgeExit(ctx, proxyURL, bridgeAllowDirect(account)); err != nil {
 		m.jarRW.RUnlock()
 		stopWatch()
 		s.fail(err)

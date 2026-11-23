@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+// proxyIDDirect（-1 锁定直连）三条核心不变量（分散实现易复发，统一在此固化）：
+//  1. 库值优先于快照：任何 acct.ProxyID/conv.proxyID 快照都可能陈旧，
+//     判出口归属必须先按 claimMu/核库读 accounts.proxy_id 当前值；
+//  2. 自动写绑绝不覆写 -1：非管理员写绑一律走 autoBindAccountProxy，
+//     它在 claimMu 锁内重查——库里 -1 / 已删 / proxyID<=0 / 已有有效绑定
+//     都绝不写；管理员写绑走 bindAccountProxy；
+//  3. 直连槽 0 的语义随池态变化：hasProxyPool() && !FallbackDirect 时
+//     slots[0] 只归锁定直连号（cur==proxyIDDirect），其它账号/匿名借用
+//     即泄漏本机 IP；池空或 fallback 开时按普通直连语义。
 type Proxy struct {
 	ID        int64  `json:"id"`
 	Name      string `json:"name"`
@@ -446,6 +455,15 @@ func joinComma(parts []string) string {
 	return out
 }
 
+// proxyDisplayName 是「绑定出口」展示名：-1 = 本机直连（锁定），0 = 未绑定，
+// >0 = 代理名（取不到回空串）。
+func proxyDisplayName(id int64) string {
+	if id == proxyIDDirect {
+		return "本机直连（锁定）"
+	}
+	return proxyNameByID(id)
+}
+
 // proxyNameByID 按 id 找代理名，找不到返回空串（0 = 还没绑 / 直连）。
 func proxyNameByID(id int64) string {
 	if id <= 0 {
@@ -530,6 +548,15 @@ func proxyEnabledByID(id int64) bool {
 		}
 	}
 	return false
+}
+
+// hasProxyPool 报告代理池是否配置了任何代理（不看 enabled/熔断）。
+// 「池非空 = 配了池」是所有「绝不直连」判定的共用口径（acquireSlot /
+// syncBridgeUpstream / allSlotUsage / acquireClaimedSlot 的 -1 快照纠偏）。
+func hasProxyPool() bool {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	return len(proxyCache) > 0
 }
 
 // proxyUsableByID 这个出口现在还能不能用（存在 + enabled + 没熔断或已过冷却）。

@@ -99,9 +99,11 @@ func viaSlot(a *CookieAccount, fn func(proxyURL string) error) error {
 	// 严格模式下绝不锁外写库：绑定仲裁已在 acquireClaimedSlot 的 claimMu 里完成
 	//（与 cookie_pool.go 的 checkAccountCookie 完全一致），这里再写会覆盖
 	// 管理员并发改绑（R3-S2）；内存快照 a.ProxyID 仍就地同步。
-	if a.ID > 0 && p.ID > 0 && p.ID != a.ProxyID {
+	// a.ProxyID == proxyIDDirect（锁定直连）绝不覆写也不调 bindAccountProxy：
+	// 直连是它的合法承诺，落到槽位 0 纯属正常，不许当成「绑定漂移」改掉。
+	if a.ID > 0 && p.ID > 0 && p.ID != a.ProxyID && a.ProxyID != proxyIDDirect {
 		if !rtCfg().StrictProxyBinding {
-			bindAccountProxy(a.ID, p.ID)
+			autoBindAccountProxy(a.ID, p.ID)
 		}
 		a.ProxyID = p.ID
 	}

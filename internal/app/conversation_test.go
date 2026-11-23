@@ -1365,3 +1365,27 @@ func TestStreamGenerateConvPersistsRebind(t *testing.T) {
 		t.Fatalf("重绑必须持久化到账号行：%+v", acc)
 	}
 }
+
+// R2-S2 回归：convMustColdStart 非严格模式下「锁定直连参与改绑」也必须冷启动——
+// -1 的承诺不靠 strict 开关兑现，带着旧出口的 cid/rid 续接会把会话推下错的出口。
+func TestConvMustColdStartLockedDirectRebind(t *testing.T) {
+	a, _ := withTwoProxies(t, false) // 非严格
+	acct := addTestAccount(t, "coldDirect")
+	// 会话记忆里是锁定直连，库中被改成代理 A → 冷启动。
+	bindAccountProxy(acct, a)
+	conv := &convState{isLogin: true, accountID: acct, proxyID: proxyIDDirect}
+	if !convMustColdStart(conv) {
+		t.Fatal("conv.proxyID=-1 库中改绑代理：非严格模式也必须冷启动")
+	}
+	// 反向：会话记代理 A，库中被锁成 -1 → 同样冷启动。
+	bindAccountProxy(acct, proxyIDDirect)
+	conv2 := &convState{isLogin: true, accountID: acct, proxyID: a}
+	if !convMustColdStart(conv2) {
+		t.Fatal("库中改锁 -1：非严格模式也必须冷启动")
+	}
+	// 两侧同为 -1（未改绑）→ 不冷启动。
+	conv3 := &convState{isLogin: true, accountID: acct, proxyID: proxyIDDirect}
+	if convMustColdStart(conv3) {
+		t.Fatal("同为 -1 未改绑不该冷启动")
+	}
+}

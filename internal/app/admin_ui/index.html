@@ -1039,6 +1039,10 @@ const RT_GROUPS = [
         hint: '客户端没传 model 时用哪个' },
       { k: 'max_prompt_bytes', label: 'Prompt 字节上限', type: 'int', min: 0, max: 10000000,
         hint: '超了直接返回 400 context_length_exceeded。上游的墙实测在约 13 万 UTF-8 字节，按字节算跟语言无关（同字节数下中英文表现一致，而 token 数差 1.9 倍）。不拦的话上游从尾部静默截断，被吃掉的正是刚问的那句。0=不限' },
+      { k: 'max_context_file_bytes', label: '历史附件字节上限', type: 'int', min: 0, max: 10000000,
+        hint: '超长对话转成 message.txt 附件时的附件字节上限。实测模型能读到的附件总量约 16 万字节，默认 150000 留余量。超了按下面「附件超限处置」处理。0=不限' },
+      { k: 'context_overflow_mode', label: '附件超限处置', type: 'text',
+        hint: 'error（默认）：附件超「历史附件字节上限」直接回 400 context_length_exceeded，由客户端自己压缩上下文。compact（显式开启）：先在结构化 messages[] 层裁掉最早的原子消息组（带 tool_calls 的 assistant 与其 tool 结果不拆散）再转附件——system 消息与最后一组交互始终保留，首条 user 任务消息在不超过 25% 历史预算时锚定保留（超限装不下时可整组淘汰）。裁到不能再裁仍超照样 400。' },
       { k: 'impersonate', label: 'TLS 指纹', type: 'text',
         hint: 'chrome_146 / chrome_144 / firefox_147 / safari_16_0 …' },
       { k: 'firefox_fingerprint', label: 'Firefox 指纹（实验）', type: 'bool',
@@ -1472,18 +1476,19 @@ function parseAuthUser(v) {
 
 async function editCookieAcct(id, label, note, authuser, proxyId) {
   const proxies = (await api('api/proxies')).items || [];
-  const proxyOptions = [{ value: '0', label: '自动（第一次用到哪个代理就绑哪个）' }]
-    .concat(proxies.map(p => ({ value: String(p.id), label: '#' + p.id + ' ' + (p.name || p.url) + (p.enabled ? '' : '（已禁用）') })));
+  const proxyOptions = [
+    { value: '0', label: '自动（第一次用到哪个代理就绑哪个）' },
+    { value: '-1', label: '本机直连（锁定）' },
+  ].concat(proxies.map(p => ({ value: String(p.id), label: '#' + p.id + ' ' + (p.name || p.url) + (p.enabled ? '' : '（已禁用）') })));
   const fields = [
     { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
     { name: 'authuser', label: '账号序号', value: String(authuser || 0),
       hint: '浏览器里同时登了多个 Google 号时用：地址栏 /u/1/ 填 1，没有 /u/ 填 0。' },
     { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
+    // 代理池为空也始终显示：支持「先锁本机直连再加代理」的部署顺序。
+    { name: 'proxy_id', label: '绑定出口', value: String(proxyId ?? 0), options: proxyOptions,
+      hint: '这个号固定从哪个出口出去：「自动」第一次用到哪个代理就绑哪个；「本机直连（锁定）」永远只走本机 IP、绝不进代理池；选某个代理则固定走它。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。' },
   ];
-  if (proxies.length) {
-    fields.push({ name: 'proxy_id', label: '绑定出口', value: String(proxyId || 0), options: proxyOptions,
-      hint: '这个号固定从哪个代理出去。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。' });
-  }
   const data = await modalForm({
     title: '编辑 Cookie #' + id,
     desc: '只改标签、备注、账号序号和绑定出口，不动 cookie 本身。要换 cookie 请删掉重新导入。',
@@ -2406,9 +2411,18 @@ const I18N_EN = {
   '导入': 'Import',
   '只改标签、备注和账号序号，不动 cookie 本身。要换 cookie 请删掉重新导入。': 'Edits only the label, note and account index, not the cookie itself. To replace the cookie, delete and re-import.',
   '只改标签、备注、账号序号和绑定出口，不动 cookie 本身。要换 cookie 请删掉重新导入。': 'Edits only the label, note, account index and bound proxy, not the cookie itself. To replace the cookie, delete and re-import.',
-  '绑定出口': 'Bound proxy',
+  '绑定出口': 'Bound exit',
   '自动（第一次用到哪个代理就绑哪个）': 'Automatic (bind to the first proxy used)',
+  '本机直连（锁定）': 'Direct local IP (locked)',
+  '这个号固定从哪个出口出去：「自动」第一次用到哪个代理就绑哪个；「本机直连（锁定）」永远只走本机 IP、绝不进代理池；选某个代理则固定走它。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。':
+    'Which exit this account always uses: "Automatic" binds the first proxy it uses; "Direct local IP (locked)" always uses the local IP and never enters the proxy pool; picking a proxy pins it. With "Strict account-to-proxy binding" on, it will not switch IP even when the bound proxy is full.',
   '这个号固定从哪个代理出去。配合设置里的「账号严格绑定出口」，绑定的代理满了也不会换 IP。': 'Which proxy this account always uses. With "Strict account-to-proxy binding" on in Settings, it will not switch IP even when that proxy is full.',
+  '历史附件字节上限': 'History attachment byte limit',
+  '超长对话转成 message.txt 附件时的附件字节上限。实测模型能读到的附件总量约 16 万字节，默认 150000 留余量。超了按下面「附件超限处置」处理。0=不限':
+    'Byte cap for the message.txt attachment produced from oversized conversations. The model can read ~160 KB total; default 150000 leaves headroom. Overflow is handled per "Attachment overflow policy" below. 0 = unlimited.',
+  '附件超限处置': 'Attachment overflow policy',
+  'error（默认）：附件超「历史附件字节上限」直接回 400 context_length_exceeded，由客户端自己压缩上下文。compact（显式开启）：先在结构化 messages[] 层裁掉最早的原子消息组（带 tool_calls 的 assistant 与其 tool 结果不拆散）再转附件——system 消息与最后一组交互始终保留，首条 user 任务消息在不超过 25% 历史预算时锚定保留（超限装不下时可整组淘汰）。裁到不能再裁仍超照样 400。':
+    'error (default): an attachment over the limit returns 400 context_length_exceeded so the client compacts its own context. compact (explicit opt-in): first trims the oldest atomic message groups on the structured messages[] layer (an assistant with tool_calls is never split from its tool results), then attaches — system messages and the last interaction group are always kept, and the first user task message is pinned only when it fits within 25% of the history budget (oversized ones may be dropped as a whole group). Still over after trimming → 400 anyway.',
   '账号序号': 'Account index',
   '浏览器里同时登了多个 Google 号才需要改：打开那个号的 Gemini，地址栏是 /u/1/ 就填 1，没有 /u/ 就是 0。同一串 cookie 想当几个号用，就导入几次、各填各的序号。':
     'Only needed when several Google accounts are signed in to the same browser: open Gemini as that account — if the address bar shows /u/1/, enter 1; no /u/ means 0. To use one cookie string as several accounts, import it once per account with its own index.',

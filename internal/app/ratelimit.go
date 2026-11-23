@@ -135,6 +135,19 @@ func slotUsage(proxyID int64) SlotUsage {
 // 最该盯的一屏。这里按 acquireSlot 的同一套规则枚举：配了代理就只列代理
 // （代理存在时不会退回直连），否则列直连。
 func allSlotUsage() []SlotUsage {
+	ids := slotIDsInUse()
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := make([]SlotUsage, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, slotUsage(id))
+	}
+	return out
+}
+
+// slotIDsInUse 枚举当前可被调度到的全部 slot id（allSlotUsage 的收集段）：
+// 启用代理 + 直连槽（池空 / fallback_direct 开 / 有锁定直连账号时可见）
+// + 已从池移除但仍有计数的残留 slot。
+func slotIDsInUse() []int64 {
 	seen := map[int64]bool{}
 	var ids []int64
 
@@ -148,7 +161,18 @@ func allSlotUsage() []SlotUsage {
 	hasProxies := len(ids) > 0
 	proxyMu.RUnlock()
 
-	if !hasProxies {
+	// 直连槽可见性：没配代理池必然走直连；配了池但 fallback_direct 开着会兜底；
+	// 还有账号锁定 proxyIDDirect（-1 本机直连）时，直连槽同样是真实调度目标。
+	directInUse := !hasProxies || rtCfg().FallbackDirect
+	if !directInUse {
+		for _, a := range accountList() {
+			if a.Status == "enabled" && a.ProxyID == proxyIDDirect {
+				directInUse = true
+				break
+			}
+		}
+	}
+	if directInUse {
 		ids = append(ids, 0)
 		seen[0] = true
 	}
@@ -156,18 +180,19 @@ func allSlotUsage() []SlotUsage {
 	// 已有计数但已从池中移除/禁用的 slot 也带上，否则它的用量会凭空消失
 	slotsMu.RLock()
 	for id := range slots {
-		if !seen[id] && (hasProxies == (id != 0)) {
-			ids = append(ids, id)
+		if seen[id] {
+			continue
 		}
+		if id == 0 && !directInUse {
+			continue
+		}
+		if id != 0 && !hasProxies {
+			continue
+		}
+		ids = append(ids, id)
 	}
 	slotsMu.RUnlock()
-
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	out := make([]SlotUsage, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, slotUsage(id))
-	}
-	return out
+	return ids
 }
 
 func pruneTimestamps(ts []int64, cutoff int64) []int64 {
