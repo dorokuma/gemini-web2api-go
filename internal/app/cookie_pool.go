@@ -565,6 +565,14 @@ type CookieCheck struct {
 // 只抓页面，不发对话，不消耗生成配额。
 func checkAccountCookie(a CookieAccount) CookieCheck {
 	t0 := time.Now()
+	// 调用方手上是 accountList() 的陈旧快照：并发请求或手动改绑之后，库里的
+	// 绑定可能已经变了，必须先按库里当前值走（同 viaSlot 的刷新），绝不能拿
+	// 旧 ProxyID 去挑出口——严格绑定下拿旧值仲裁会误抢并发请求赢下的绑定。
+	if a.ID > 0 {
+		if cur := accountByID(a.ID); cur != nil {
+			a.ProxyID = cur.ProxyID
+		}
+	}
 	picked, release, err := acquireClaimedSlot(a.ID, a.ProxyID)
 	if picked == nil {
 		return CookieCheck{Detail: "拿不到出口：" + err.Error()}
@@ -620,12 +628,24 @@ func explainCookieFailure(err error) string {
 	}
 }
 
-// bindAccountProxy 记住这个账号这次用的出口，下次优先复用。
-func bindAccountProxy(accountID, proxyID int64) {
+// bindAccountProxyLocked 记住这个账号这次用的出口，下次优先复用。
+// 调用方必须持有 claimMu——锁外写库会覆盖 claimAccountProxy 刚仲裁出的胜者。
+func bindAccountProxyLocked(accountID, proxyID int64) {
 	if accountID <= 0 {
 		return
 	}
 	_, _ = getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`, proxyID, accountID)
+}
+
+// bindAccountProxy 是锁外入口（管理员 PATCH/POST 改绑、非严格模式的首绑/重绑落库）：
+// 加 claimMu 后与 claimAccountProxy 完全互斥——手动改绑不能插在「核库→写库」之间。
+func bindAccountProxy(accountID, proxyID int64) {
+	if accountID <= 0 {
+		return
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	bindAccountProxyLocked(accountID, proxyID)
 }
 
 // claimMu 把「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作。
@@ -652,7 +672,7 @@ func claimAccountProxy(accountID, candidateProxyID int64) int64 {
 	if cur > 0 && proxyEnabledByID(cur) {
 		return cur
 	}
-	bindAccountProxy(accountID, candidateProxyID)
+	bindAccountProxyLocked(accountID, candidateProxyID)
 	return candidateProxyID
 }
 

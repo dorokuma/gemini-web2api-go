@@ -287,8 +287,12 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	// 绑定持久化：挑到的出口跟记的不一样就写库同步——含首次绑定（旧值 0）、
 	// 绑定出口被删/禁用后的重绑、以及管理员在面板上改绑后被本轮仲裁纠正回
 	// 胜者的场景。匿名会话（accountID==0）不写：它没有账号行可绑。
+	// 严格模式下绝不锁外写库：绑定仲裁已在 acquireClaimedSlot 的 claimMu 里完成，
+	// 这里再写会覆盖管理员并发改绑（R3-S2）；内存快照 conv.proxyID 仍就地同步。
 	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID {
-		bindAccountProxy(conv.accountID, p.ID)
+		if !rtCfg().StrictProxyBinding {
+			bindAccountProxy(conv.accountID, p.ID)
+		}
 		conv.proxyID = p.ID
 	}
 	proxyURL := p.URL

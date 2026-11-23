@@ -15,11 +15,18 @@ import (
 
 // blockingBody 让 StreamGenerate 的响应体读取阻塞到 ctx 结束：模拟真实
 // 流式响应中途客户端取消——readBody 经 stopReader/heardReader 读到 ctx.Err() 中断。
+// reachedRead 非 nil 时首个 Read 关闭它一次：调用方据此确定取消发生在
+// StreamGenerate 已进入响应体读取之后（R3-M3 要求确定性，不靠 sleep）。
 type blockingBody struct {
-	ctx context.Context
+	ctx         context.Context
+	reachedRead chan struct{}
+	once        sync.Once
 }
 
 func (b *blockingBody) Read(p []byte) (int, error) {
+	if b.reachedRead != nil {
+		b.once.Do(func() { close(b.reachedRead) })
+	}
 	<-b.ctx.Done()
 	return 0, b.ctx.Err()
 }
@@ -968,15 +975,49 @@ func convFakeUpstream(t *testing.T, proxyURL string, rt http.RoundTripper) strin
 //   - 败方重取胜者失败（ok2=false）：败方 slot 不双释放、胜者的占用保持。
 //
 // 用 claimMu 同步门把仲裁卡在临界区，主线程在期间改状态，跟真实并发首绑同构。
+// R3-M3：两个子例共用同一套「并发首绑」场景与哨兵计位——
+//   - 账号在库中保持未绑定（ProxyID=0），goroutine 拿 B 只是轮询落空；
+//   - PerIPConcurrent=2，slots[a]=2 满载迫使 acquireSlot(0) 必选 B，
+//     slots[b]=1 哨兵（借出变 2、单释放回 1、双释放跌 0），
+//     slots[0]=1 哨兵（误释放直连槽会跌 0）；
+//   - 主线程持 claimMu → goroutine 拿到 B 后阻塞在 claimAccountProxy 的锁上
+//     （轮询 slotUsage(b)==2 且 done 未关 = 确定性同步点，不用 sleep），
+//     主线程以 bindAccountProxyLocked 模拟并发胜者落库后再放锁。
 func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
+	// 轮询等待 goroutine 拿下 B 的 slot（inflight 1→2）并阻塞在 claimMu 上：
+	// 拿到 B 后唯一的锁点就是 claimAccountProxy，done 未关证明它还在临界区前。
+	waitBLoaned := func(t *testing.T, b int64, done chan struct{}) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for slotUsage(b).Inflight != 2 {
+			select {
+			case <-done:
+				t.Fatal("goroutine 在拿到 B 的 slot 之前就退出了")
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("goroutine 未在 5s 内拿到 B 的 slot：%+v", slotUsage(b))
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	t.Run("ok2 winner takes over without leak", func(t *testing.T) {
 		a, b := withTwoProxies(t, true)
-		s := getSlot(a)
-		s.mu.Lock()
-		s.inflight = 0 // 胜者 A 此刻空闲
-		s.mu.Unlock()
+		rtMu.Lock()
+		rtVal.PerIPConcurrent = 2
+		rtMu.Unlock()
+		setSlotInflight := func(id int64, n int) {
+			s := getSlot(id)
+			s.mu.Lock()
+			s.inflight = n
+			s.mu.Unlock()
+		}
+		setSlotInflight(a, 2) // 满载迫使 acquireSlot(0) 必选 B
+		setSlotInflight(b, 1) // 哨兵：借出→2、单释放回 1、双释放跌 0
+		setSlotInflight(0, 1) // 哨兵：误释放直连槽会跌 0
 		acct := addTestAccount(t, "convwin")
-		bindAccountProxy(acct, a) // 并发首绑已把 A 绑给这个号
+		// 库中保持未绑定：goroutine 先拿到 B，主线程稍后落库胜者 A。
 
 		claimMu.Lock()
 		done := make(chan struct{})
@@ -989,28 +1030,26 @@ func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
 			res, err = streamGenerateConv(context.Background(), "hi",
 				Models["gemini-3.6-flash"], conv, nil, nil)
 		}()
-		time.Sleep(50 * time.Millisecond)
-		// 仲裁卡在 claimMu：此刻 goroutine 已占 B、在 claimAccountProxy 等锁。
-		// 占满 A：让胜者改占必走 Bound 失败的那一路？不——这里测 ok2=true：
-		// 释放主线程对 A 的占用后放锁，goroutine 读到绑定 A、释放 B、重取 A 成功。
-		s.mu.Lock()
-		s.inflight = 0
-		s.mu.Unlock()
+		waitBLoaned(t, b, done)
+		// 模拟并发胜者落库，再给胜者 A 腾出 1 个并发位（2→1）：
+		// 放锁后败方释放 B、重取 A 必成功（ok2=true）。
+		bindAccountProxyLocked(acct, a)
+		setSlotInflight(a, 1)
 		claimMu.Unlock()
 		<-done
 		_ = res
 		// getXSRF 会真发请求（127.0.0.1:1 不可达）→ 失败，但 slot 必须先正确记账。
 		_ = err
-		// A 被 goroutine 拿走又随 defer release() 归还——终态 inflight 必须回到 0，
-		// 泄漏者槽位会留 1（旧实现 defer releaseSlot(p.ID) 记的是败方 B）。
-		if u := slotUsage(a); u.Inflight != 0 {
-			t.Fatalf("胜者 A 不能泄漏 slot：%+v", u)
+		// goroutine 拿走 A 又随 defer release() 归还：哨兵终态必须回到主线程占的 1——
+		// 泄漏留 2（旧实现 defer releaseSlot(p.ID) 记的是败方 B）。
+		if u := slotUsage(a); u.Inflight != 1 {
+			t.Fatalf("胜者 A 不能泄漏 slot（哨兵应回 1）：%+v", u)
 		}
-		if u := slotUsage(b); u.Inflight != 0 {
-			t.Fatalf("败方 B 必须归还不能多放：%+v", u)
+		if u := slotUsage(b); u.Inflight != 1 {
+			t.Fatalf("败方 B 必须单释放回哨兵 1（双释放会跌 0）：%+v", u)
 		}
-		if u := slotUsage(0); u.Inflight < 0 {
-			t.Fatalf("直连 slot 被误释放：%+v", u)
+		if u := slotUsage(0); u.Inflight != 1 {
+			t.Fatalf("直连 slot 绝不能被误释放（哨兵应保持 1）：%+v", u)
 		}
 		// 会话跟库都必须绑到胜者 A。
 		if conv.proxyID != a {
@@ -1023,8 +1062,20 @@ func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
 
 	t.Run("ok2 false loser never double releases", func(t *testing.T) {
 		a, b := withTwoProxies(t, true)
+		rtMu.Lock()
+		rtVal.PerIPConcurrent = 2
+		rtMu.Unlock()
+		setSlotInflight := func(id int64, n int) {
+			s := getSlot(id)
+			s.mu.Lock()
+			s.inflight = n
+			s.mu.Unlock()
+		}
+		setSlotInflight(a, 2) // 保持满载：败方重取 A 必然 !ok2
+		setSlotInflight(b, 1)
+		setSlotInflight(0, 1)
 		acct := addTestAccount(t, "convlose")
-		bindAccountProxy(acct, a)
+		// 库中保持未绑定。
 
 		claimMu.Lock()
 		done := make(chan struct{})
@@ -1037,11 +1088,9 @@ func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
 			res, err = streamGenerateConv(context.Background(), "hi",
 				Models["gemini-3.6-flash"], conv, nil, nil)
 		}()
-		time.Sleep(50 * time.Millisecond)
-		s := getSlot(a)
-		s.mu.Lock()
-		s.inflight = 1 // 占满胜者 A：败方重取必然 !ok2
-		s.mu.Unlock()
+		waitBLoaned(t, b, done)
+		// 主线程以并发胜者落库 A，保持 A 满载后放锁：败方重取必然 !ok2。
+		bindAccountProxyLocked(acct, a)
 		claimMu.Unlock()
 		<-done
 
@@ -1052,14 +1101,14 @@ func TestStreamGenerateConvClaimLoserSlotAccounting(t *testing.T) {
 		if res == nil || res.AccountID != acct {
 			t.Fatalf("失败结果必须带会话账号：%+v", res)
 		}
-		if u := slotUsage(a); u.Inflight != 1 {
-			t.Fatalf("胜者 A 保持占用 1（主线程占的）：%+v", u)
+		if u := slotUsage(a); u.Inflight != 2 {
+			t.Fatalf("胜者 A 保持占用 2（主线程哨兵，goroutine 没拿过 A）：%+v", u)
 		}
-		if u := slotUsage(b); u.Inflight != 0 {
-			t.Fatalf("败方 B 必须归还不双释放：%+v", u)
+		if u := slotUsage(b); u.Inflight != 1 {
+			t.Fatalf("败方 B 必须单释放回哨兵 1（双释放会跌 0）：%+v", u)
 		}
-		if u := slotUsage(0); u.Inflight < 0 {
-			t.Fatalf("直连 slot 被误释放：%+v", u)
+		if u := slotUsage(0); u.Inflight != 1 {
+			t.Fatalf("直连 slot 绝不能被误释放（哨兵应保持 1）：%+v", u)
 		}
 	})
 }
@@ -1074,6 +1123,9 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 	var mu sync.Mutex
 	var genCalls int
 	var cancelHook func()
+	// reachedRead 随 cancelHook 一起设置：挂起路径的 blockingBody 首个 Read 关闭它，
+	// 子例 B 据此确定取消发生在已进入响应体读取之后（R3-M3，不用 sleep）。
+	var reachedRead chan struct{}
 	rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		resp := func(status int, body string) *http.Response {
 			return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d", status),
@@ -1087,6 +1139,7 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 			genCalls++
 			n := genCalls
 			hook := cancelHook
+			reached := reachedRead
 			mu.Unlock()
 			inner := make([]any, innerSlots)
 			if hook != nil {
@@ -1107,7 +1160,7 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 			line, _ := json.Marshal([]any{[]any{"wrb.fr", "rpc1", string(ib), nil}})
 			if hook != nil {
 				r := resp(200, "")
-				r.Body = &blockingBody{ctx: req.Context()}
+				r.Body = &blockingBody{ctx: req.Context(), reachedRead: reached}
 				return r, nil
 			}
 			return resp(200, ")]}'\n"+string(line)+"\n"), nil
@@ -1209,11 +1262,15 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "cancel-next"})
 
 		ctx, cancel := context.WithCancel(context.Background())
+		reached := make(chan struct{})
 		mu.Lock()
 		cancelHook = func() {} // 非 nil 标记走挂起路径（见 blockingBody）
+		reachedRead = reached
 		mu.Unlock()
+		// 确定性证明取消发生在 StreamGenerate 已进入响应体读取之后：blockingBody
+		// 首个 Read 关闭 reached，等到了才 cancel——不靠 sleep 猜时机（R3-M3）。
 		go func() {
-			time.Sleep(60 * time.Millisecond)
+			<-reached
 			cancel()
 		}()
 		_, _, _, err := callGeminiConv(ctx, next, mc, nil, nil, nil, nil,
@@ -1231,6 +1288,7 @@ func TestConvContinuationUpstreamTouchedAndDowngrade(t *testing.T) {
 		}
 		mu.Lock()
 		cancelHook = nil
+		reachedRead = nil
 		mu.Unlock()
 	})
 }

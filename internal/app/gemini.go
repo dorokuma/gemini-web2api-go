@@ -469,10 +469,11 @@ func releaseSlot(proxyID int64) {
 // 返回 (proxy, release, err)：release 幂等，最多真正释放一次最后占有的 slot；
 // 失败返回 (nil, func(){}, err)——绝不双释放，也绝不误释放 slots[0]。
 //
-// strict_proxy_binding 首绑仲裁必须在任何出站请求之前：拿到的出口跟
-// preferProxyID 不一致时先 claimAccountProxy——胜者不是手上的出口时，先释放
-// 手上的、再按胜者重取 slot；重取失败（如胜者恰在此刻满/冷却）原样报错，
-// 败方的 slot 已归还，胜者的归属由绑定结果保证，同一个账号绝不从两个 IP 外发。
+// strict_proxy_binding 首绑仲裁必须在任何出站请求之前：拿到的出口（含陈旧
+// preferProxyID 命中、以及 fallback_direct 落下的直连槽 0）都要核库仲裁——
+// 胜者不是手上的出口时，先释放手上的、再按胜者重取 slot；重取失败（如胜者
+// 恰在此刻满/冷却）原样报错，败方的 slot 已归还，胜者的归属由绑定结果保证，
+// 同一个账号绝不从两个 IP 外发、已绑定的号绝不直连外发。
 func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) {
 	p, ok, err := acquireSlot(preferProxyID)
 	if !ok {
@@ -485,17 +486,60 @@ func acquireClaimedSlot(accountID, preferProxyID int64) (*Proxy, func(), error) 
 			releaseSlot(heldID)
 		}
 	}
-	if rtCfg().StrictProxyBinding && accountID > 0 && p.ID > 0 && p.ID != preferProxyID {
-		if winner := claimAccountProxy(accountID, p.ID); winner != p.ID {
-			release()
-			p2, ok2, err2 := acquireSlot(winner)
-			if !ok2 {
-				return nil, func() {}, err2
+	if !rtCfg().StrictProxyBinding || accountID <= 0 {
+		return &p, release, nil
+	}
+	// 严格绑定下拿到的出口必须经过仲裁，无论它是不是 preferProxyID：调用方的
+	// prefer 可能是 accountList()/convState 的陈旧快照（claimAccountProxy 核库后
+	// 可能推翻它），绝不能以 p.ID == preferProxyID 为由跳过核库。
+	// 最多 2 轮有界循环：第 2 轮覆盖「claim 出的胜者在 acquireSlot 期间被禁用、
+	// slot 实际落到第 3 个出口」的窗口——那个出口同样要仲裁一次才能外发。
+	for i := 0; i < 2; i++ {
+		var winner int64
+		if p.ID == 0 {
+			// 代理全满/全不可用落入 fallback_direct 直连兜底：先核库——库里已绑
+			// 启用出口的号绝不能从本机 IP 外发，必须释放直连槽去占绑定的出口。
+			// cur==0（未绑定或绑定已失效）时才允许直连。
+			if cur := currentBoundEnabledProxy(accountID); cur == 0 {
+				return &p, release, nil
+			} else {
+				winner = cur
 			}
-			p, heldID, held = p2, p2.ID, true
+		} else {
+			winner = claimAccountProxy(accountID, p.ID)
+			if winner == p.ID {
+				return &p, release, nil
+			}
 		}
+		release()
+		p2, ok2, err2 := acquireSlot(winner)
+		if !ok2 {
+			// 败方 slot 已归还，胜者的归属由绑定结果保证——原样报错，绝不双释放。
+			return nil, func() {}, err2
+		}
+		p, heldID, held = p2, p2.ID, true
+		if p.ID == winner {
+			return &p, release, nil
+		}
+		// winner 途中被禁用/挤兑，acquireSlot 落到了别的出口（可能是另一个代理，
+		// 也可能是 fallback_direct 的直连槽 0）：回圈顶对它再仲裁一次——p.ID==0
+		// 时走「核库当前绑定」分支，库里的 winner 若仍有效就再试一次它的 slot，
+		// 满了/冷却原样报 Bound，绝不直连外发已绑定账号。
 	}
 	return &p, release, nil
+}
+
+// currentBoundEnabledProxy 在 claimMu 下取这个号当前绑定的、仍然存在且 enabled 的
+// 出口 id；没绑、或绑定的出口被删/禁用返回 0。冷却中的绑定仍然算数（同
+// claimAccountProxy 的语义），只看 enabled 不看可用性。
+func currentBoundEnabledProxy(accountID int64) int64 {
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	a := accountByID(accountID)
+	if a == nil || a.ProxyID <= 0 || !proxyEnabledByID(a.ProxyID) {
+		return 0
+	}
+	return a.ProxyID
 }
 
 // deltaTracker 把上游的累积帧转成增量。
@@ -698,12 +742,12 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	// release 闭包内部已按「最后实际占有的 slot」记账：仲裁败方先归还、
 	// 胜者过户，defer 只调一次，绝不双释放也绝不泄漏胜者 slot。
 	defer release()
-	// 仲裁/轮询后的实际出口立即同步进内存快照：后续 getXSRF / rotateAccount(*acct)
-	// 都按 acct.ProxyID 取出口 URL，不同步的话重绑/仲裁后的请求还会按旧绑定
-	// 打向已禁用或别人的出口，甚至退回直连。
-	if acct != nil {
-		acct.ProxyID = picked.ID
-	}
+	// picked（真实拿到的出口）不再原地写进 acct：acct.ProxyID 要保留库里记的
+	// 旧绑定值——非严格模式下 743/763 行要靠它判断「还没绑过 / 绑的出口没了」
+	// 才落库 bindAccountProxy；严格模式下 acquireClaimedSlot 已在 claimMu 里完成
+	// 仲裁落库。原地覆写会让默认模式 743 行判定恒假、绑定永不落库（R3-M1），
+	// 也让 XSRF 换号挑出的新号丢失自己的绑定值。所有出站请求的出口由 proxyURL
+	//（取自 picked）决定，轮转发副本（见 756 行 rotAcct），不依赖 acct.ProxyID。
 
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
@@ -728,8 +772,32 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		// 严格绑定首绑仲裁已在 acquireClaimedSlot 里原子完成（先于一切出站请求），
-		// acct.ProxyID 也已就地同步成实际出口——这里不再重复仲裁/换 slot。
+		// 严格绑定下换号不换出口：XSRF 换号循环挑出的第 2+ 个号还拿着自己在库里的
+		// 绑定值，必须先仲裁——并发请求/管理员已把它绑到别的出口时，绝不能拿
+		// picked 出口替它外发（那等于「换号不换出口」不变量被反着破坏）。
+		// acct.ID>0 是匿名兜底防御（acct 恒来自池，但判空成本为零）。
+		if rtCfg().StrictProxyBinding && acct.ID > 0 && picked.ID > 0 {
+			if winner := claimAccountProxy(acct.ID, picked.ID); winner != picked.ID {
+				// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
+				if mc.PinAccountID > 0 {
+					acct = nil
+					continue
+				}
+				next := map[int64]bool{}
+				for id := range skip {
+					next[id] = true
+				}
+				for id := range tried {
+					next[id] = true
+				}
+				acct, _ = pickCookieAccountExcept(next)
+				for acct != nil && strictBoundElsewhere(acct, picked.ID) {
+					next[acct.ID] = true
+					acct, _ = pickCookieAccountExcept(next)
+				}
+				continue
+			}
+		}
 		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
 		if err == nil {
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
@@ -740,7 +808,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
 			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
 			// 粘性打散一次 —— 实测就是这么散掉的。
-			if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
+			// 只在非严格模式写：严格模式的落库只走 claimMu 里的 claimAccountProxy
+			//（上面已仲裁过），锁外写库会覆盖管理员的并发改绑。
+			if !rtCfg().StrictProxyBinding && (acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
 				bindAccountProxy(acct.ID, picked.ID)
 			}
 			break
@@ -753,14 +823,21 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		// 只试一次，且只在这一轮。
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
-			if _, _, rerr := rotateAccount(*acct); rerr == nil {
+			// 轮转必须走本次选定的出口：rotateAccount 按 a.ProxyID 取出口 URL，
+			// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
+			// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
+			rotAcct := *acct
+			if picked.ID > 0 {
+				rotAcct.ProxyID = picked.ID
+			}
+			if _, _, rerr := rotateAccount(rotAcct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
 					if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
 						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
 						acct = fresh
 						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
 						authUser = fresh.AuthUser
-						if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
+						if !rtCfg().StrictProxyBinding && (fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID)) {
 							bindAccountProxy(fresh.ID, picked.ID)
 						}
 						break
