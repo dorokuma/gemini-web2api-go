@@ -654,7 +654,16 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		return nil, err
 	}
 	var acct *CookieAccount
-	skip := exclude
+	// skip 是调用方 exclude 的独立浅拷贝：后面 XSRF 换号 / 并发改绑仲裁会往里面
+	// 加号，直接共用会把调用方的 exclude 污染掉（外层重试循环靠 exclude 判「这个号
+	// 已被处理过」，被污染后会把没出问题的号也排除掉）。pickAccountForModel 返回的
+	// 新 map 已经含 exclude+冷却，拿到它后再覆写即可。
+	skip := make(map[int64]bool, len(exclude))
+	for k, v := range exclude {
+		if v {
+			skip[k] = true
+		}
+	}
 	if mc.PinAccountID > 0 {
 		a := accountByID(mc.PinAccountID)
 		if a == nil || a.Status != "enabled" {
@@ -676,6 +685,16 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 				return &StreamResult{}, err
 			}
 			acct, skip = a, s
+		}
+	}
+	// M1 驻留号路径（shouldUseBrowserTransport 且 stickyResidentAccountFor 命中）跳过了
+	// pickAccountForModel，skip 里没有 strict_model 的冷却集合——后面 XSRF 换号走
+	// pickCookieAccountExcept(skip) 会把正在冷却的号挑回来，Bound 内层换号也一样。
+	// 统一在挑号分支结束后把冷却并进 skip；pickAccountForModel 已经并过一次的是幂等重并。
+	if rtCfg().StrictModel && mc.Upstream != "" {
+		cooling, _ := coolingAccounts(mc)
+		for id := range cooling {
+			skip[id] = true
 		}
 	}
 	preferProxy := int64(0)

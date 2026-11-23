@@ -107,6 +107,12 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool) (*CookieAccount
 // retryOnAnotherAccount 判断一次降级要不要换号重来，要的话先把这个号记进冷却和 exclude。
 // 匿名降级没号可换；已经吐过内容的不能重来（客户端会收到两遍）。
 func retryOnAnotherAccount(res *StreamResult, err error, mc ModelConfig, exclude map[int64]bool) bool {
+	// 会话钉住的号绝不能换：PinAccountID>0 时 Bound 429 不并进 exclude、不打换号日志，
+	// 直接返回 false——streamGenerateOnce 内部已经按 pinned 语义拒绝了换号，外层再把它
+	// 记进 exclude 换下一个号等于绕过钉号语义（降级冷却同理，先记冷却再 return）。
+	if mc.PinAccountID > 0 {
+		return false
+	}
 	// strict_proxy_binding：会话绑的号因绑定出口受限出不去（Bound 429）时，把它并进
 	// exclude 再换号——多轮续接的换号循环调本函数。它是「这个号这次用不了」而不是
 	// 模型降级，不记 strict_model 冷却；browser_transport 的 stickyResidentAccountFor

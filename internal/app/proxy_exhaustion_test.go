@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 func withTestProxySlot(t *testing.T, proxy Proxy, configure func(*RuntimeConfig)) {
@@ -305,8 +308,12 @@ func TestStrictBindingM1BoundSwitchSkipsCoolingAccount(t *testing.T) {
 	m.mu.Unlock()
 	t.Cleanup(func() { m.mu.Lock(); m.seed = oldSeed; m.mu.Unlock() })
 
+	// 调用方的 exclude 只能被 Bound 内层的驻留号有意并入（让下一轮
+	// stickyResidentAccountFor 不再挑回它）；XSRF 换号往 skip 加的冷却号 /
+	// 挑过的号绝不能写回调用方的 exclude（R5-S2：skip 已是独立浅拷贝）。
+	callerExclude := map[int64]bool{}
 	res, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
-		mc, nil, nil, nil, nil, map[int64]bool{})
+		mc, nil, nil, nil, nil, callerExclude)
 	if err == nil {
 		t.Fatal("127.0.0.1:1 不可达，请求不该成功")
 	}
@@ -323,6 +330,13 @@ func TestStrictBindingM1BoundSwitchSkipsCoolingAccount(t *testing.T) {
 	// 也没被挑号记录过 last_used_at（仍 0）。任何一次误挑都会留下这两者之一。
 	if acc := accountByID(cooling); acc == nil || acc.ProxyID != 0 || acc.LastUsedAt != 0 {
 		t.Fatalf("冷却号绝不能被挑中/绑定：%+v", acc)
+	}
+	// exclude 里只能有驻留号这个有意并入项，绝不能混入冷却号或 healthy。
+	if callerExclude[cooling] {
+		t.Fatalf("冷却号绝不能被写进调用方 exclude：%v", callerExclude)
+	}
+	if callerExclude[healthy] {
+		t.Fatalf("挑中过的健康号绝不能被写回调用方 exclude：%v", callerExclude)
 	}
 
 	// 健康号也没了：只剩绑 A 的驻留号 + 冷却号 → 全阻应报 Bound 429（A 满），
@@ -609,6 +623,7 @@ func TestStrictFallbackDirectRotateNeverUsesStaleBinding(t *testing.T) {
 
 	var mu sync.Mutex
 	var bPaths []string
+	var directPaths, directCookies []string
 	timeout := rtCfg().RequestTimeout
 	for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
 		stdlibClientCache.Store("http://127.0.0.1:2"+suf, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -623,6 +638,37 @@ func TestStrictFallbackDirectRotateNeverUsesStaleBinding(t *testing.T) {
 			stdlibClientCache.Delete("http://127.0.0.1:2" + suf)
 		}
 	}()
+	// R5-M1：直连绝不能真发公网。用 fake tls-client 接管两个缓存 key（限时的
+	// getTLSClient 与不限时的 getTLSStreamClient）：/app 回 200 空页面让 getXSRF
+	// 确定性失败 → 进 rotateAccount → /RotateCookies 也落在这个 fake 上。
+	fake := &captureTLSClient{do: func(req *fhttp.Request) (*fhttp.Response, error) {
+		mu.Lock()
+		directPaths = append(directPaths, req.URL.Path)
+		directCookies = append(directCookies, req.Header.Get("Cookie"))
+		mu.Unlock()
+		return &fhttp.Response{
+			StatusCode: 200, Status: "200 OK",
+			Header: fhttp.Header{},
+			Body:   io.NopCloser(strings.NewReader("")),
+		}, nil
+	}}
+	imp := effectiveImpersonate()
+	for _, to := range []int{timeout, 0} {
+		key := fmt.Sprintf("%s|%d", imp, to)
+		clientCacheMu.Lock()
+		prev, had := clientCache[key]
+		clientCache[key] = fake
+		clientCacheMu.Unlock()
+		t.Cleanup(func() {
+			clientCacheMu.Lock()
+			defer clientCacheMu.Unlock()
+			if had {
+				clientCache[key] = prev
+			} else {
+				delete(clientCache, key)
+			}
+		})
+	}
 
 	res, _ := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
 		mc, nil, nil, nil, nil, map[int64]bool{})
@@ -631,11 +677,27 @@ func TestStrictFallbackDirectRotateNeverUsesStaleBinding(t *testing.T) {
 	if len(bPaths) != 0 {
 		t.Fatalf("直连兜底下轮转绝不能打向已禁用/满载的旧绑定 B：paths=%v", bPaths)
 	}
+	var rotateHits int
+	var rotateCookieOK bool
+	for i, p := range directPaths {
+		if strings.Contains(p, "/RotateCookies") {
+			rotateHits++
+			if strings.Contains(directCookies[i], "__Secure-1PSID=rotdirect") {
+				rotateCookieOK = true
+			}
+		}
+	}
+	if rotateHits == 0 {
+		t.Fatalf("直连兜底的 getXSRF 失败必须触发 /RotateCookies 轮转发往直连：directPaths=%v", directPaths)
+	}
+	if !rotateCookieOK {
+		t.Fatalf("/RotateCookies 必须携带该账号的 __Secure-1PSID=rotdirect：cookies=%v", directCookies)
+	}
 	if res != nil && res.ProxyID != 0 {
 		t.Fatalf("出口应是直连兜底（ProxyID=0）：res=%+v", res)
 	}
-	if u := slotUsage(0); u.Inflight != 1 {
-		t.Fatalf("直连槽哨兵应回 1（借出后单释放）：%+v", u)
+	if u := slotUsage(0); u.RPM != 1 || u.Inflight != 1 {
+		t.Fatalf("直连槽应真实借还（RPM=1、Inflight 回哨兵 1）：%+v", u)
 	}
 }
 
@@ -744,6 +806,17 @@ func TestStrictPinnedReboundConflictNeverAnon(t *testing.T) {
 	// 库里最终绑定保持 A（并发写序的最后一写），没被 picked=B 覆写。
 	if acc := accountByID(acct); acc == nil || acc.ProxyID != a {
 		t.Fatalf("库里绑定必须保持并发写的结果 A：%+v", acc)
+	}
+	// R5-S1：pin 住的号上收到 Bound 429 绝不能被外层 retryOnAnotherAccount 换号——
+	// 不写入 exclude、不打「换下一个号」日志、直接返回 false。
+	excl := map[int64]bool{}
+	if retryOnAnotherAccount(&StreamResult{AccountID: acct},
+		&RateLimitError{Reason: "rebound", ProxyID: b, Bound: true},
+		ModelConfig{PinAccountID: acct}, excl) {
+		t.Fatal("钉住号的 Bound 错误绝不能换号重试")
+	}
+	if len(excl) != 0 {
+		t.Fatalf("钉住号的 Bound 错误绝不能写 exclude：excl=%v", excl)
 	}
 }
 
