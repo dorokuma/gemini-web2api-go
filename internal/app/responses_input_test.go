@@ -412,29 +412,28 @@ func TestResponsesInputLargeIntegersKeepPrecision(t *testing.T) {
 	// Turn 2 变异组（先发）：arguments …993 必须 miss（turn 0）且不消耗首轮 head；
 	// 若 arguments 被解成 float64，…993 与首轮存的 …992 撞同指纹会错误续接。
 	// 首轮 head 只有 [user, assistant] 两层，function_call_output/user 后缀不算。
+	// arguments 用对象形态经 json.Marshal 发送，入口 UseNumber() 解成 json.Number
+	// 后走 arguments 序列化分支，真实检验对象形态大整数不被 float64 舍入。
 	callHead := map[string]interface{}{"type": "function_call", "call_id": callID,
-		"name": "lookup", "arguments": `{"id":9007199254740992}`}
+		"name": "lookup", "arguments": map[string]interface{}{"id": json.Number("9007199254740992")}}
 	callReplay := func(fc map[string]interface{}, id string) []interface{} {
 		return []interface{}{firstUser, fc,
 			map[string]interface{}{"type": "function_call_output", "call_id": callID,
 				"output": map[string]interface{}{"id": json.Number(id)}},
 			map[string]interface{}{"role": "user", "content": "again"}}
 	}
-	// 变异组换 call_id：撞不进首轮 head（arguments …993 也不同），必 cold-start
-	// 且不消耗首轮 head。若 arguments 被解成 float64，…993 会同 …992 撞指纹，
-	// 但 call_id 不同仍冷启动——本条只能验 arguments 精度，靠对照组回合续接。
-	mutationCall := map[string]interface{}{"type": "function_call", "call_id": "call_mut",
-		"name": "lookup", "arguments": `{"id":9007199254740993}`}
+	// 变异组沿用真实 call_id（与 callHead 完全相同），仅 arguments 大整数改
+	// …993：除该整数外前缀全同首轮 head，必 miss 且不消耗它。若 arguments 被
+	// 解成 float64，…993 会舍成 …992 撞同指纹错误续接（turn 1）——本条直接
+	// 验 arguments 精度；换 call_id 则无论精度如何都 cold-start，测不到。
+	mutationCall := map[string]interface{}{"type": "function_call", "call_id": callID,
+		"name": "lookup", "arguments": map[string]interface{}{"id": json.Number("9007199254740993")}}
 	req["input"] = callReplay(mutationCall, "1")
 	call()
 	// Turn 3 对照组：回放首轮 + arguments …992 + 新 user —— 首轮 head 还在（变异组
 	// miss 没消费它），必须命中续接（turn 1）。
 	req["input"] = callReplay(callHead, "1")
 	call()
-	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
-		t.Fatalf("arguments mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
-	}
-
 	if len(turns) != 3 || turns[0] != 0 || turns[1] != 0 || turns[2] != 1 {
 		t.Fatalf("arguments mutation must cold-start without consuming head, identical replay must continue: turns=%v", turns)
 	}
@@ -690,11 +689,12 @@ func TestResponsesInputFunctionCallOutputFingerprint(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "again"}, assistantOK,
 			map[string]interface{}{"role": "user", "content": "more"}}
 	}
-	// Turn 3 变异组（先发）：fco 数据数组内容改 beta 且换 call_id，必 miss
-	// （turn 0）不消耗 Turn 2 落的 head；数据数组若被拍平成空串，也只能靠
-	// 对照组回合续接验证（call_id 不同，撞不进任何已存 head）。
-	mutationFco := map[string]interface{}{"type": "function_call_output", "call_id": "call_mut",
-		"output": []interface{}{map[string]interface{}{"id": 1, "val": "beta"}}}
+	// Turn 3 变异组（先发）：与对照组完全相同的 call_id，仅 fco 数据数组内容
+	// 改 beta，必 miss（turn 0）不消耗 Turn 2 落的 head；Turn 2 已消费首轮 K2，
+	// convStore 只剩 5 层 K5(alpha)，无中间前缀误命中。数据数组若被拍平成空串，
+	// beta 会跟 alpha 撞同指纹错误续接（turn 2）——换 call_id 则无论如何都
+	// cold-start，测不到数据数组进指纹。
+	mutationFco := fco("beta")
 	req["input"] = history(mutationFco)
 	call()
 	// Turn 4 对照组：前缀全同（含 fco(alpha)）必须命中 Turn 2 head 续接
