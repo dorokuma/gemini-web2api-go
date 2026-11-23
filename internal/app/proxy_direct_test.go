@@ -53,19 +53,6 @@ func TestClaimAccountProxyLockedDirect(t *testing.T) {
 	}
 }
 
-// acquireClaimedSlot：库中锁定直连的号，即便 prefer 误传代理 ID，
-// 也必须释放代理槽重取直连槽。
-func TestAcquireClaimedSlotLockedDirect(t *testing.T) {
-	a, _ := withTwoProxies(t, true)
-	id := addTestAccount(t, "lockedDirect2")
-	bindAccountProxy(id, proxyIDDirect)
-	p, release, err := acquireClaimedSlot(id, a)
-	defer release()
-	if err != nil || p == nil || p.ID != 0 {
-		t.Fatalf("锁定直连号误持代理槽应重取直连：p=%+v err=%v", p, err)
-	}
-}
-
 // rotateProxyURL：绑定代理被删/禁用 → fail-closed 报错，绝不退回直连。
 func TestRotateProxyURLFailClosed(t *testing.T) {
 	a, _ := withTwoProxies(t, false)

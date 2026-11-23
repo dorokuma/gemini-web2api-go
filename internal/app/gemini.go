@@ -1730,8 +1730,9 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 	// 1-3s 网络 I/O，期间管理员可能已把号锁成 -1 或绑到别的代理。
 	// 拿着已变 -1 的号在旧代理 proxyURL 上轮转/重取 XSRF，或拿着
 	// 已绑代理的号在直连 proxyURL=="" 上重取，都会串出口外发。
+	curBound := acct.ProxyID
 	if acct.ID > 0 {
-		conflictID, conflict, _ := xsrfExitConflict(acct.ID, picked.ID)
+		conflictID, conflict, bound := xsrfExitConflict(acct.ID, picked.ID)
 		if conflict {
 			out.skip = ensureSkipMap(skip)
 			out.skip[acct.ID] = true
@@ -1743,6 +1744,10 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 			}
 			return out
 		}
+		// xsrfExitConflict 内部已按库中实时绑定返回 curBound（R3-S2：直接
+		// 复用，不再二次查库——两次查询之间管理员改绑会让 picked.ID=0 的
+		// 直连轮转误发给刚绑上代理的号）。
+		curBound = bound
 	}
 	// 轮转必须走本次选定的出口：rotateAccount 按 a.ProxyID 取出口 URL，
 	// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
@@ -1753,10 +1758,6 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 	// 判定必须按**刚核库的实时绑定**：acct.ProxyID 是挑号时的陈旧快照，
 	// 管理员此刻可能已把它锁成 -1——拿陈旧值判会把锁定直连号的 Cookie
 	// 按 picked.ID=0 交给 rotateProxyURL 挑代理外发。
-	curBound := acct.ProxyID
-	if a := accountByID(acct.ID); a != nil {
-		curBound = a.ProxyID
-	}
 	if curBound == proxyIDDirect {
 		rotAcct.ProxyID = proxyIDDirect
 	} else {

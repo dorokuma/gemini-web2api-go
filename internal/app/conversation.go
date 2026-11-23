@@ -730,7 +730,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
 			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
 			// last_used_at，调了不用等于白占一轮。
-			if !anonFirstEligible(mc, false, 0) {
+			if !anonFirstEligible(mc, false, len(prompt)) {
 				var a *CookieAccount
 				if shouldUseBrowserTransport() {
 					// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。

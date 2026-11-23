@@ -294,6 +294,11 @@ func TestApplyCompactIfNeededRealBytesWithinBudget(t *testing.T) {
 	if total > 4000 {
 		t.Fatalf("裁剪后 %d 字节仍超 maxFile=4000", total)
 	}
+	// 终检按真实渲染长度（buildPromptParts 口径）：角色标签与分隔必须
+	// 一并计入预算，否则低估会让重拼后的 prompt 仍超 maxFile 撞 400。
+	if n := len(buildPrompt(out, nil, nil, false)); n > 4000 {
+		t.Fatalf("裁剪后真实渲染 %d 字节仍超 maxFile=4000", n)
+	}
 }
 
 // 必保集合不挪位、不顶替：超长首条 user（>25% 预算）装得下时原位保留、装不下
@@ -555,5 +560,111 @@ func TestTruncateMultimodalPartsKeepsNonText(t *testing.T) {
 	}
 	if kept == nil || getStr(kept, "v") != getStr(data, "v") {
 		t.Fatal("非文本 JSON part 被改动")
+	}
+
+	// R3-S1 回归 1：[12287B, 4097B] 总文本 ≤12288 且绝不膨胀——旧实现
+	// 硬编码 head=4096 会把 4097B 截成 4129B（越截越长，总长反超原长）。
+	sumText := func(c []interface{}) int {
+		n := 0
+		for _, p := range c {
+			if pm, ok := p.(map[string]interface{}); ok &&
+				textPartTypes[getStr(pm, "type")] {
+				n += len(getStr(pm, "text"))
+			}
+		}
+		return n
+	}
+	np3, changed3 := truncateMultimodalParts([]interface{}{
+		map[string]interface{}{"type": "text", "text": strings.Repeat("a", 12287)},
+		map[string]interface{}{"type": "text", "text": strings.Repeat("b", 4097)},
+	})
+	if !changed3 {
+		t.Fatal("累计文本超限应截断")
+	}
+	if n := sumText(np3); n > compactToolMsgLimit || n >= 12287+4097 {
+		t.Fatalf("截后总文本 %d 超 12KB 或未实际缩减（越截越长）", n)
+	}
+
+	// R3-S1 回归 2：[10KB, 3KB, 2KB] 首个顶出预算的 part 之后文本一律
+	// 淘汰——旧实现把 3KB 静默丢弃后仍原样保留 2KB，产生无省略提示的
+	// 中间空洞。新实现绝不留下「丢中间留尾部」的空洞。
+	mid := "MID" + strings.Repeat("m", 3069)
+	end := "END" + strings.Repeat("e", 2045)
+	np4, _ := truncateMultimodalParts([]interface{}{
+		map[string]interface{}{"type": "text", "text": strings.Repeat("x", 10240)},
+		map[string]interface{}{"type": "text", "text": mid},
+		map[string]interface{}{"type": "text", "text": end},
+	})
+	if n := sumText(np4); n > compactToolMsgLimit {
+		t.Fatalf("截后总文本 %d 超 12KB", n)
+	}
+	joined := ""
+	for _, p := range np4 {
+		if pm, ok := p.(map[string]interface{}); ok &&
+			textPartTypes[getStr(pm, "type")] {
+			joined += getStr(pm, "text")
+		}
+	}
+	if strings.Contains(joined, "END") {
+		t.Fatal("越界 part 之后的文本 part 必须一并淘汰，否则留下中间空洞")
+	}
+}
+
+// R3-M1 回归：MultiTurn=true + compact 裁掉带图轮次后，multiTurnEligible
+// 必须保持 false——裁过的 messages 注了 [System note]，切进 callGeminiConv
+// 会绕过附件路径把超 MaxPromptBytes 的历史内联发出遭上游静默截断，并污染
+// 会话前缀指纹。anonEligible 同步保持 false（裁后 prompt 仍超 MaxPromptBytes
+// 且有 cookie，必须走附件上传）。
+func TestApplyCompactGateKeepsMultiTurnFalse(t *testing.T) {
+	withContextCfgBudget(t, 4000, "compact", 2000)
+	rtMu.Lock()
+	prev := rtVal
+	rtVal.MultiTurn = true
+	rtVal.AnonFirst = true
+	rtMu.Unlock()
+	t.Cleanup(func() { rtMu.Lock(); rtVal = prev; rtMu.Unlock() })
+	ck := addTestAccount(t, "gateCookie")
+	defer func() { _ = accountDelete(ck) }()
+
+	img := map[string]interface{}{
+		"type":      "image_url",
+		"image_url": map[string]interface{}{"url": "data:image/png;base64,iVBORw0KGgo="},
+	}
+	msgs := []map[string]interface{}{
+		{"role": "system", "content": "sys"},
+		{"role": "user", "content": "task"},
+		{"role": "user", "content": []interface{}{
+			map[string]interface{}{"type": "text", "text": strings.Repeat("q", 1200)},
+			img,
+		}},
+		{"role": "assistant", "content": strings.Repeat("a", 1200)},
+		{"role": "user", "content": "最后" + strings.Repeat("尾", 1000)},
+	}
+	mc := Models[fallbackDefaultModel] // Tool==0，多轮资格唯一门槛
+	prompt, pc := messagesToPrompt(msgs, nil, nil, mc.TaskMode)
+	if len(prompt) <= 2000 {
+		t.Fatalf("场景前提不成立：prompt=%d 未超 MaxPromptBytes=2000", len(prompt))
+	}
+	g := promptGate{
+		messages: msgs, prompt: prompt, pc: pc,
+		hasMedia: hasMediaInMessages(msgs),
+	}
+	if !g.hasMedia {
+		t.Fatal("场景前提不成立：messages 含图应预判 hasMedia=true")
+	}
+	out, err := applyCompactGate(g, mc, func(ms []map[string]interface{}) (string, promptCtx) {
+		return messagesToPrompt(ms, nil, nil, mc.TaskMode)
+	})
+	if err != nil {
+		t.Fatalf("applyCompactGate: %v", err)
+	}
+	if out.multiTurnEligible {
+		t.Fatal("裁剪后 multiTurnEligible 必须保持 false（裁过的 messages 绝不能进 callGeminiConv）")
+	}
+	if out.anonEligible {
+		t.Fatal("裁剪后 prompt 仍超 MaxPromptBytes 且有 cookie，anonEligible 必须为 false")
+	}
+	if !strings.Contains(out.prompt, "[System note: omitted") {
+		t.Fatalf("场景前提不成立：裁剪未真实发生（prompt=%d 字节）", len(out.prompt))
 	}
 }

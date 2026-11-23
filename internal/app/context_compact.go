@@ -11,10 +11,10 @@ import (
 // tool_calls 围栏、[Assistant] 前缀、tool 结果标签都会被切碎）。
 //
 // 裁剪规则：
-//   - 必保：前导 system 消息、首条 user 任务消息（无论大小都锚定，
-//     绝不把后面的短 user 倒序提到它前面）、中间 system（原位保留，
-//     不前置不重排）、最后一组完整用户/工具交互、以及 pc.Head/pc.Tail
-//     工具协议（不裁）；
+//   - 必保：前导 system 消息、首条 user 任务消息（在不超过 25% 历史预算
+//     时锚定保留，超限装不下时可整组淘汰；绝不把后面的短 user 倒序提到
+//     它前面）、中间 system（原位保留，不前置不重排）、最后一组完整
+//     用户/工具交互、以及 pc.Head/pc.Tail 工具协议（不裁）；
 //   - 中间部分按「原子组」整组移除：带 tool_calls 的 assistant 与其紧随的
 //     全部 tool 消息绑成一组，绝不拆开（拆开会让客户端回放历史时出现孤儿
 //     tool 结果 / 缺结果的 tool_call）；
@@ -377,8 +377,10 @@ func withReplacedField(m map[string]interface{}, key string, v interface{}) map[
 //
 // 只认 textPartTypes（text/input_text/output_text）的文本 part：媒体 part
 // （image_url 等）与普通 JSON 数据绝不截断。预算按**整条消息所有文本 part
-// 的累计字节**计——总文本 >12KB 但分散在多个 <12KB part 时同样要截，
-// 从尾部 part 开始整段截掉直到累计落回预算内（首个超长 part 按头尾截断）。
+// 的累计字节**计——总文本 >12KB 但分散在多个 <12KB part 时同样要截：首个
+// 顶出预算的 part 按剩余预算 rem 头尾截断（rem 太小装不下头尾就整段丢弃），
+// 之后所有文本 part 一律淘汰（非文本 part 仍保留），保证总文本绝不超
+// 12KB、不膨胀、不留无省略提示的中间空洞。
 func truncateMultimodalParts(c []interface{}) ([]interface{}, bool) {
 	total := 0
 	for _, p := range c {
@@ -405,23 +407,20 @@ func truncateMultimodalParts(c []interface{}) ([]interface{}, bool) {
 			kept += len(txt)
 			np = append(np, p)
 		case kept < compactToolMsgLimit:
-			// 本 part 是第一个把累计顶出预算的：把头尾截断填到预算内
-			// （头 compactToolHead + 尾按剩余额度取，绝不超 limit）。
-			tail := compactToolMsgLimit - kept - compactToolHead
-			if tail > compactToolTail {
-				tail = compactToolTail
+			// 本 part 是第一个把累计顶出预算的：按剩余预算 rem 头尾截断
+			// （预留 64B 省略标记开销），截后必须真的更短才保留；rem 装不下
+			// 有意义的头尾或截后反而变长时直接整段丢弃。无论保留还是丢弃，
+			// 都立即封顶 kept=limit——后续文本 part 一律淘汰，不留中间空洞。
+			rem := compactToolMsgLimit - kept
+			if rem > 128 {
+				h := (rem - 64) * 2 / 3
+				tail := (rem - 64) - h
+				if nc, ok2 := truncateToolContent(txt, h, tail); ok2 && len(nc) < len(txt) {
+					np = append(np, withReplacedField(pm, "text", nc))
+				}
 			}
-			if tail < 0 {
-				tail = 0
-			}
-			if nc, ok2 := truncateToolContent(txt, compactToolHead, tail); ok2 {
-				np = append(np, withReplacedField(pm, "text", nc))
-				kept += len(nc)
-				changed = true
-			} else {
-				// 太短无法头尾截断：整段丢弃（仍在预算内的部分已由头段体现）。
-				changed = true
-			}
+			kept = compactToolMsgLimit
+			changed = true
 		default:
 			// 预算已满：后续文本 part 整段淘汰，非文本 part 仍原样保留。
 			changed = true
@@ -547,7 +546,11 @@ func applyCompactGate(g promptGate, mc ModelConfig,
 	g.messages = cm
 	g.prompt, g.pc = rebuild(cm)
 	g.hasMedia = hasMediaInMessages(cm)
-	g.multiTurnEligible = rtCfg().MultiTurn && !g.hasMedia && mc.Tool == 0
+	// 裁剪一旦真实发生，multiTurnEligible 必须保持 false：改了 messages
+	// 的会话绝不能切进 callGeminiConv——它既无附件上传路径也无
+	// MaxPromptBytes 校验，会注入 [System note] 的超限历史内联外发被上游
+	// 静默截断，且污染会话前缀指纹使续接永不命中（R3-M1）。
+	g.multiTurnEligible = false
 	g.anonEligible = anonFirstEligible(mc, g.hasMedia, len(g.prompt))
 	return g, nil
 }

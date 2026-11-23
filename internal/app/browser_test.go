@@ -74,9 +74,12 @@ type fakeCDPServer struct {
 	// document.readyState（about:blank 初始为 "null"/"complete"）；
 	// pageNavDelay>0 时 Page.navigate 后延迟这么久才切 origin 并推
 	// Page.loadEventFired（模拟真实导航的网络往返）。
+	// navErrorText 非空时 Page.navigate 返回 RPC 成功 + errorText（模拟
+	// 代理/网络错误下 Chromium 停在 chrome-error:// 的导航失败）。
 	pageOrigin   atomic.Value // string
 	pageReady    atomic.Value // string
 	pageNavDelay atomic.Int64 // 纳秒
+	navErrorText atomic.Value // string
 
 	// failMethods 列出的 CDP method 一律回 JSON-RPC 错误（fault 注入）。
 	failMethods sync.Map // map[string]bool
@@ -243,6 +246,13 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	case "Target.attachToTarget":
 		result = json.RawMessage(`{"sessionId":"fake-session-1"}`)
 	case "Page.navigate":
+		if et := s.navErrorText.Load(); et != nil && et.(string) != "" {
+			// 代理/网络错误：RPC 成功但 errorText 非空，页面停在
+			// chrome-error://——不切 origin、不推 loadEventFired。
+			result = json.RawMessage(fmt.Sprintf(
+				`{"frameId":"frame-1","errorText":%q}`, et.(string)))
+			break
+		}
 		// 模拟真实导航：返回响应时活动文档仍是旧文档；延迟 navDelay 后
 		// 切 origin 并推 Page.loadEventFired（sessionId 与请求一致）。
 		delay := time.Duration(s.pageNavDelay.Load())
@@ -3649,7 +3659,9 @@ func TestNavigateAndWaitAppWaitsForOrigin(t *testing.T) {
 	m := &browserManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	m.navigateAndWaitApp(ctx, client, "fake-session-1")
+	if err := m.navigateAndWaitApp(ctx, client, "fake-session-1"); err != nil {
+		t.Fatalf("navigateAndWaitApp: %v", err)
+	}
 	if got := srv.pageOrigin.Load().(string); got != "https://gemini.google.com" {
 		t.Fatalf("返回时 origin 仍为 %q（在 about:blank 提前返回）", got)
 	}
@@ -3669,6 +3681,220 @@ done:
 	if !sawNav {
 		t.Fatal("未发出 Page.navigate")
 	}
+}
+
+// R3-M4 回归：Once 的 cancel 必须按注册 id 精确摘除——同一函数字面量求值
+// 出的两个闭包共享相同代码指针，旧实现按 reflect 指针比较会在 cancel2()
+// 时误删先注册的 ch1 监听器（ch1 永久丢唤醒、ch2 反而收到事件）。
+// OnceSession 另须按 session 过滤：别的 session 发出同名事件不得摘除本
+// session 的监听器。
+func TestOnceCancelSameLiteralClosureDoesNotDropPeer(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	conn, err := dialCDPWebsocket(context.Background(), srv.wsURL)
+	if err != nil {
+		t.Fatalf("dial fake cdp: %v", err)
+	}
+	client := newCDPClient(conn)
+	defer func() { client.Close(); conn.Close() }()
+
+	// reg 是唯一闭包构造点：ch1/ch2 的监听器由同一函数字面量生成，
+	// reflect.ValueOf(fn).Pointer() 恒相等——这正是 R3-M4 的触发形态。
+	reg := func(ch chan struct{}) func() {
+		return client.OnceSession("sess-1", "Test.Evt", func(evt cdpEvent) {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		})
+	}
+	ch1, ch2 := make(chan struct{}, 1), make(chan struct{}, 1)
+	cancel1 := reg(ch1)
+	defer cancel1()
+	cancel2 := reg(ch2)
+	cancel2() // 只摘 ch2，绝不能误删 ch1
+
+	// 本 session 事件：ch1 收到，ch2（已取消）收不到。
+	srv.pushEvent("sess-1", "Test.Evt", map[string]interface{}{})
+	select {
+	case <-ch1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel2() 误删了 ch1 监听器（同字面量闭包指针碰撞）")
+	}
+	select {
+	case <-ch2:
+		t.Fatal("cancel2() 未生效：已取消的监听器仍被触发")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 跨 session 事件不得摘除本 session 的 OnceSession 监听器。
+	ch3 := make(chan struct{}, 1)
+	cancel3 := client.OnceSession("sess-1", "Test.Evt2", func(evt cdpEvent) {
+		select {
+		case ch3 <- struct{}{}:
+		default:
+		}
+	})
+	defer cancel3()
+	srv.pushEvent("other-session", "Test.Evt2", map[string]interface{}{})
+	select {
+	case <-ch3:
+		t.Fatal("别的 session 的事件误触发了本 session 监听器")
+	case <-time.After(50 * time.Millisecond):
+	}
+	srv.pushEvent("sess-1", "Test.Evt2", map[string]interface{}{})
+	select {
+	case <-ch3:
+	case <-time.After(2 * time.Second):
+		t.Fatal("别的 session 的同名事件误删了本 session 的 OnceSession 监听器")
+	}
+}
+
+// R3-M2/R3-M3 回归：
+//  1. recreateTab 中途失败（installBridge 段的 RPC 错）必须走 handleDeadLocked
+//     整机回收——绝不留下 m.sessionID=="" 的永久僵尸实例（ensureRunning 只看
+//     进程/CDP 存活，空 session 会让 ensureBridge 永远报 no page session）。
+//     同时刚创建的孤儿 Tab 必须 best-effort 关闭（Target.closeTarget）。
+//  2. navigateAndWaitApp 遇到 Page.navigate 的 errorText（代理不可用时的
+//     chrome-error:// 导航失败）或导航后仍停在 "null" origin（about:blank），
+//     必须 fail-closed 返回 error——绝不回退 waitPageLoad 秒回假就绪。
+func TestRecreateTabFailureMarksDeadNotZombie(t *testing.T) {
+	t.Run("recreate failure reclaims instance", func(t *testing.T) {
+		cleanup := resetMgrForLifecycle(t)
+		defer cleanup()
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		conn, err := dialCDPWebsocket(context.Background(), srv.wsURL)
+		if err != nil {
+			t.Fatalf("dial fake cdp: %v", err)
+		}
+		defer conn.Close()
+		client := newCDPClient(conn)
+		defer client.Close()
+
+		m := browserMgr
+		m.mu.Lock()
+		m.proc = &browserProc{PID: 0x7fffffff, PGID: 0x7fffffff,
+			exitedCh: make(chan struct{})}
+		m.client = client
+		m.sessionID = "old-session"
+		m.targetID = "old-target"
+		m.started = true
+		m.starting = false
+		m.ready.Store(true)
+		m.mu.Unlock()
+
+		// installBridgeFor 的第一步 Runtime.addBinding 注入失败 → 中途失败。
+		srv.failMethods.Store("Runtime.addBinding", true)
+		m.recreateTab()
+
+		m.mu.Lock()
+		started := m.started
+		sess := m.sessionID
+		cleaned := m.client == nil && m.proc == nil
+		m.mu.Unlock()
+		if started && sess == "" {
+			t.Fatal("recreateTab 失败留下 sessionID==\"\" 的永久僵尸实例")
+		}
+		if started {
+			t.Fatal("recreateTab 失败必须经 handleDeadLocked 复位实例（started 仍为 true）")
+		}
+		if !cleaned {
+			t.Fatal("handleDeadLocked 未清场：client/proc 未复位")
+		}
+		// 孤儿 Tab 必须被 best-effort 关闭。
+		sawClose := false
+		deadline := time.After(2 * time.Second)
+		for !sawClose {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Target.closeTarget" &&
+					strings.Contains(string(c.params), "fake-target-1") {
+					sawClose = true
+				}
+			case <-deadline:
+				t.Fatal("recreateTab 失败未关闭刚创建的孤儿 Tab")
+			}
+		}
+	})
+
+	t.Run("navigate errorText fails closed", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, _ := newTestClientAndBridge(t, srv)
+		// RPC 成功但 errorText 非空（代理不可用时 Chromium 停在
+		// chrome-error://）：旧实现完全忽略 navRes，新实现必须 fail-closed。
+		srv.navErrorText.Store("net::ERR_TUNNEL_CONNECTION_FAILED")
+		srv.pageNavDelay.Store(int64(10 * time.Second)) // 绝不切换 origin
+		m := &browserManager{}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		err := m.navigateAndWaitApp(ctx, client, "fake-session-1")
+		if err == nil {
+			t.Fatal("Page.navigate errorText 必须 fail-closed 返回 error")
+		}
+		if !strings.Contains(err.Error(), "ERR_TUNNEL") {
+			t.Fatalf("error 应包含 errorText 内容，得到 %v", err)
+		}
+		if time.Since(start) > 2*time.Second {
+			t.Fatalf("errorText 应在 Page.navigate 返回后立即失败，实际 %.0fms",
+				float64(time.Since(start))/float64(time.Millisecond))
+		}
+	})
+
+	t.Run("late about:blank event then real load succeeds", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, _ := newTestClientAndBridge(t, srv)
+		// 导航有真实耗时：目标页 load 在 400ms 后才到；但 60ms 时先推一条
+		// 迟到的旧文档（about:blank）loadEventFired——旧实现会拿它核 origin
+		// （"null/complete" 不过）再退回 waitPageLoad 在 readyState=complete
+		// 的 about:blank 上秒回。新实现必须重挂 OnceSession 等真 load。
+		srv.pageNavDelay.Store(int64(400 * time.Millisecond))
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			srv.pushEvent("fake-session-1", "Page.loadEventFired",
+				map[string]interface{}{"timestamp": 0})
+		}()
+		m := &browserManager{}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := m.navigateAndWaitApp(ctx, client, "fake-session-1"); err != nil {
+			t.Fatalf("目标页 load 终会到达，不应 fail：%v", err)
+		}
+		if got := srv.pageOrigin.Load().(string); got != "https://gemini.google.com" {
+			t.Fatalf("返回时 origin 仍为 %q（迟到事件导致 about:blank 秒回回归）", got)
+		}
+		if time.Since(start) < 300*time.Millisecond {
+			t.Fatalf("%.0fms 即在 null origin 返回（waitPageLoad 秒回回归）",
+				float64(time.Since(start))/float64(time.Millisecond))
+		}
+	})
+
+	t.Run("navigate stuck on about:blank fails closed", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		client, _ := newTestClientAndBridge(t, srv)
+		// Page.navigate 的 goroutine 把 origin 切换推迟到 10s 后（比 navCtx
+		// 的 1.2s 预算长得多）——导航期间 origin 恒 "null"（about:blank）。
+		srv.pageNavDelay.Store(int64(10 * time.Second))
+		m := &browserManager{}
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		err := m.navigateAndWaitApp(ctx, client, "fake-session-1")
+		if err == nil {
+			t.Fatal("导航后仍停在 null origin 必须 fail-closed，绝不能 waitPageLoad 秒回假就绪")
+		}
+		// 秒回防护：waitPageLoad 兜底路径会在 <50ms 返回；真等待路径至少
+		// 会等到 navCtx（继承 ctx 的 1.2s）到期。
+		if time.Since(start) < 500*time.Millisecond {
+			t.Fatalf("在 null origin 上 %.0fms 提前返回（waitPageLoad 秒回回归）",
+				float64(time.Since(start))/float64(time.Millisecond))
+		}
+	})
 }
 
 var _ = syscall.Kill
