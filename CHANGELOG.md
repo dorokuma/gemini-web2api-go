@@ -20,15 +20,18 @@
   只在发往上游之前的确定性本地失败（Bound 429 / ctx 取消，即
   `CanRestoreConvHead`）按原样归还；`convScopeKey` 纳入 `TaskMode` +
   `Upstream` 等更多字段区分会话作用域；全链路 `unmarshalJSONUseNumber`
-  把数字解成 `json.Number` 保真大整数，并对 tool_calls 下标做溢出防护；
+  把数字解成 `json.Number` 保真大整数，并拒绝候选数 `n` 的溢出值（如
+  `1e309`）；
   续接前 `ctx.Err()` 前置拦截已取消请求，续接账号已停用/删除或绑定出口
   变更时回退冷启动重挑健康账号；非空 `cid` 才入库门控——上游没给 `cid`
   的会话不落库，避免下一路同前缀请求撞进死会话。
 - **`stream_idle_timeout_sec` 配置与 `stallWatch` 两阶段融合**：开流吐字后
   块间沉默窗口独立计时（默认 0 关闭，0 < 值且小于 `request_timeout_sec`
   或总超时为 0 时生效），保持无总超时策略不变——排队阶段沉默照旧报
-  `*StallError` 走切换，首字后块间沉默报新的 `errStreamIdle` 当瞬时抖动
-  无条件重试；`webchannel.go` 同步换 `newStallWatchIdle`；`runtime.go`
+  `*StallError` 走切换，首字后块间沉默报新的 `errStreamIdle`：未发正文/思考
+  增量且重试预算允许时自动重试（不受 `retry_on_timeout` 开关限制）；
+  已向客户端发出增量后则在流内报错；`webchannel.go` 同步换
+  `newStallWatchIdle`；`runtime.go`
   校验上限 600s、`request_timeout_sec` 上限由 600 放宽到 1200；管理面板
   `RT_GROUPS` 与 `I18N_EN` 词典同步收录新配置项与诊断文案。
 - **`strict_proxy_binding` 严格代理绑定 + 后台手动绑出口**：开启后账号绑定
@@ -42,8 +45,9 @@
   `callOnVideoAccount` Bound 429 走换号重试。
 - **OSID Cookie 识别与诊断**：账号 cookie 检测 `OSID`（精确匹配，
   `__Secure-OSID` 不算）——管理面板账号列表加 `has_osid` 徽标、
-  新增/编辑 cookie 时弹「缺 OSID」提醒（只提醒不拦），`POST /admin/api/cookies`
-  回执把 `缺 OSID` 原因翻成可操作文案并经 `I18N_EN` 国际化；/app 302
+  导入 cookie 时弹「缺 OSID」提醒（只提醒不拦）；账号检测接口
+  `POST /admin/api/cookies/{id}/check` 回执提供缺 OSID 可操作重新导出
+  提示并经 `I18N_EN` 国际化；/app 302
   跳登录页时按 `MissingOSID` 诊断提示重新导出。
 - **`UpstreamAliases` 与 `ModelConfig.Retired` 淘汰模型框架**：`strict_model`
   校验放行已确认的上游原位改名/升级别名（修复别名映射）；`Retired` 非空
@@ -62,8 +66,9 @@
   client hints）；`appPageHeaders()` 统一 /app 抓取头；`webchannel.go`
   直连分支同步接入同一份浏览器头；`firefox_fingerprint` 实验开关保留
   （Firefox 指纹不发 `Sec-CH-UA` 组）。
-- **SIDCC 保活按服务端退避**：`rotateSIDCC` 命中 RotateCookies 429 时读
-  服务端 Retry-After，`noteSIDCCBackoff` 记该号退避窗口，窗口内不再
+- **SIDCC 保活按服务端退避**：`rotateSIDCC` 命中 RotateCookies 429 时
+  解析响应体 `identity.hfcr` 退避秒数（缺失或越界时回退默认轮转间隔），
+  `noteSIDCCBackoff` 记该号退避窗口，窗口内不再
   请求 SIDCC 端点，日志带剩余等待时间。
 - **`recordProxyResult` 纳入 `errStreamIdle`**：开流后断流/黑洞的坏代理
   照常累计失败次数（不因瞬时抖动语义漏记）；`streamContentInLine`
