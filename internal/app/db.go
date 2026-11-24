@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
     proxy_id      INTEGER NOT NULL DEFAULT 0,     -- 绑定的出口，0 = 还没绑
     authuser      INTEGER NOT NULL DEFAULT 0,     -- 浏览器多号登录时的账号序号（/u/N），0 = 默认号
-    priority      INTEGER NOT NULL DEFAULT 0      -- 主备优先级：数值越大越先被挑中（主 100 / 备 10 / 默认 0）
+    priority      INTEGER NOT NULL DEFAULT 0,     -- 主备优先级：数值越大越先被挑中（主 100 / 备 10 / 默认 0）
+    auto_disabled INTEGER NOT NULL DEFAULT 0      -- 1 = 因连续鉴权失败被自动停用；手动停用/启用一律为 0
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
 `
@@ -182,11 +183,14 @@ func getDB() *dbx {
 		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN authuser INTEGER NOT NULL DEFAULT 0`)
 		// priority 列（v6.6.0 主备优先级）同规则补列，三方言语法通用。
 		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`)
+		// auto_disabled 列（v6.7.0 区分自动停用与管理员手动停用）同规则补列。
+		// 老库已有行默认 0：历史 disabled 无法判明来源，保守视为手动停用，绝不误自动恢复。
+		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN auto_disabled INTEGER NOT NULL DEFAULT 0`)
 		// 列存在性探针：ALTER 在方言/老库上被静默吞掉时，这里能发现并报硬错，
 		// 不能让挑号 SQL 在运行期才炸。
-		pRows, pErr := conn.Query(`SELECT priority FROM accounts LIMIT 1`)
+		pRows, pErr := conn.Query(`SELECT priority, auto_disabled FROM accounts LIMIT 1`)
 		if pErr != nil {
-			fmt.Fprintf(os.Stderr, "[db] accounts.priority 列缺失且自动迁移失败: %v\n", pErr)
+			fmt.Fprintf(os.Stderr, "[db] accounts.priority/auto_disabled 列缺失且自动迁移失败: %v\n", pErr)
 			os.Exit(1)
 		}
 		_ = pRows.Close()

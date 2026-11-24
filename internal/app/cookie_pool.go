@@ -33,6 +33,9 @@ type CookieAccount struct {
 	// Priority 是主备优先级（v6.6.0）：数值越大越先被挑中，建议主力号 100、
 	// 备用号 10 / 5，默认 0 与旧行为一致（同级之间仍按失败数与最久未用轮转）。
 	Priority int `json:"priority"`
+	// AutoDisabled（v6.7.0）为 true 表示本行是被连续鉴权失败自动停用的，
+	// 扩展推来新 cookie 可以自动恢复 enabled；管理员手动停用/启用一律为 false。
+	AutoDisabled bool `json:"auto_disabled"`
 }
 
 // 账号优先级的合法范围：面板/API 越界直接 400 零写库。
@@ -174,10 +177,26 @@ func accountInsert(label, cookie, note string) (int64, error) {
 		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix())
 }
 
+// accountInsertWithAuthUser 一步建号：与 accountInsert 相同校验，但单条
+// INSERT 直接带上 authuser——消除「先按 /u/0 插入再补序号」的半成品窗口
+// （R2 consider），窗口内新行可能被挑号器按 /u/0 挑中。
+func accountInsertWithAuthUser(label, cookie, note string, authuser int) (int64, error) {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return 0, fmt.Errorf("cookie 不能为空")
+	}
+	if authuser < 0 || authuser > maxAuthUser {
+		return 0, fmt.Errorf("账号序号要在 0..%d 之间，收到 %d", maxAuthUser, authuser)
+	}
+	return insertID(
+		`INSERT INTO accounts(label, cookie, status, note, created_at, authuser) VALUES (?,?,?,?,?,?)`,
+		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix(), authuser)
+}
+
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts ORDER BY priority DESC, id`)
 	if err != nil {
 		return nil
@@ -187,7 +206,7 @@ func accountList() []CookieAccount {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled); err != nil {
 			continue
 		}
 		out = append(out, a)
@@ -202,10 +221,10 @@ func accountList() []CookieAccount {
 func accountByID(id int64) *CookieAccount {
 	var a CookieAccount
 	err := getDB().QueryRow(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts WHERE id=?`, id).
 		Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority)
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled)
 	if err != nil {
 		return nil
 	}
@@ -219,11 +238,14 @@ func accountDelete(id int64) error {
 }
 
 // accountSetStatus 改状态（enabled / disabled）。
+// 本入口只被管理员操作（toggle / PATCH）调用：不论启用还是停用，一律清掉
+// auto_disabled——从管理员点下去这一刻起，该行的停用不再算「自动停用」，
+// 扩展再推新 cookie 也不得越过这条手动决定把它启用回来。
 func accountSetStatus(id int64, status string) error {
 	if status != "enabled" && status != "disabled" {
 		return fmt.Errorf("非法状态 %q", status)
 	}
-	_, err := getDB().Exec(`UPDATE accounts SET status=? WHERE id=?`, status, id)
+	_, err := getDB().Exec(`UPDATE accounts SET status=?, auto_disabled=0 WHERE id=?`, status, id)
 	return err
 }
 
@@ -385,14 +407,24 @@ var cookieTemplateOrder = []string{
 
 // normalizeCookie 把各种输入形态归一化成池子要的裸 "k=v; k=v" 串。
 //
-// 吃三种：
+// 吃这几种：
 //   - 裸串，原样返回
 //   - 旧单 cookie 路径的 {"cookie":"k=v; k=v","sapisid":"..."}
 //   - 面板逐项模式的 {"SID":"a","SAPISID":"b",...}
+//   - 浏览器扩展导出的数组 [{"name":"SID","value":"a","domain":".google.com"},...]
+//     以及 Playwright storageState {"cookies":[...]}，按 domain 过滤到 gemini.google.com
 //
 // 不归一化的话池子里会存进一整段 JSON，SAPISID 提取和后续请求全错。
 func normalizeCookie(raw, who string) (string, bool) {
 	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "[") {
+		var arr []cookieJSONEntry
+		if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+			logf("[cookie] %s 是 JSON 数组但解析失败，跳过: %v", who, err)
+			return "", false
+		}
+		return joinCookieEntries(arr, who)
+	}
 	if !strings.HasPrefix(raw, "{") {
 		return raw, true
 	}
@@ -400,6 +432,17 @@ func normalizeCookie(raw, who string) (string, bool) {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		logf("[cookie] %s 是 JSON 但解析失败，跳过: %v", who, err)
 		return "", false
+	}
+	// Playwright / Puppeteer 的 storageState：{"cookies":[{name,value,domain}...], "origins":[...]}
+	if _, ok := m["cookies"].([]interface{}); ok {
+		var st struct {
+			Cookies []cookieJSONEntry `json:"cookies"`
+		}
+		if err := json.Unmarshal([]byte(raw), &st); err != nil {
+			logf("[cookie] %s 的 cookies 数组解析失败，跳过: %v", who, err)
+			return "", false
+		}
+		return joinCookieEntries(st.Cookies, who)
 	}
 	if c, ok := m["cookie"].(string); ok && strings.TrimSpace(c) != "" {
 		return strings.TrimSpace(c), true
@@ -431,6 +474,64 @@ func normalizeCookie(raw, who string) (string, bool) {
 	if len(parts) == 0 {
 		logf("[cookie] %s 是 JSON 但一项非空值都没有，跳过", who)
 		return "", false
+	}
+	return strings.Join(parts, "; "), true
+}
+
+// cookieJSONEntry 是浏览器扩展（Cookie-Editor / EditThisCookie / Get cookies.txt 的 JSON 版）
+// 和 Playwright storageState 导出的单条 cookie。只用得到这三个字段。
+type cookieJSONEntry struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Domain string `json:"domain"`
+}
+
+// cookieExportDomainOK 按 RFC 6265 的 domain-match 规则判断浏览器会不会把这条 cookie
+// 发给 gemini.google.com。导出「全部 cookie」时会混进 youtube.com、
+// accounts.google.com 之类的，那些不该进串里——尤其 accounts.google.com 也有一个
+// OSID，混进来会顶掉真正的那个。domain 为空（有些导出不带）就当匹配。
+// 复用下方 RFC 6265 §5.1.3 的 cookieDomainMatches(host, domain)。
+func cookieExportDomainOK(domain string) bool {
+	d := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(domain), "."))
+	if d == "" {
+		return true
+	}
+	return cookieDomainMatches(geminiCookieTargetHost, d)
+}
+
+// joinCookieEntries 把导出的 cookie 数组拼成 "k=v; k=v"。保留导出里的原始顺序（接近浏览器
+// 实际发送的顺序）；同名的按 domain 更具体的那条为准——host-only 的 gemini.google.com
+// 优先于 .google.com。
+func joinCookieEntries(arr []cookieJSONEntry, who string) (string, bool) {
+	type kept struct {
+		value  string
+		domLen int
+	}
+	var order []string
+	byName := map[string]kept{}
+	for _, e := range arr {
+		name := strings.TrimSpace(e.Name)
+		val := strings.TrimSpace(e.Value)
+		if name == "" || val == "" || !cookieExportDomainOK(e.Domain) {
+			continue
+		}
+		dl := len(strings.TrimPrefix(strings.TrimSpace(e.Domain), "."))
+		if prev, ok := byName[name]; ok {
+			if dl > prev.domLen {
+				byName[name] = kept{val, dl}
+			}
+			continue
+		}
+		order = append(order, name)
+		byName[name] = kept{val, dl}
+	}
+	if len(order) == 0 {
+		logf("[cookie] %s 是 cookie 数组但没有发往 %s 的有效项，跳过", who, geminiCookieTargetHost)
+		return "", false
+	}
+	parts := make([]string, 0, len(order))
+	for _, n := range order {
+		parts = append(parts, n+"="+byName[n].value)
 	}
 	return strings.Join(parts, "; "), true
 }
@@ -472,7 +573,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	// 出口就按"无偏好"选了；等换号换到好号，出口已经定死 —— 于是好号的出口
 	// 粘性被坏号带偏。实测 1 好 2 坏时出口在两个代理间对半分。
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts WHERE status='enabled' ORDER BY priority DESC, fail_count ASC, last_used_at ASC, id ASC`)
 	if err != nil {
 		return nil, false
@@ -481,7 +582,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled); err != nil {
 			continue
 		}
 		if skip[a.ID] {
@@ -525,7 +626,7 @@ func markAccountResult(id int64, ok bool, errStr string) {
 	}
 	if ok {
 		_, _ = getDB().Exec(
-			`UPDATE accounts SET last_ok_at=?, fail_count=0, last_error='' WHERE id=?`,
+			`UPDATE accounts SET last_ok_at=?, fail_count=0, last_error='', auto_disabled=0 WHERE id=?`,
 			time.Now().Unix(), id)
 		return
 	}
@@ -559,7 +660,7 @@ func autoDisableIfDead(id int64) {
 		return
 	}
 	if _, err := getDB().Exec(
-		`UPDATE accounts SET status='disabled' WHERE id=? AND status='enabled'`, id); err == nil {
+		`UPDATE accounts SET status='disabled', auto_disabled=1 WHERE id=? AND status='enabled'`, id); err == nil {
 		logf("[cookie] 账号 #%d 连续 %d 次鉴权失败，已自动停用", id, fails)
 		// SF-1：停用成功后精准失效其常驻 BrowserContext，避免停用槽
 		// 继续被懒建复用。
@@ -986,6 +1087,179 @@ func updateAccountCookie(id int64, cookie string) {
 	if bump && shouldUseBrowserTransport() {
 		browserMgr.InvalidateAccount(id, false, "cookie rotated")
 	}
+}
+
+// accountSyncResult 是 accountSync 的结果：动作是 added / updated / unchanged。
+type accountSyncResult struct {
+	ID     int64  `json:"id"`
+	Action string `json:"action"`
+}
+
+// findSyncTargetAccountID 按「同会话 + 同账号序号 → 同标签 + 同账号序号」
+// 在账号池里找 accountSync 要更新的那一行，找不到返回 0。
+// 无锁：并发首推时调用方须先拿 accountSyncCreateMu 再重查（见 accountSync）。
+func findSyncTargetAccountID(authuser int, ident, label string) int64 {
+	accts := accountList()
+	for i := range accts {
+		if accts[i].AuthUser == authuser && cookieIdentity(accts[i].Cookie) == ident {
+			return accts[i].ID
+		}
+	}
+	if label == "" {
+		return 0
+	}
+	for i := range accts {
+		if accts[i].AuthUser == authuser && strings.EqualFold(strings.TrimSpace(accts[i].Label), label) {
+			return accts[i].ID
+		}
+	}
+	return 0
+}
+
+// accountSyncCreateMu 把并发首推的「查重 → 插入」串成原子操作。
+// 不加它时两个并发同步会同时查得 hitID==0 各自 accountInsert：accounts 表
+// 三种方言都没有唯一约束兜底，同 label/authuser/会话的重复 enabled 账号
+// 就进了库，之后匹配只 break 到首行，另一行成了不可维护的额外登录号。
+// 进程内一把锁就够（同 pickMu）：本反代天生单实例，同步端点只有本进程入口。
+//
+// 锁序红线：acquireAcctCookieLock（L1）只在**释放本锁之后**才允许获取，
+// 绝不持本锁去拿 L1，防锁序反转。
+var accountSyncCreateMu sync.Mutex
+
+// accountSync 是浏览器扩展定时推 cookie 用的「有就更新、没有就新建」。
+//
+// 找哪一行，按顺序：
+//  1. 同一会话（cookieIdentity：SAPISID + __Secure-1PSID）且同一账号序号 —— 正常的定时刷新
+//  2. 同标签（不分大小写、非空）且同一账号序号 —— 用户重新登录过，会话换了但还是这个号
+//  3. 都没有就新建
+//
+// 账号序号必须一起比：同一串 cookie 可以按不同 /u/N 导入成几个号，
+// 只比会话会把 /u/1 的刷新写进 /u/0 那行。
+//
+// v6.7.0 适配 v6.6.0 锁序：命中更新时走 acquireAcctCookieLock（L1）持锁
+// 快照→写库→BumpAccountEpoch 三段，再放锁后 invalidateXSRF + 清短冷却 +
+// InvalidateAccount——与 updateAccountCookie / rotateAccountOpts 严格互斥，
+// 绝不误杀健康 BrowserContext（unchanged 快路径零副作用），也绝不覆写原账号的
+// proxy_id 与 priority。
+func accountSync(label string, authuser int, cookie string) (accountSyncResult, error) {
+	if authuser < 0 || authuser > maxAuthUser {
+		return accountSyncResult{}, fmt.Errorf("账号序号要在 0..%d 之间", maxAuthUser)
+	}
+	c, ok := normalizeCookie(cookie, "扩展推送的 cookie")
+	if !ok {
+		return accountSyncResult{}, fmt.Errorf("cookie 解析失败：既不是 \"k=v; k=v\" 串，也不是可识别的 JSON")
+	}
+	if extractSAPISID(c) == "" {
+		return accountSyncResult{}, fmt.Errorf("cookie 里没有 SAPISID，浏览器可能没登录 Google")
+	}
+	label = strings.TrimSpace(label)
+	warnMissingOSID(label, c)
+
+	ident := cookieIdentity(c)
+	hitID := findSyncTargetAccountID(authuser, ident, label)
+	if hitID == 0 {
+		// 首次匹配落空：拿进程级互斥再查一次。并发胜者在锁外先插好，
+		// 败者进锁后重查必命中同一行，转走下方的 L1 更新/unchanged 路径。
+		accountSyncCreateMu.Lock()
+		hitID = findSyncTargetAccountID(authuser, ident, label)
+		if hitID == 0 {
+			// 首推建号一步带入 authuser：不再「先插 /u/0 再补序号」，
+			// authuser!=0 的新号没有以 /u/0 短暂暴露给挑号器的窗口。
+			id, err := accountInsertWithAuthUser(label, c, "由浏览器扩展同步", authuser)
+			if err != nil {
+				accountSyncCreateMu.Unlock()
+				return accountSyncResult{}, err
+			}
+			accountSyncCreateMu.Unlock()
+			return accountSyncResult{ID: id, Action: "added"}, nil
+		}
+		// 锁内重查命中并发刚插入的行：立即释放 accountSyncCreateMu，
+		// 绝不持它去拿 acquireAcctCookieLock（锁序反转红线）。
+		accountSyncCreateMu.Unlock()
+	}
+
+	// L1 串行锁内做「重读快照 → 判定 → 写库 → Bump」：与懒建 Context 播种、
+	// syncAccountCookiesBackCtx 回写、rotateAccountOpts、updateAccountCookie 严格互斥，
+	// 拿陈旧快照比较会把刚刷新的 cookie 覆盖回去。
+	unlock, err := acquireAcctCookieLock(context.Background(), hitID)
+	if err != nil {
+		return accountSyncResult{}, err
+	}
+	cur := accountByID(hitID)
+	if cur == nil {
+		unlock()
+		return accountSyncResult{}, fmt.Errorf("账号 #%d 已删除", hitID)
+	}
+	// reenable 快照判定只服务 unchanged 快路径：只对**自动停用**
+	// （auto_disabled=1，fail_count 到阈值由 autoDisableIfDead 写入）的号
+	// 才可能恢复——它停用的原因就是 cookie 失效；管理员手动停用
+	// （auto_disabled=0，即使 fail_count>=3）绝不动。真正的恢复写不由这份
+	// 快照决定，而是下推给下方条件 UPDATE 原子完成。
+	reenable := cur.Status == "disabled" && cur.AutoDisabled
+	// unchanged 快路径：cookie 完全未变、无失败计数、无需恢复——零写库零 Bump
+	// 零失效，绝不空转误杀健康槽。
+	if cur.Cookie == c && cur.FailCount == 0 && !reenable {
+		unlock()
+		return accountSyncResult{ID: hitID, Action: "unchanged"}, nil
+	}
+	// R2 丢失更新修复：状态恢复判定彻底下推数据库原子条件更新，不在 Go 内存
+	// 拿 cur.Status 盲写回库——accountSetStatus 不经 L1，快照之后落进来的
+	// 手动停用/启用绝不能被本快照覆盖。
+	// R3：两条 UPDATE 装进一个事务，任一步失败整体回滚——不留「cookie 已写
+	// 库却未 Bump 未失效」的部分写入态（它不自愈：重推同串会走 unchanged
+	// 快路径，旧 Context 与旧代际永远留着）。事务内只放这两条 UPDATE，
+	// 不放 SELECT，避免 SQLite SHARED→RESERVED 锁升级死锁。
+	// 第一条只写凭据与错误计数，完全不碰 status/auto_disabled；
+	// proxy_id 与 priority 同样保留不动。
+	tx, err := getDB().Begin()
+	if err != nil {
+		unlock()
+		return accountSyncResult{}, err
+	}
+	if _, err := tx.Exec(
+		`UPDATE accounts SET cookie=?, fail_count=0, last_error='' WHERE id=?`,
+		c, hitID); err != nil {
+		_ = tx.Rollback()
+		unlock()
+		return accountSyncResult{}, err
+	}
+	// 第二条仅当该行此刻仍是自动停用（status='disabled' AND auto_disabled=1）
+	// 才原子恢复 enabled 并清零标记：快照之后被管理员手动停用/启用的行
+	// 0 行受影响，绝不越过手动决定（三方言通用、无 MySQL 赋值顺序歧义）。
+	reenabled := false
+	res, err := tx.Exec(
+		`UPDATE accounts SET status='enabled', auto_disabled=0 WHERE id=? AND status='disabled' AND auto_disabled=1`,
+		hitID)
+	if err != nil {
+		_ = tx.Rollback()
+		unlock()
+		return accountSyncResult{}, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		reenabled = true
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		unlock()
+		return accountSyncResult{}, err
+	}
+	// MF-6：真实写库成功后在 L1 内 BumpAccountEpoch（无条件推进，不门控
+	// shouldUseBrowserTransport），杜绝新 cookie 与并发回写交错时代际漂移。
+	browserMgr.BumpAccountEpoch(hitID)
+	unlock()
+
+	if reenabled {
+		logf("[cookie] 账号 #%d 收到新 cookie，已从自动停用中恢复", hitID)
+	}
+	// 新旧两份的 XSRF 缓存都作废：新串等懒建后重抓，旧串绝不再信。
+	// 顺手清掉 45s 防雪崩短冷却——换上新 cookie 的号不该再背着旧凭据的失败记录。
+	invalidateXSRF(cur.Cookie)
+	invalidateXSRF(c)
+	recordAccountReqSuccess(hitID, nextClientReqID())
+	if shouldUseBrowserTransport() {
+		browserMgr.InvalidateAccount(hitID, false, "cookie synced")
+	}
+	return accountSyncResult{ID: hitID, Action: "updated"}, nil
 }
 
 // xsrfErrBlamesCookie 判断取 XSRF（抓 /app）失败是不是 cookie 的错。
