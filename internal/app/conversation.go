@@ -32,6 +32,12 @@ type convState struct {
 	proxyID               int64
 	proxyURL              string
 	updated               time.Time
+	// fstate 是本请求跨号跳槽的统一准入状态（v6.6.0 防雪崩）：由
+	// callGeminiConv 顶层建立、经 runConvWithFailover 挂到 conv 上透传——
+	// runConversationTurn 签名保持原样，streamGenerateConv 在读 XSRF /
+	// 发 StreamGenerate 前 conv.fstate.markTouched 登记。nil = 存量测试
+	// 直接调 runConversationTurn，不参入准入（向后兼容）。
+	fstate *reqFailoverState
 }
 
 const (
@@ -320,6 +326,12 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	// 登录态每轮要带 at（XSRF）；匿名不要。
 	xsrf := ""
 	if conv.isLogin && conv.cookie != "" {
+		// getXSRF 是会话账号对上游的第一发：记入 fstate.touched（多轮跟单轮
+		// 共用统一准入；v2.2 §8——reqFailoverState 经 convState.fstate 透传，
+		// runConversationTurn 签名保持原样不变）。
+		if conv.fstate != nil {
+			conv.fstate.markTouched(conv.accountID)
+		}
 		if tok, err := getXSRF(conv.cookie, conv.authuser, proxyURL); err == nil {
 			xsrf = tok
 		} else {
@@ -392,15 +404,30 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	var lastErr error
 	var lastDiag upstreamDiagMeta
 	var lastTTFB int64
+	// convHopRes 是本轮（会话账号+出口）的代理记账暂挂载体：多轮续接同样
+	// 受 v2.2 §7「内层重试不提前写代理分」约束，失败归因在本轮结束后由
+	// 调用方 commitPendingProxy 统一结算。
+	convHopRes := &StreamResult{}
+	noteConvProxy := func(success bool, errStr string) {
+		noteProxyResult(convHopRes, p.ID, success, errStr, true)
+	}
+	// mergePendingProxy 把本轮暂挂迁到返回的 res 上（各 return 统一调）。
+	mergePendingProxy := func(res *StreamResult) *StreamResult {
+		if res != nil {
+			res.PendingProxyFail, res.PendingProxyOK, res.proxyCommitted =
+				convHopRes.PendingProxyFail, convHopRes.PendingProxyOK, convHopRes.proxyCommitted
+		}
+		return res
+	}
 	// failRes 是「循环启动后」各失败返回路径的统一回填：真实计时
 	//（TTFBMs/TotalMs）、结构化现场（Diag/UpstreamModel）与已发增量。
 	failRes := func() *StreamResult {
-		return &StreamResult{
+		return mergePendingProxy(&StreamResult{
 			ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID,
 			Diag: lastDiag, UpstreamModel: lastDiag.Model,
 			TTFBMs: lastTTFB, TotalMs: time.Since(t0).Milliseconds(),
 			Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted,
-		}
+		})
 	}
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
 		if cerr := ctx.Err(); cerr != nil {
@@ -409,6 +436,10 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		// 同 streamGenerateOnce：每轮先清上一轮现场，防帧数污染最后一轮。
 		lastDiag = upstreamDiagMeta{}
 		lastTTFB = 0
+		// StreamGenerate 发出前登记 touched（会话账号的真实上游使用）。
+		if conv.fstate != nil {
+			conv.fstate.markTouched(conv.accountID)
+		}
 		statusCode, raw, ttfb, setCookie, err := doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lineCB, nil, mc.TaskMode)
 		if len(raw) > 0 {
 			lastDiag.Frames, lastDiag.ContentFrame, lastDiag.Model = upstreamFrameStats(string(raw))
@@ -458,7 +489,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			// errStreamIdle 正常记：开流后断流/黑洞的坏代理该累计失败次数
 			// 触发熔断与迁离（见 gemini.go）。
 			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
-				recordProxyResult(p.ID, false, lastErr.Error())
+				noteConvProxy(false, lastErr.Error())
 			}
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
@@ -505,9 +536,9 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		conv.tok26 = tok26 // 每轮更新（可能为空）
 		conv.turn++
 		if pickedOK {
-			recordProxyResult(p.ID, true, "")
+			noteConvProxy(true, "")
 		}
-		return &StreamResult{
+		return mergePendingProxy(&StreamResult{
 			Emitted:          tracker.emitted,
 			EmittedReasoning: rtracker.emitted,
 			Raw:              string(raw),
@@ -518,7 +549,7 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			AccountID:        conv.accountID,
 			TTFBMs:           ttfb,
 			TotalMs:          time.Since(t0).Milliseconds(),
-		}, nil
+		}), nil
 	}
 	return failRes(), lastErr
 }
@@ -702,6 +733,10 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	// Bound 换号不受 maxCookieTries 截断：绑定出口不可用不是模型降级，池里第 4+
 	// 个绑在空闲出口上的号也该被试到。上限取「全池账号数 + maxCookieTries」，
 	// 足够覆盖任意大小池子的 Bound 换号 + 原有的降级换号预算。
+	// 防雪崩顶层共享跳槽准入状态：多轮换号跟单轮共用一套预算
+	//（v2.2 §8：runConversationTurn 签名不变，经 convState/闭包透传 fstate）。
+	fstate := newReqFailoverState(false)
+	defer releaseReqProbes(fstate.reqID)
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
@@ -731,28 +766,34 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
 			// last_used_at，调了不用等于白占一轮。
 			if !anonFirstEligible(mc, false, len(prompt)) {
-				var a *CookieAccount
-				if shouldUseBrowserTransport() {
-					// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
-					// 传真实 mc.Upstream：strict_model 模型级冷却按模型登记。
-					a = stickyResidentAccountFor(exclude, mc.Upstream)
-				}
-				if a == nil {
-					var perr error
-					a, _, perr = pickAccountForModel(mc, exclude)
-					if perr != nil {
-						var last *ModelDowngradedError
-						if !firstAttempt && errors.As(err, &last) {
-							// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
-							last.RetryAfter = perr.(*ModelDowngradedError).RetryAfter
-							break
-						}
+				a, perr := pickFreshConvAccount(mc, exclude, fstate)
+				if perr != nil {
+					var last *ModelDowngradedError
+					var nee *noEligibleAccountError
+					switch {
+					case !firstAttempt && errors.As(err, &last) && errors.As(perr, &nee):
+						// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
+						last.RetryAfter = nee.retryAfter()
+						break
+					case errors.As(perr, &nee):
 						if lastBoundErr != nil {
 							// 排除集里是 Bound 受阻的号而不是降级号：全池 Bound
 							// 不可用时报真实的 Bound 429，不谎报模型降级。
 							return "", nil, res, lastBoundErr
 						}
+						if nee.shortRetryAfter > 0 {
+							return "", nil, res, &AccountCooldownError{RetryAfter: nee.shortRetryAfter}
+						}
+						return "", nil, res, &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: nee.modelRetryAfter}
+					case lastBoundErr != nil && errors.As(perr, &last):
+						// 排除集里是 Bound 受阻的号而不是降级号：全池 Bound
+						// 不可用时报真实的 Bound 429，不谎报模型降级。
+						return "", nil, res, lastBoundErr
+					default:
 						return "", nil, &StreamResult{}, perr
+					}
+					if !firstAttempt && errors.As(err, &last) {
+						break
 					}
 				}
 				if a != nil {
@@ -765,13 +806,17 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 				}
 			}
 		}
-		res, err = runConversationTurn(ctx, prompt, mc, conv, onDelta, onReasoning)
+		res, err = runConvWithFailover(ctx, prompt, mc, conv, onDelta, onReasoning, fstate)
 		if !fresh {
 			// 续接在发往上游之前就确定性本地失败（CanRestoreConvHead 为 true）：
 			// 被消费的 head 仍然有效，按原键归还，让客户端重试能接着 turn 续接。
 			if err != nil && res != nil && res.CanRestoreConvHead && takenKey != "" {
 				convPutIfAbsent(takenKey, &savedConv)
 			}
+			// v2.2 §3.4：!fresh 续接返回路径必须显式 commitPendingProxy——
+			// 会话绑原号不换，代理成败照常记（续接不走延迟毒载荷结算，
+			// Pin 会话由 runConvWithFailover/streamGenerateConv 自己管）。
+			commitPendingProxy(res)
 			// 续接降级：把降级登记进该号该模型的冷却（下次冷启动自动跳过它），
 			// 但绝不换号——续接绑死在原号上，换了续接就是另一条会话。
 			var mde *ModelDowngradedError
@@ -783,6 +828,20 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			break
 		}
 		firstAttempt = false
+		// v2.2 §3.3(4)：fresh 首跳成功后先在循环内做 C1b 输出校验——
+		// 抽空正文（errEmptyContent）在本跳内判定，让它能触发 1 次跨号
+		// 跳槽或与上一跳 C1 构成毒载荷互认；!fresh 续接抽空在循环外
+		// 照常报 empty_content 作废会话。
+		if err == nil && res != nil && res.Emitted == "" && res.EmittedReasoning == "" {
+			if verr := validateConvTurnOutput(res, tools); verr != nil {
+				err = verr
+			}
+		}
+		// fresh 首跳失败结算：按错误分类记短冷却/降级，再判定能否换号。
+		res, err = settleConvHop(res, err, fstate, mc)
+		if err == nil {
+			break
+		}
 		var rle *RateLimitError
 		if errors.As(err, &rle) && rle.Bound {
 			lastBoundErr = rle
@@ -795,7 +854,11 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			budgetOut = boundTries >= boundBudget
 		case errors.As(err, &mde) && mde.AccountID > 0:
 			downgradeTries++
-			budgetOut = downgradeTries >= maxCookieTries
+			budgetOut = downgradeTries >= maxCookieTries || fstate.faultHops >= 1
+		default:
+			if classIsFault(classifyFailoverError(err)) {
+				budgetOut = fstate.faultHops >= maxCrossAccountHops
+			}
 		}
 		if !retryOnAnotherAccount(res, err, mc, exclude) || budgetOut {
 			break
@@ -837,3 +900,94 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 
 // runConversationTurn is the upstream seam used by continuation regression tests.
 var runConversationTurn = streamGenerateConv
+
+// runConvWithFailover 包一层上游轮次：把顶层共享 fstate 挂到 conv 上供
+// streamGenerateConv 内部 markTouched，并在返回后统一结算代理记账
+// （callGeminiConv 各出口靠它保证 v2.2 §3.4「全部出口 commitPendingProxy」）。
+func runConvWithFailover(ctx context.Context, prompt string, mc ModelConfig, conv *convState,
+	onDelta, onReasoning func(string), fstate *reqFailoverState) (*StreamResult, error) {
+	prev := conv.fstate
+	conv.fstate = fstate
+	defer func() { conv.fstate = prev }()
+	res, err := runConversationTurn(ctx, prompt, mc, conv, onDelta, onReasoning)
+	if res != nil && res.AccountID > 0 && fstate != nil {
+		fstate.markTouched(res.AccountID)
+	}
+	// 成功直接提交代理；失败留给调用方按分类结算（毒载荷/短冷却在
+	// settleConvHop 判定，!fresh 续接在调用处显式 commit）。
+	if err == nil {
+		commitPendingProxy(res)
+		if res != nil && res.AccountID > 0 {
+			recordAccountReqSuccess(res.AccountID, fstate.reqID)
+		}
+	}
+	return res, err
+}
+
+// pickFreshConvAccount 从 callGeminiConv 抽出的首轮挑号：M1 驻留粘性优先，
+// 否则走 pickAccountForModel（带 fstate 半开探测认领）。返回 (nil, nil) 表示
+// 合法空池走匿名。
+func pickFreshConvAccount(mc ModelConfig, exclude map[int64]bool, fstate *reqFailoverState) (*CookieAccount, error) {
+	if shouldUseBrowserTransport() {
+		// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
+		// 传真实 mc.Upstream：strict_model 模型级冷却按模型登记。
+		if a := stickyResidentAccountFor(exclude, mc.Upstream); a != nil {
+			return a, nil
+		}
+	}
+	a, _, err := pickAccountForModel(mc, exclude, fstate)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// validateConvTurnOutput 是 fresh 首跳的循环内输出校验（C1b 前移）：
+// 抽不出正文且无 tool_call 时返回 diagErr——hasContentFrame 为真记
+// empty_content（C1b），无帧记 no_content_frame（C1）。
+// 续接（!fresh）不调它：抽空在循环外按作废会话处理。
+func validateConvTurnOutput(res *StreamResult, tools []map[string]interface{}) error {
+	text := extractResponseText(res.Raw)
+	var toolCalls []ToolCall
+	if len(tools) > 0 {
+		text, toolCalls = parseToolCalls(text)
+	}
+	if text != "" || len(toolCalls) > 0 {
+		return nil
+	}
+	if hasContentFrame(res.Raw) {
+		return &diagErr{err: fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+			reason: reasonEmptyContent, res: res}
+	}
+	return &diagErr{err: fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
+		reason: reasonNoContentFrame, res: res}
+}
+
+// settleConvHop 是 fresh 首轮失败后的统一结算（conversation 版防雪崩）：
+// 按错误分类记账号短冷却 + 代理记账，并消耗 fstate 跳槽预算。
+// 返回 (res, err)：err 可能被包成 poisonPayloadError。
+func settleConvHop(res *StreamResult, err error, fstate *reqFailoverState, mc ModelConfig) (*StreamResult, error) {
+	if err == nil {
+		return res, nil
+	}
+	cls := classifyFailoverError(err)
+	acctID := int64(0)
+	emitted := false
+	if res != nil {
+		acctID = res.AccountID
+		emitted = res.Emitted != "" || res.EmittedReasoning != ""
+	}
+	// 已吐字或 C5b 本地终止：不跳槽、不记账号，代理记账照常。
+	if emitted || cls == classLocalAbort {
+		commitPendingProxy(res)
+		return res, err
+	}
+	if classAccountsBlame(cls) && acctID > 0 {
+		recordAccountReqFailureAt(acctID, fstate.reqID, cls, firstFailureAt(res))
+	}
+	commitPendingProxy(res)
+	// 消耗统一准入预算：C4b 豁免（未碰上游）；C3 走降级预算；故障类走
+	// faultHops——budgetOut 由调用方按各计数器/预算判定。
+	fstate.tryAdvanceHop(cls, emitted)
+	return res, err
+}

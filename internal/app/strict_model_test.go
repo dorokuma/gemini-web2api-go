@@ -67,17 +67,17 @@ func TestPickAccountForModelSkipsCooling(t *testing.T) {
 
 	markDowngraded(a1, argon)
 	for i := 0; i < 4; i++ { // 轮转会换号，多挑几次确认 a1 一次都不出现
-		a, _, err := pickAccountForModel(argon, nil)
+		a, _, err := pickAccountForModel(argon, nil, nil)
 		if err != nil || a == nil || a.ID != a2 {
 			t.Fatalf("a1 在 Argon 上冷却中，应只挑到 a2，得到 %v %v", a, err)
 		}
 	}
-	if _, skip, _ := pickAccountForModel(flash, nil); skip[a1] {
+	if _, skip, _ := pickAccountForModel(flash, nil, nil); skip[a1] {
 		t.Fatal("冷却只针对被降级的那一档，a1 在 3.6 Flash 上应照常可用")
 	}
 
 	markDowngraded(a2, argon)
-	_, _, err := pickAccountForModel(argon, nil)
+	_, _, err := pickAccountForModel(argon, nil, nil)
 	var mde *ModelDowngradedError
 	if !errors.As(err, &mde) || mde.Reported != "" || mde.RetryAfter < 299*time.Minute {
 		t.Fatalf("全池冷却应报降级错误并带解冻时间（~300 分钟），得到 %v", err)
@@ -103,7 +103,7 @@ func TestCooldownZeroStillExcludesWithinRequest(t *testing.T) {
 	if cooling, _ := coolingAccounts(argon); len(cooling) != 0 {
 		t.Fatalf("cooldown=0 不该记冷却：%v", cooling)
 	}
-	if a, _, _ := pickAccountForModel(argon, exclude); a == nil || a.ID != a2 {
+	if a, _, _ := pickAccountForModel(argon, exclude, nil); a == nil || a.ID != a2 {
 		t.Fatalf("本次请求里 a1 已降级，应换到 a2，得到 %v", a)
 	}
 }

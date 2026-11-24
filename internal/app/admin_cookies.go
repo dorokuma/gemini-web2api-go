@@ -70,6 +70,10 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 		"proxy_id":     a.ProxyID,
 		"proxy_name":   proxyDisplayName(a.ProxyID),
 		"authuser":     a.AuthUser,
+		"priority":     a.Priority,
+		// 45s 防雪崩短冷却剩余秒数（0 = 不在冷却）：面板状态列据此标黄，
+		// 免得冷却中的主号被当成「坏了」去手动排障。
+		"cooldown_left_sec": accountShortCooldownLeftSec(a.ID),
 	}
 }
 
@@ -94,6 +98,8 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 			ProxyID *int64 `json:"proxy_id"`
 			// 浏览器多号登录时的账号序号（/u/N），不传 = 0
 			AuthUser int `json:"authuser"`
+			// Priority 主备优先级，不传 = 0（默认轮转）。
+			Priority *int `json:"priority"`
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &p); err != nil {
@@ -113,6 +119,10 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
 			return
 		}
+		if p.Priority != nil && (*p.Priority < minAccountPriority || *p.Priority > maxAccountPriority) {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("priority 要在 %d..%d 之间", minAccountPriority, maxAccountPriority)})
+			return
+		}
 		id, err := accountAdd(p.Label, p.Cookie, p.Note)
 		if err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -120,6 +130,12 @@ func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.AuthUser != 0 {
 			if err := accountSetAuthUser(id, p.AuthUser); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		if p.Priority != nil && *p.Priority != 0 {
+			if err := accountSetPriority(id, *p.Priority); err != nil {
 				writeJSON(w, 500, map[string]string{"error": err.Error()})
 				return
 			}
@@ -216,72 +232,113 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, map[string]interface{}{"status": next})
 	case http.MethodPatch:
-		var p struct {
-			Label  *string `json:"label"`
-			Note   *string `json:"note"`
-			Status *string `json:"status"`
-			// ProxyID 手动指定绑定的出口（#80），0 = 清掉绑定，下次用到哪个出口再自动绑。
-			ProxyID  *int64 `json:"proxy_id"`
-			AuthUser *int   `json:"authuser"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &p); err != nil {
-			writeJSON(w, 400, map[string]string{"error": "bad json"})
-			return
-		}
-		// 先全部校验再统一落库：任何一个字段非法都 400 零副作用——以前
-		// bindAccountProxy 抢在 authuser/status 校验前写库，带合法 proxy_id +
-		// 非法 authuser 的请求 400 了却已经改掉绑定。
-		if p.ProxyID != nil && (*p.ProxyID < proxyIDDirect ||
-			(*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
-			writeJSON(w, 400, map[string]string{"error": "proxy not found"})
-			return
-		}
-		if p.AuthUser != nil && (*p.AuthUser < 0 || *p.AuthUser > maxAuthUser) {
-			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("账号序号要在 0..%d 之间", maxAuthUser)})
-			return
-		}
-		if p.Status != nil && *p.Status != "enabled" && *p.Status != "disabled" {
-			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("非法状态 %q", *p.Status)})
-			return
-		}
-		if p.ProxyID != nil {
-			bindAccountProxy(id, *p.ProxyID)
-		}
-		if p.AuthUser != nil {
-			if err := accountSetAuthUser(id, *p.AuthUser); err != nil {
-				writeJSON(w, 400, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-		if p.Status != nil {
-			if err := accountSetStatus(id, *p.Status); err != nil {
-				writeJSON(w, 400, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-		if p.Label != nil || p.Note != nil {
-			// 只改传了的字段：没传的沿用当前值。
-			var curLabel, curNote string
-			for _, a := range accountList() {
-				if a.ID == id {
-					curLabel, curNote = a.Label, a.Note
-					break
-				}
-			}
-			if p.Label != nil {
-				curLabel = *p.Label
-			}
-			if p.Note != nil {
-				curNote = *p.Note
-			}
-			if err := accountUpdateMeta(id, curLabel, curNote); err != nil {
-				writeJSON(w, 500, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-		writeJSON(w, 200, map[string]bool{"ok": true})
+		handleAdminCookiePatch(w, r, id)
 	default:
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 	}
+}
+
+// cookiePatchBody 是 PATCH /admin/api/cookies/{id} 的全部可选字段。
+type cookiePatchBody struct {
+	Label  *string `json:"label"`
+	Note   *string `json:"note"`
+	Status *string `json:"status"`
+	// ProxyID 手动指定绑定的出口（#80），0 = 清掉绑定，下次用到哪个出口再自动绑。
+	ProxyID  *int64 `json:"proxy_id"`
+	AuthUser *int   `json:"authuser"`
+	// Priority 主备优先级（v6.6.0），范围 minAccountPriority..maxAccountPriority。
+	Priority *int `json:"priority"`
+}
+
+// validateCookiePatch 全量校验 PATCH 字段，返回一段能直接写 400 的错误串
+// （"" = 全部合法）。先全部校验再统一落库：任何一个字段非法都 400 零副作用——
+// 以前 bindAccountProxy 抢在 authuser/status 校验前写库，带合法 proxy_id +
+// 非法 authuser 的请求 400 了却已经改掉绑定。
+func validateCookiePatch(p cookiePatchBody) string {
+	if p.ProxyID != nil && (*p.ProxyID < proxyIDDirect ||
+		(*p.ProxyID > 0 && !proxyExists(*p.ProxyID))) {
+		return "proxy not found"
+	}
+	if p.AuthUser != nil && (*p.AuthUser < 0 || *p.AuthUser > maxAuthUser) {
+		return fmt.Sprintf("账号序号要在 0..%d 之间", maxAuthUser)
+	}
+	if p.Status != nil && *p.Status != "enabled" && *p.Status != "disabled" {
+		return fmt.Sprintf("非法状态 %q", *p.Status)
+	}
+	if p.Priority != nil && (*p.Priority < minAccountPriority || *p.Priority > maxAccountPriority) {
+		return fmt.Sprintf("priority 要在 %d..%d 之间", minAccountPriority, maxAccountPriority)
+	}
+	return ""
+}
+
+// writeCookiePatchErr 把单字段落库错误回给面板（校验过仍可能撞并发删除等）。
+func writeCookiePatchErr(w http.ResponseWriter, err error) {
+	writeJSON(w, 400, map[string]string{"error": err.Error()})
+}
+
+// handleAdminCookiePatch — PATCH /admin/api/cookies/{id}：改 label / note /
+// status / proxy_id / authuser / priority。独立成函数控制 handleAdminCookieItem
+// 的认知复杂度（原 PATCH 分支占了大半）。
+//
+// 写库前先取 before := accountByID(id) 快照：Stage 2（多 BrowserContext）靠它
+// 精准判断要不要失效在途浏览器上下文——只改 priority/label/note/authuser 绝不能
+// 打断在途流，proxy_id 实际变化或 status 切 disabled 才失效。
+func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
+	var p cookiePatchBody
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &p); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad json"})
+		return
+	}
+	if msg := validateCookiePatch(p); msg != "" {
+		writeJSON(w, 400, map[string]string{"error": msg})
+		return
+	}
+	// before 快照：Stage 2 精准失效钩子（browserMgr.InvalidateAccount）按
+	// (before.ProxyID != *p.ProxyID) 或 (status -> disabled) 判定；Stage 1
+	// 尚未接浏览器上下文失效，但快照与写序必须先固定下来。
+	before := accountByID(id)
+	_ = before // Stage 2 的 browserMgr.InvalidateAccount 钩子按 before 判定
+	if p.ProxyID != nil {
+		bindAccountProxy(id, *p.ProxyID)
+	}
+	if p.AuthUser != nil {
+		if err := accountSetAuthUser(id, *p.AuthUser); err != nil {
+			writeCookiePatchErr(w, err)
+			return
+		}
+	}
+	if p.Priority != nil {
+		if err := accountSetPriority(id, *p.Priority); err != nil {
+			writeCookiePatchErr(w, err)
+			return
+		}
+	}
+	if p.Status != nil {
+		if err := accountSetStatus(id, *p.Status); err != nil {
+			writeCookiePatchErr(w, err)
+			return
+		}
+	}
+	if p.Label != nil || p.Note != nil {
+		// 只改传了的字段：没传的沿用当前值。
+		var curLabel, curNote string
+		for _, a := range accountList() {
+			if a.ID == id {
+				curLabel, curNote = a.Label, a.Note
+				break
+			}
+		}
+		if p.Label != nil {
+			curLabel = *p.Label
+		}
+		if p.Note != nil {
+			curNote = *p.Note
+		}
+		if err := accountUpdateMeta(id, curLabel, curNote); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }

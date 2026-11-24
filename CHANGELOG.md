@@ -2,6 +2,73 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 6.6.0 - 2026-11-24
+
+### 新增
+
+- **`accounts.priority` 严格主备优先级**：账号表新增 `priority` 列
+  （`-1000..10000`，默认 `0`），挑号排序改为
+  `ORDER BY priority DESC, fail_count ASC, last_used_at ASC, id ASC`——
+  主力号填 `100`、备用号填 `10`/`5` 即形成显式主备梯队，同级之间仍按
+  原有「失败数 + 最久未用」轮转（`priority=0` 与旧行为完全一致）。
+  幂等迁移 `ALTER TABLE accounts ADD COLUMN priority` 带列存在性探针，
+  老库（v6.5.0 升级）在 `ALTER` 之后才创建 `idx_accounts_priority_pick`
+  索引（兼容 SQLite/MySQL/PostgreSQL，修复索引早于列创建被静默吞掉的
+  顺序问题）；`POST/GET/PATCH /admin/api/cookies` 全量支持 `priority`
+  （越界 `400` 零写库，`PATCH` 写库前先取 `before` 快照为精准失效预留
+  钩子）；面板 Cookie 池新增「优先级」列、导入/编辑表单字段与冷却徽标
+  （45s 短冷却剩余秒数）。
+- **防雪崩（Anti-Avalanche）延迟提交状态机**：新增
+  `internal/app/account_cooldown.go`——同一账号在连续 `N>=2` 个独立请求
+  （按 `reqID` 幂等去重）真实失败后进入 `45s` 短冷却，冷却期间挑号跳过；
+  **延迟账号失败提交（Deferred Account Failure Commit）**对毒载荷敏感类
+  （`C1` `no_content_frame`/`errUpstreamFailureReply` 与循环内前移判定的
+  `C1b` `errEmptyContent`）第 0 跳只暂挂栈变量不写全局，第 1 跳落定后按
+  `isPoisonPair`（双端同落 `C1`/`C1b`）判定——毒载荷双端账号零记账、
+  零冷却、代理零扣分，非毒按首次 `occurredAt` 因果时序单次提交；
+  `PinAccountID>0` 的会话对 `C1` 豁免短冷却记账（视频/续写的内容拒单
+  不再误伤聊天主号）。
+- **混合链 `C1 <-> C3` 统一跳槽准入（`reqFailoverState`）**：单请求跨号
+  跳槽统一记账——故障/毒载荷类（`C1`/`C1b`/`C2`/`C4a`/`C5a`）最多跨号
+  跳槽 `1` 次（含故障的请求至多触碰 `2` 个账号），纯 `C3` 模型降级保留
+  `maxCookieTries=3`；一旦发生过任意故障跳槽，后续即使遇到 `C3` 也禁止
+  再跳第 3 号；`Bound` 门前错误仅在该号尚未触碰上游前豁免预算；
+  `singleAccountTry` 模式下禁止内层 `FallbackAnon` 抢跑，`xsrfExitConflict`
+  早退补填账号归属。
+- **半开单飞探测（`probeInFlight`）**：冷却到期的账号一次只放行一条探测
+  请求，其余并发仍视为冷却平滑路由至备号（杜绝瞬时并发雪崩回切打爆
+  未恢复的主号）；探测占位带 `maxHalfOpenProbeHold` 兜底租约与 `10m`
+  静默复位，封死永久黑洞；探测成功清零恢复、失败单次续期冷却，
+  毒载荷/Bound/取消不归罪主号。
+- **`accounts_cooling_down` 429 全链路接线**：新增 `*AccountCooldownError`
+  与 `noEligibleAccountError`——全池处于短冷却时各端点统一返回
+  `429` + `Retry-After` + `code="accounts_cooling_down"`（OpenAI
+  chat/responses、Gemini 原生 `generateContent`/`streamGenerateContent`、
+  已开流 SSE `Fail` 与 `response.failed` 事件同一份诊断）；跳槽选备号
+  无号可挑时绝不静默退回匿名（`noEligibleAccountError`），
+  `conversation.go`/`gemini.go` 统一 `errors.As` 消除裸类型断言。
+
+### 修复
+
+- **`callOnVideoAccount` 短冷却原地回退**：视频任务挑号先并入 45s 短
+  冷却集合，全跳完仍无号可挑时当场重建 skip 原地回退（短冷却不是视频
+  配额问题，几秒就解冻）——全池恰处短冷却时异步长视频任务不再空转
+  报错；视频任务使用独立 `videoReqID` 占探测位，每轮 `videoCall` 返回
+  后立即释放，`defer releaseReqProbes` 兜底防泄漏。
+- **视频 `errVideoQuotaUsed` 不误清探测位**：`recordAccountReqFailureAt`
+  仅在 `probeReqID` 匹配或冷却续期时清探测占位，迟到释放不再误清他号
+  探测（R3-S1）。
+
+### 预告
+
+- **单 Chromium 多 `BrowserContext` 物理隔离（模块一，Stage 2 落地）**：
+  每个登录账号与匿名出口将迁入独立的 `BrowserContext`
+  （`disposeOnDetach: true` + 每槽独立代理 bridge，`rootBridge` 恒拒 `502`
+  防根 Profile 偷跑本机 IP），取代当前 M1 单常驻 Jar 粘性方案——账号间
+  Cookie/出口 100% 物理隔离，多账号并发零切号冷却。Stage 1 已先落地
+  `accounts.priority` 与防雪崩状态机，并让 `stickyResidentAccountFor` 在
+  冷却/更高优先级账号存在时让位（Stage 2 随多 Context 一起删除）。
+
 ## 6.5.0 - 2026-11-23
 
 ### 新增

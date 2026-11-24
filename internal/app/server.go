@@ -153,7 +153,33 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 
 func callGemini(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, tools []map[string]interface{},
 	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	res, err := streamGenerateWithFiles(ctx, prompt, pc, mc, images, onDelta, onReasoning, toolCallComplete(tools))
+	// v2.2 §3.3(4)：输出校验前移入跳槽循环（C1b 可达）——成功帧但抽不出
+	// 正文/工具时在本跳内判定，让 errEmptyContent 跟 C1 一样能参与
+	// isPoisonPair 毒载荷互认与跨号跳槽。媒体/画布模型放行（正文可空，
+	// 产物取回在出循环后单独判）。
+	postValidate := func(res *StreamResult) error {
+		if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo || mc.Tool == toolCanvas {
+			return nil
+		}
+		text := extractResponseText(res.Raw)
+		var toolCalls []ToolCall
+		if len(tools) > 0 {
+			text, toolCalls = parseToolCalls(text)
+		}
+		if text != "" || len(toolCalls) > 0 {
+			return nil
+		}
+		if res.Emitted != "" || res.EmittedReasoning != "" {
+			return nil // 已吐字：不再参与毒载荷判定
+		}
+		if hasContentFrame(res.Raw) {
+			return &diagErr{err: fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+				reason: reasonEmptyContent, res: res}
+		}
+		return &diagErr{err: fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
+			reason: reasonNoContentFrame, res: res}
+	}
+	res, err := streamGenerateWithFilesOpts(ctx, prompt, pc, mc, images, onDelta, onReasoning, toolCallComplete(tools), postValidate)
 	if err != nil {
 		// res 非 nil：失败时它只带归属（哪个号 / 哪个出口），给 recordRequest 用
 		return "", nil, res, err
@@ -456,14 +482,20 @@ func failChatRequest(w http.ResponseWriter, r *http.Request, modelName, prompt s
 		return
 	}
 	var mde *ModelDowngradedError
+	var ace *AccountCooldownError
 	downgraded := errors.As(err, &mde)
+	cooling := errors.As(err, &ace)
 	status := 502
-	if downgraded {
+	if downgraded || cooling {
 		status = 429
 	}
 	recordUpstreamFailure("chat.completions", modelName, prompt, res, status, err, stream)
 	if sse != nil && sse.Started() {
 		sse.Fail(err, res) // 已经开流，HTTP 状态码改不了了
+		return
+	}
+	if cooling {
+		writeAccountCooldown(w, ace)
 		return
 	}
 	if downgraded {
@@ -512,6 +544,11 @@ func responsesFailedError(err error, res *StreamResult) map[string]interface{} {
 		errObj["type"] = "rate_limit_exceeded"
 		errObj["code"] = "ip_slot_full"
 	}
+	var ace *AccountCooldownError
+	if errors.As(err, &ace) {
+		errObj["type"] = "rate_limit_exceeded"
+		errObj["code"] = "accounts_cooling_down"
+	}
 	return errObj
 }
 
@@ -524,9 +561,11 @@ func failResponsesRequest(w http.ResponseWriter, r *http.Request, modelName, pro
 		return
 	}
 	var mde *ModelDowngradedError
+	var ace *AccountCooldownError
 	downgraded := errors.As(err, &mde)
+	cooling := errors.As(err, &ace)
 	status := 502
-	if downgraded {
+	if downgraded || cooling {
 		status = 429
 	}
 	recordUpstreamFailure("responses", modelName, prompt, res, status, err, stream)
@@ -542,6 +581,10 @@ func failResponsesRequest(w http.ResponseWriter, r *http.Request, modelName, pro
 				"error":  responsesFailedError(err, res),
 			},
 		})
+		return
+	}
+	if cooling {
+		writeAccountCooldown(w, ace)
 		return
 	}
 	if downgraded {

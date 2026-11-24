@@ -1236,12 +1236,26 @@ func stickyResidentAccountFor(exclude map[int64]bool, upstream string) *CookieAc
 			merged[id] = true
 		}
 	}
+	// Stage 1 过渡（模块二）：45s 防雪崩短冷却/半开已认领的驻留号同样跳过——
+	// 驻留粘性不能让正在冷却的号继续被打（Stage 2 多 BrowserContext 落地后
+	// 本函数随 M1 一起删除）。
+	shortCooling, _ := shortCoolingAccounts()
+	for id := range shortCooling {
+		merged[id] = true
+	}
 	if merged[sid] {
 		return nil
 	}
 	a := accountByID(sid)
 	if a == nil || a.Status != "enabled" {
 		return nil
+	}
+	// Stage 1 过渡：accounts.priority 主备——存在优先级更高且未在 merged
+	// 排除集里的启用号时让位（驻留粘性不压过显式主备配置）。
+	for _, b := range accountList() {
+		if b.Status == "enabled" && b.ID != sid && b.Priority > a.Priority && !merged[b.ID] {
+			return nil // 让位给更高优先级的号，走 pickAccountForModel 正常挑
+		}
 	}
 	return a
 }

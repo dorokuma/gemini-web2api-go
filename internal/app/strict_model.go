@@ -77,31 +77,80 @@ func coolingAccounts(mc ModelConfig) (map[int64]bool, time.Duration) {
 	return out, soonest
 }
 
-// pickAccountForModel 挑号，跳过 exclude（本次请求里已经被降级过的）和正在为 mc 冷却的号。
-// 返回的 skip 是两者合集，换号重取时要接着用它。
+// pickAccountForModel 挑号，跳过 exclude（本次请求里已经被降级/故障过的）、
+// 正在为 mc 做 strict_model 冷却的、以及 45s 短冷却/半开已认领的号。
+// 返回的 skip 是三者合集，换号重取时要接着用它。
 //
-// 池里有号但全被跳过时报 *ModelDowngradedError，而不是返回 nil 让请求退成匿名：
-// 匿名对登录模型同样是降级，那正是开 strict_model 想避免的。
-func pickAccountForModel(mc ModelConfig, exclude map[int64]bool) (*CookieAccount, map[int64]bool, error) {
+// 错误契约（v6.6.0 防雪崩，闭合 Oracle M4）：
+//   - !hasCookie()（库内无任何 enabled 账号）→ (nil, skip, nil)，合法空池走匿名；
+//   - hasCookie() && len(exclude)==0（首跳入口全池冷却）→
+//     存在未被 modelCooling 覆盖但处于 shortCooling 的启用号时报
+//     *AccountCooldownError{RetryAfter: shortSoonest}，否则报
+//     *ModelDowngradedError{RetryAfter: modelSoonest}；
+//   - hasCookie() && len(exclude)>0（跳槽选备号无号可挑）→
+//     一律报 *noEligibleAccountError，绝不返回 (nil,skip,nil) 误退匿名。
+//
+// 半开单飞：挑中一个冷却刚到期的号时经 tryClaimHalfOpenProbe 认领探测位，
+// 认领不到（别的请求在探）就并入局部 skip 重挑，fstate==nil 时 reqID 取 0
+// （存量直接调用方不参与探测认领，向后兼容）。
+func pickAccountForModel(mc ModelConfig, exclude map[int64]bool, fstate *reqFailoverState) (*CookieAccount, map[int64]bool, error) {
 	skip := map[int64]bool{}
 	for id := range exclude {
 		skip[id] = true
 	}
-	var soonest time.Duration
+	var modelSoonest, shortSoonest time.Duration
 	if rtCfg().StrictModel && mc.Upstream != "" {
 		var cooling map[int64]bool
-		cooling, soonest = coolingAccounts(mc)
+		cooling, modelSoonest = coolingAccounts(mc)
 		for id := range cooling {
 			skip[id] = true
 		}
 	}
-	if a, ok := pickCookieAccountExcept(skip); ok {
-		return a, skip, nil
+	shortCooling, shortSoonest := shortCoolingAccounts()
+	for id := range shortCooling {
+		skip[id] = true
 	}
-	if len(skip) > 0 && hasCookie() {
-		return nil, skip, &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: soonest}
+	var reqID uint64
+	if fstate != nil {
+		reqID = fstate.reqID
 	}
-	return nil, skip, nil
+	// 逐轮挑号：挑中半开号但探测位被占时并入局部 skip 重挑（不占外层 exclude，
+	// 否则下次请求会把刚恢复的号误当「本次已试」）。
+	for {
+		a, ok := pickCookieAccountExcept(skip)
+		if !ok {
+			return nil, skip, resolvePoolExhaustedErr(mc, exclude, shortCooling,
+				modelSoonest, shortSoonest)
+		}
+		if reqID == 0 || tryClaimHalfOpenProbe(a.ID, reqID) {
+			return a, skip, nil
+		}
+		skip[a.ID] = true
+	}
+}
+
+// resolvePoolExhaustedErr 决定「没挑到号」时报什么错（pickAccountForModel 抽出，
+// 控制圈复杂度）。hasCookie() 判库内有无 enabled 账号。
+func resolvePoolExhaustedErr(mc ModelConfig, exclude map[int64]bool,
+	shortCooling map[int64]bool, modelSoonest, shortSoonest time.Duration) error {
+	if !hasCookie() {
+		return nil // 合法空池：调用方按匿名处理
+	}
+	if len(exclude) > 0 {
+		// 跳槽选备号无号可挑：绝不退匿名。
+		return &noEligibleAccountError{modelRetryAfter: modelSoonest, shortRetryAfter: shortSoonest}
+	}
+	// 首跳入口全池冷却：只要有一个号的拦路原因是 45s 短冷却（而非模型降级
+	// 或调用方显式 exclude），报 accounts_cooling_down 更诚实——解冻以秒计，
+	// 不是以分钟计。
+	if len(shortCooling) > 0 {
+		for _, a := range accountList() {
+			if a.Status == "enabled" && shortCooling[a.ID] && !exclude[a.ID] {
+				return &AccountCooldownError{RetryAfter: shortSoonest}
+			}
+		}
+	}
+	return &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: modelSoonest}
 }
 
 // retryOnAnotherAccount 判断一次降级要不要换号重来，要的话先把这个号记进冷却和 exclude。

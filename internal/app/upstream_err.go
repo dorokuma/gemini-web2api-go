@@ -31,6 +31,9 @@ const (
 	// browser_transport 开着但本机找不到/拉不起浏览器时的硬错：绝不静默降级
 	// 回纯 Go HTTP（browser_fallback_http 显式开才回退），见 browser.go。
 	reasonBrowserUnavailable = "browser_unavailable"
+	// accounts_cooling_down：所有可挑登录账号都在 45s 防雪崩短冷却——
+	// 不是上游故障也不是限流满，是「等几十秒再来」的软 429。
+	reasonAccountsCoolingDown = "accounts_cooling_down"
 )
 
 // upstreamDiag 是 502 body 和 requests.error 前缀共用的一份诊断。
@@ -98,6 +101,9 @@ func diagHint(reason string, err error) string {
 		return "上游返回了内容帧但抽不出正文：可能是回复被清洗规则剥空或协议字段已变更"
 	case reasonUpstreamHTTP:
 		return "上游返回了非 200 状态码：可能是出口被风控（302/sorry）、限流（429）或上游临时故障"
+	case reasonAccountsCoolingDown:
+		return "所有登录账号刚连续被上游拒绝，正处 45s 防雪崩短冷却：按 Retry-After 稍等再试，" +
+			"或检查这批账号 cookie 是否过期/被风控"
 	case reasonBrowserUnavailable:
 		return "常驻浏览器不可用：browser_transport 已开启但本机找不到 Chromium/Chrome/Edge，" +
 			"或拉起/连接失败。请安装 chromium（如 apt install chromium），" +
@@ -115,7 +121,14 @@ func diagHint(reason string, err error) string {
 // 同一句），剩下按错误串里的上游状态码和兜底归。
 func upstreamReason(err error) string {
 	var se *StallError
+	var ace *AccountCooldownError
+	var ppe *poisonPayloadError
 	switch {
+	case errors.As(err, &ace):
+		return reasonAccountsCoolingDown
+	case errors.As(err, &ppe):
+		// 毒载荷保留内层 reason（no_content_frame 等）：外层只改了「免记账」语义。
+		return upstreamReason(ppe.err)
 	case isBrowserLocalError(err):
 		return reasonBrowserUnavailable
 	case errors.Is(err, errUpstreamFailureReply):
@@ -202,6 +215,21 @@ func upstreamErrorJSON(err error, res *StreamResult) map[string]interface{} {
 		}
 	}
 	d.Hint = diagHint(d.Reason, err)
+	var ace *AccountCooldownError
+	if errors.As(err, &ace) {
+		// 短冷却按标准限流形状写：sse.Fail 与 response.failed 会带上
+		// rate_limit_exceeded + accounts_cooling_down，客户端按「稍后重试」处理。
+		return map[string]interface{}{
+			"message":        "upstream error: " + err.Error(),
+			"type":           "rate_limit_exceeded",
+			"code":           reasonAccountsCoolingDown,
+			"reason":         d.Reason,
+			"upstream_model": d.UpstreamModel,
+			"frames":         d.Frames,
+			"content_frame":  d.ContentFrame,
+			"hint":           d.Hint,
+		}
+	}
 	return map[string]interface{}{
 		"message":        "upstream error: " + err.Error(),
 		"type":           "upstream_error",
