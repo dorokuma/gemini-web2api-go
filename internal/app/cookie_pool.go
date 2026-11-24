@@ -1205,11 +1205,21 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	// R2 丢失更新修复：状态恢复判定彻底下推数据库原子条件更新，不在 Go 内存
 	// 拿 cur.Status 盲写回库——accountSetStatus 不经 L1，快照之后落进来的
 	// 手动停用/启用绝不能被本快照覆盖。
+	// R3：两条 UPDATE 装进一个事务，任一步失败整体回滚——不留「cookie 已写
+	// 库却未 Bump 未失效」的部分写入态（它不自愈：重推同串会走 unchanged
+	// 快路径，旧 Context 与旧代际永远留着）。事务内只放这两条 UPDATE，
+	// 不放 SELECT，避免 SQLite SHARED→RESERVED 锁升级死锁。
 	// 第一条只写凭据与错误计数，完全不碰 status/auto_disabled；
 	// proxy_id 与 priority 同样保留不动。
-	if _, err := getDB().Exec(
+	tx, err := getDB().Begin()
+	if err != nil {
+		unlock()
+		return accountSyncResult{}, err
+	}
+	if _, err := tx.Exec(
 		`UPDATE accounts SET cookie=?, fail_count=0, last_error='' WHERE id=?`,
 		c, hitID); err != nil {
+		_ = tx.Rollback()
 		unlock()
 		return accountSyncResult{}, err
 	}
@@ -1217,15 +1227,21 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	// 才原子恢复 enabled 并清零标记：快照之后被管理员手动停用/启用的行
 	// 0 行受影响，绝不越过手动决定（三方言通用、无 MySQL 赋值顺序歧义）。
 	reenabled := false
-	res, err := getDB().Exec(
+	res, err := tx.Exec(
 		`UPDATE accounts SET status='enabled', auto_disabled=0 WHERE id=? AND status='disabled' AND auto_disabled=1`,
 		hitID)
 	if err != nil {
+		_ = tx.Rollback()
 		unlock()
 		return accountSyncResult{}, err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		reenabled = true
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		unlock()
+		return accountSyncResult{}, err
 	}
 	// MF-6：真实写库成功后在 L1 内 BumpAccountEpoch（无条件推进，不门控
 	// shouldUseBrowserTransport），杜绝新 cookie 与并发回写交错时代际漂移。
