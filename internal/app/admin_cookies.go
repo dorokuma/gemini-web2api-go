@@ -178,6 +178,9 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
+		if shouldUseBrowserTransport() {
+			browserMgr.InvalidateAccount(id, false, "deleted")
+		}
 		logf("[cookies] 删除账号 #%d", id)
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case http.MethodPost:
@@ -229,6 +232,9 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		if err := accountSetStatus(id, next); err != nil {
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
+		}
+		if next == "disabled" && shouldUseBrowserTransport() {
+			browserMgr.InvalidateAccount(id, false, "disabled")
 		}
 		writeJSON(w, 200, map[string]interface{}{"status": next})
 	case http.MethodPatch:
@@ -294,11 +300,14 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 		writeJSON(w, 400, map[string]string{"error": msg})
 		return
 	}
-	// before 快照：Stage 2 精准失效钩子（browserMgr.InvalidateAccount）按
-	// (before.ProxyID != *p.ProxyID) 或 (status -> disabled) 判定；Stage 1
-	// 尚未接浏览器上下文失效，但快照与写序必须先固定下来。
+	// before 快照：精准失效钩子（browserMgr.InvalidateAccount）按
+	// (before.ProxyID != *p.ProxyID) 或 (status -> disabled) 判定——只改
+	// priority/label/note/authuser（即使表单附带未变的 proxy_id）绝不
+	// 触发失效，在途流 0 中断。
 	before := accountByID(id)
-	_ = before // Stage 2 的 browserMgr.InvalidateAccount 钩子按 before 判定
+	proxyChanged := p.ProxyID != nil && before != nil && *p.ProxyID != before.ProxyID
+	disabling := p.Status != nil && *p.Status == "disabled" &&
+		(before == nil || before.Status != "disabled")
 	if p.ProxyID != nil {
 		bindAccountProxy(id, *p.ProxyID)
 	}
@@ -339,6 +348,9 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
+	}
+	if shouldUseBrowserTransport() && (proxyChanged || disabling) {
+		browserMgr.InvalidateAccount(id, !disabling, "patched")
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }

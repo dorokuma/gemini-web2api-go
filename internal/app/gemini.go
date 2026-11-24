@@ -1150,28 +1150,15 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 		}
 		acct = a
 	} else if !anonFirstEligible(mc, len(pending) > 0, len(prompt)) {
-		if shouldUseBrowserTransport() {
-			// 策略 M1：常驻浏览器有粘性主号且它还能用时，优先继续驻留
-			// （同 cookieIdentity 的 authuser=0..9 共用同一 /app Tab），
-			// 不轻易切号——切一次就是 30s 冷却 + 清种 cookie。
-			// 传真实 mc.Upstream：strict_model 的模型级冷却按模型登记，
-			// 传空串等于把「这个模型正被该号降级冷却」的事实吞掉。
-			// Stage 1 过渡：同一函数内同样跳过 45s 短冷却/半开已认领号
-			//（stickyResidentAccountFor 内部合并 shortCoolingAccounts）。
-			acct = stickyResidentAccountFor(exclude, mc.Upstream)
+		a, s, err := pickAccountForModel(mc, exclude, fstate)
+		if err != nil {
+			return &StreamResult{}, err
 		}
-		if acct == nil {
-			a, s, err := pickAccountForModel(mc, exclude, fstate)
-			if err != nil {
-				return &StreamResult{}, err
-			}
-			acct, skip = a, s
-		}
+		acct, skip = a, s
 	}
-	// M1 驻留号路径（shouldUseBrowserTransport 且 stickyResidentAccountFor 命中）跳过了
-	// pickAccountForModel，skip 里没有 strict_model/短冷却的冷却集合——后面 XSRF 换号走
+	// skip 里要含 strict_model/短冷却的冷却集合——后面 XSRF 换号走
 	// pickCookieAccountExcept(skip) 会把正在冷却的号挑回来，Bound 内层换号也一样。
-	// 统一在挑号分支结束后把冷却并进 skip；pickAccountForModel 已经并过一次的是幂等重并。
+	// pickAccountForModel 已经并过一次的是幂等重并。
 	if rtCfg().StrictModel && mc.Upstream != "" {
 		cooling, _ := coolingAccounts(mc)
 		for id := range cooling {
@@ -1256,9 +1243,9 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 			busy[acct.ID] = true
 			// 换号前释放旧号的半开探测位（v2.2 §5：Bound 切走旧 acct 立即释放）。
 			releaseAccountProbeIfMatch(acct.ID, fstate.reqID)
-			// M1 × strict_proxy_binding：受阻的驻留号必须并进 exclude——外层换号
-			// 重试时 stickyResidentAccountFor 读的是 exclude，只记在 skip 里它还会
-			// 把这个出不去的驻留号原样返回，重试路径就死循环了。
+			// strict_proxy_binding：受阻的号必须并进 exclude——外层换号
+			// 重试时 pickAccountForModel 读的是 exclude，只记在 skip 里它还会
+			// 把这个出不去的号原样返回，重试路径就死循环了。
 			if exclude != nil {
 				exclude[acct.ID] = true
 			}

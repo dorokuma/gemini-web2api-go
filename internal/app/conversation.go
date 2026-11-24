@@ -924,17 +924,10 @@ func runConvWithFailover(ctx context.Context, prompt string, mc ModelConfig, con
 	return res, err
 }
 
-// pickFreshConvAccount 从 callGeminiConv 抽出的首轮挑号：M1 驻留粘性优先，
-// 否则走 pickAccountForModel（带 fstate 半开探测认领）。返回 (nil, nil) 表示
-// 合法空池走匿名。
+// pickFreshConvAccount 从 callGeminiConv 抽出的首轮挑号：统一走
+// pickAccountForModel（带 fstate 半开探测认领；v6.6.0 多 Context 后
+// 不再有 M1 驻留粘性优先）。返回 (nil, nil) 表示合法空池走匿名。
 func pickFreshConvAccount(mc ModelConfig, exclude map[int64]bool, fstate *reqFailoverState) (*CookieAccount, error) {
-	if shouldUseBrowserTransport() {
-		// 策略 M1：常驻粘性主号优先（同 streamGenerateOnce）。
-		// 传真实 mc.Upstream：strict_model 模型级冷却按模型登记。
-		if a := stickyResidentAccountFor(exclude, mc.Upstream); a != nil {
-			return a, nil
-		}
-	}
 	a, _, err := pickAccountForModel(mc, exclude, fstate)
 	if err != nil {
 		return nil, err

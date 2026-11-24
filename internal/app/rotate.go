@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -104,12 +105,42 @@ func firstUsableProxyURL() string {
 // rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
 // 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
 func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
+	return rotateAccountOpts(a, false)
+}
+
+// rotateAccountOpts 是 rotateAccount 的选项版：skipIfActive=true 时若该号
+// 已有活跃 BrowserContext（或同 cookieIdentity 兄弟号活跃）直接跳过，
+// 避免双端抢刷。仅后台 rotateAllAccounts 传 true；healXSRFByRotation 与
+// Admin POST /rotate 传 false（管理/自愈动作必须真执行）。
+//
+// Cookie 串行锁：持 acctCookieLock 与 buildAccountCtx 播种 /
+// syncAccountCookiesBackCtx 写回 / updateAccountCookie 严格互斥；写库走
+// updateAccountCookieCASLocked（merged==cur 不发 UPDATE）。真实写库成功后
+// BumpAccountEpoch + 放锁 InvalidateAccount（cookie rotated）。
+func rotateAccountOpts(a CookieAccount, skipIfActive bool) (time.Duration, []string, error) {
 	proxyURL, err := rotateProxyURL(a)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	cookie := a.Cookie
+	// Cookie 串行锁内重读 cur：并发懒建 Context / 并发回写交错时按
+	// 最新库值轮转，消除重入自死锁与陈旧快照覆写。
+	unlock, err := acquireAcctCookieLock(context.Background(), a.ID)
+	if err != nil {
+		return 0, nil, err
+	}
+	cur := accountByID(a.ID)
+	if cur == nil || cur.Status != "enabled" {
+		unlock()
+		return 0, nil, fmt.Errorf("账号 #%d 已删除或停用", a.ID)
+	}
+	if skipIfActive && shouldUseBrowserTransport() &&
+		browserMgr.HasActiveAccountOrIdentity(a.ID, cookieIdentity(cur.Cookie)) {
+		unlock()
+		return defaultRotateInterval, nil, nil
+	}
+
+	cookie := cur.Cookie
 	var names []string
 	var psidtsErr, sidccErr error
 	interval := defaultRotateInterval
@@ -124,7 +155,6 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	}
 
 	if left := sidccBackoffLeft(a.ID); left > 0 {
-		// 不发请求。记成错误，只在 1PSIDTS 也没刷到时才返回，面板按钮据此不显示「保活成功」。
 		sidccErr = fmt.Errorf("SIDCC 保活被限流，%s 后再试", left.Round(time.Second))
 	} else {
 		c3, iv, n2, err := rotateSIDCC(cookie, proxyURL)
@@ -148,16 +178,22 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	}
 
 	names = uniqueKeepOrder(names)
-	if cookie != a.Cookie {
-		old := a.Cookie
-		updateAccountCookie(a.ID, cookie)
-		invalidateXSRF(old)
+	written := false
+	if cookie != cur.Cookie {
+		written = updateAccountCookieCASLocked(a.ID, cur.Cookie, cookie)
+	}
+	unlock()
+	if written {
+		invalidateXSRF(cur.Cookie)
+		if shouldUseBrowserTransport() {
+			browserMgr.BumpAccountEpoch(a.ID)
+			browserMgr.InvalidateAccount(a.ID, false, "cookie rotated")
+		}
 	}
 	if len(names) > 0 {
 		logf("[rotate] 账号 #%d 刷新了 %s", a.ID, strings.Join(names, ", "))
 	}
-	// 两条路都失败才算失败。1PSIDTS 刷到了但 iframe 页没 init，仍然是续命成功。
-	if cookie == a.Cookie && len(names) == 0 {
+	if cookie == cur.Cookie && len(names) == 0 {
 		if psidtsErr != nil {
 			return 0, nil, psidtsErr
 		}
@@ -470,24 +506,26 @@ func rotateDo(method, url string, headers map[string]string, body []byte, proxyU
 // 网络抖一下就把号标成坏的，会让它在挑号时沉底，反而伤可用性。
 func rotateAllAccounts() time.Duration {
 	next := defaultRotateInterval
-	// 浏览器模式下：当前被常驻浏览器持有的活跃账号，跳过纯 Go /RotateCookies
-	// 双端抢刷——浏览器 jar 才是权威，上游刷的 SIDCC 它都收下了，拿 DB 旧串
-	// 去刷等于两边各刷一份、互相覆盖。改为把 jar 当前值写回 DB。
-	var residentID int64
+	// v6.6.0 多 Context：开头先淘汰空闲超 30m 的备号槽交回 Go rotateAccount
+	// 保活；再取活跃槽集合跳过活跃号与同 cookieIdentity 兄弟号（防双端抢刷）。
+	var activeIDs map[int64]bool
+	var activeIdentSet map[string]bool
 	if shouldUseBrowserTransport() {
-		browserMgr.mu.Lock()
-		residentID = browserMgr.seed.AccountID
-		browserMgr.mu.Unlock()
+		browserMgr.EvictIdleContexts()
+		activeIDs, activeIdentSet = browserMgr.ActiveAccountsAndIdentities()
 	}
 	for _, a := range accountList() {
 		if a.Status != "enabled" {
 			continue
 		}
-		if residentID > 0 && a.ID == residentID {
-			syncResidentCookiesBack()
+		if activeIDs[a.ID] {
+			browserMgr.SyncAccountCookiesBack(a.ID, true)
 			continue
 		}
-		iv, _, err := rotateAccount(a)
+		if ident := cookieIdentity(a.Cookie); ident != "|" && activeIdentSet[ident] {
+			continue // 同 Google 会话的兄弟 authuser 正在活跃 Context 中驻留
+		}
+		iv, _, err := rotateAccountOpts(a, true)
 		if err != nil {
 			logf("[rotate] 账号 #%d 保活失败: %v", a.ID, err)
 			continue

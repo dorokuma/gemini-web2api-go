@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -948,18 +949,31 @@ func cookieIdentity(cookie string) string {
 // 带了另一个账号的 SID），照单全收就等于把 A 号的凭据写进 B 号那一行。之后这个号
 // 在面板上显示的还是原来的标签，实际发出去的却是别人的会话，而且**完全静默**。
 // 身份对不上就不写，宁可让这次刷新白费。
+//
+// v6.6.0：串行经 acquireAcctCookieLock（L1）与 rotateAccountOpts / 浏览器
+// buildAccountCtx 播种 / syncAccountCookiesBackCtx 写回严格互斥；写库走
+// updateAccountCookieCASLocked（merged==cur 不发 UPDATE，变化时 CAS 条件更新）。
+// 真实写库成功后 BumpAccountEpoch + 放锁 InvalidateAccount（`cookie rotated`）——
+// 无变化快路径绝不空转误杀健康槽。
 func updateAccountCookie(id int64, cookie string) {
 	if id <= 0 || cookie == "" {
 		return
 	}
-	var cur string
-	if err := getDB().QueryRow(`SELECT cookie FROM accounts WHERE id=?`, id).Scan(&cur); err == nil {
-		if got, want := cookieIdentity(cookie), cookieIdentity(cur); got != want {
-			logf("[cookie] 账号 #%d 的刷新结果身份对不上，已丢弃不写回", id)
-			return
-		}
+	unlock, err := acquireAcctCookieLock(context.Background(), id)
+	if err != nil {
+		return
 	}
-	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`, cookie, id)
+	var cur string
+	if err := getDB().QueryRow(`SELECT cookie FROM accounts WHERE id=?`, id).Scan(&cur); err != nil {
+		unlock()
+		return
+	}
+	written := updateAccountCookieCASLocked(id, cur, cookie)
+	unlock()
+	if written && cookie != cur && shouldUseBrowserTransport() {
+		browserMgr.BumpAccountEpoch(id)
+		browserMgr.InvalidateAccount(id, false, "cookie rotated")
+	}
 }
 
 // xsrfErrBlamesCookie 判断取 XSRF（抓 /app）失败是不是 cookie 的错。
