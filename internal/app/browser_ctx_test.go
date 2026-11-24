@@ -600,9 +600,12 @@ drained:
 }
 
 // TestBrowserDrainWaitersMergeOnExitChange 复核 MF-8：同登录槽非严格模式
-// 换出口，inFlight>0 时跨出口等待者登记 drainWaiters；当旧槽被
-// errExitChanged 摘除时，等待者经生产 acquireWaitResult 的 waitDrain
-// 分支清自身登记后汇入新槽（retry=true，err=nil），不返回终态错。
+// 换出口，inFlight>0 时跨出口等待者登记 drainWaiters 并阻塞在 drainWait；
+// 旧槽被 errExitChanged 摘除时，等待者必须汇入替换 winner 新建的 proxyB 槽
+// 而不是返回终态 errExitChanged。全部经生产外部入口 m.acquireAccountCtx
+// 驱动（d251051 同样存在该入口）：旧实现唤醒后见 ac.disposed 直接返回
+// ac.lastBuildErr=errExitChanged → 等待者 FAIL；修复后 waitDrain +
+// errExitChanged 分支清登记并汇入新槽 → PASS。
 func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -622,7 +625,7 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	acct := accountByID(id)
 	acct.ProxyID = 0 // 未绑定，非锁直连
 
-	// 就绪登录槽：出口 proxyOld、inFlight=1（有在飞租约）。
+	// 就绪登录槽：出口 proxyA、inFlight=1（有在飞租约）。
 	key := slotKeyForAccount(acct, "http://proxy-old:8080", false)
 	ac := &accountBrowserCtx{
 		key:              key,
@@ -643,60 +646,84 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	m.ctxs[key] = ac
 	m.mu.Unlock()
 
-	// 跨出口等待者（换到 proxyNew）：inFlight>0 → 登记 drainWaiters + 等
-	// drainWait（生产 acquirePlanLocked drain 分支）。
-	var drain acquireDrainReg
-	poolSnap := snapshotProxyPool()
-	m.mu.Lock()
-	waitCh, kind, proceed, snap := m.acquirePlanLocked(ac, acct,
-		"http://proxy-new:8080", false, false, false, poolSnap, &drain)
-	stopCh := m.stopCh
-	m.mu.Unlock()
-	if snap.ac != nil || proceed {
-		t.Fatalf("acquirePlanLocked on busy slot: snap=%+v proceed=%v, want drain-wait", snap, proceed)
-	}
-	if kind != waitDrain || waitCh == nil {
-		t.Fatalf("acquirePlanLocked kind=%v waitCh=%v, want waitDrain non-nil", kind, waitCh)
-	}
-	if !drain.registered || drain.target != ac {
-		t.Fatal("cross-exit waiter did not register drainWaiters")
-	}
-
-	// 等待协程：真实调 acquireWaitResult 的 waitDrain 分支（锁外 select）。
+	// 跨出口等待者 W2：换到 proxyNew，inFlight>0 → 经生产 acquireAccountCtx
+	// 登记 drainWaiters 并阻塞在 drainWait（确定性：等 drainWaiters==1 才
+	// 继续，不用 sleep 猜时机）。
 	type waitRet struct {
-		retry bool
-		err   error
+		ac2 *accountBrowserCtx
+		err error
 	}
-	retCh := make(chan waitRet, 1)
+	w2 := make(chan waitRet, 1)
 	go func() {
-		_, _, _, _, retry, werr := m.acquireWaitResult(
-			context.Background(), ac, waitCh, stopCh, waitDrain, &drain)
-		retCh <- waitRet{retry: retry, err: werr}
+		_, a2, _, _, e2 := m.acquireAccountCtx(
+			context.Background(), acct, "http://proxy-new:8080", false, true)
+		w2 <- waitRet{ac2: a2, err: e2}
 	}()
-	time.Sleep(50 * time.Millisecond) // 让等待者先阻塞在 drainWait
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		n := ac.drainWaiters
+		m.mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		select {
+		case r := <-w2:
+			t.Fatalf("W2 exited early without registering drain: %+v", r)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("W2 did not register drainWaiters within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
 
-	// 旧槽被 errExitChanged 摘除（替换 winner）：detach 关 drainWait 唤醒
-	// 等待者，acquireWaitResult 见 disposed+errExitChanged → 汇入新槽
-	//（清登记 + retry=true）。
+	// 归还 ac 的在飞租约：等价 acquireReleaseFn 的 inFlight--，但不合入
+	// drainWait 的 close——让 W2 保持阻塞在 drainWait 上直到旧槽被摘除，
+	// 摘除时刻 ac.disposed 已成立，W2 在旧代码上必然命中 disposed+
+	// errExitChanged 终态分支（确定性红灯，无唤醒时序侥幸）。
 	m.mu.Lock()
-	won, _ := m.detachCtxLocked(ac, errExitChanged)
+	ac.inFlight--
 	m.mu.Unlock()
-	if !won {
-		t.Fatal("detachCtxLocked did not win for exit-change replacement")
-	}
+
+	// 替换 winner W1：真实 acquireAccountCtx 走唯一替换分支——inFlight==0
+	// + 跨出口 → detachSnapLocked(ac, errExitChanged) 摘除旧槽后认领新建
+	// proxyB 槽（buildAccountCtx 经 fakeCDPServer 完整走通）。
+	w1 := make(chan waitRet, 1)
+	go func() {
+		_, a1, _, _, e1 := m.acquireAccountCtx(
+			context.Background(), acct, "http://proxy-new:8080", false, true)
+		w1 <- waitRet{ac2: a1, err: e1}
+	}()
+
+	var r1 waitRet
 	select {
-	case ret := <-retCh:
-		if !ret.retry {
-			t.Fatalf("acquireWaitResult retry=false err=%v, want retry=true (merge into new slot)", ret.err)
-		}
-		if ret.err != nil {
-			t.Fatalf("acquireWaitResult err=%v, want nil on exit-change merge", ret.err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("acquireWaitResult did not return after exit-change detach")
+	case r1 = <-w1:
+	case <-time.After(15 * time.Second):
+		t.Fatal("W1 (replacement winner) did not return")
 	}
-	if drain.registered {
-		t.Fatal("drain registration not cleared after merge-to-new-slot")
+	if r1.err != nil {
+		t.Fatalf("W1 should win the exit-change replacement, got err=%v", r1.err)
+	}
+	if r1.ac2 == nil || r1.ac2 == ac {
+		t.Fatalf("W1 must publish a NEW slot, got ac=%p (old=%p)", r1.ac2, ac)
+	}
+	if r1.ac2.proxyURL != "http://proxy-new:8080" {
+		t.Fatalf("W1 slot exit=%q, want http://proxy-new:8080", r1.ac2.proxyURL)
+	}
+
+	// W2 汇入 W1 新建的 proxyB 槽：旧代码在 drainWait 唤醒后见
+	// ac.disposed+errExitChanged 直接返回终态错；修复后清登记重查汇入新槽。
+	select {
+	case r2 := <-w2:
+		if r2.err != nil {
+			t.Fatalf("W2 must merge into W1's new slot, got err=%v (errExitChanged leak?)", r2.err)
+		}
+		if r2.ac2 != r1.ac2 {
+			t.Fatalf("W2 must land on W1's new slot %p, got %p", r1.ac2, r2.ac2)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("W2 did not return after exit-change detach")
 	}
 }
 

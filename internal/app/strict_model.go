@@ -82,7 +82,9 @@ func coolingAccounts(mc ModelConfig) (map[int64]bool, time.Duration) {
 // 返回的 skip 是三者合集，换号重取时要接着用它。
 //
 // 错误契约（v6.6.0 防雪崩，闭合 Oracle M4）：
-//   - !hasCookie()（库内无任何 enabled 账号）→ (nil, skip, nil)，合法空池走匿名；
+//   - len(exclude)==0 && !hasCookie()（库内无任何 enabled 账号）→
+//     (nil, skip, nil)，合法空池走匿名（exclude 非空优先，末号在上一跳
+//     刚被 autoDisableIfDead 停用时绝不静默匿名，R3-MF-1）；
 //   - hasCookie() && len(exclude)==0（首跳入口全池冷却）→
 //     存在未被 modelCooling 覆盖但处于 shortCooling 的启用号时报
 //     *AccountCooldownError{RetryAfter: shortSoonest}，否则报
@@ -139,12 +141,13 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool, fstate *reqFail
 // 控制圈复杂度）。hasCookie() 判库内有无 enabled 账号。
 func resolvePoolExhaustedErr(mc ModelConfig, exclude map[int64]bool,
 	shortCooling, modelCooling map[int64]bool, modelSoonest, shortSoonest time.Duration) error {
-	if !hasCookie() {
-		return nil // 合法空池：调用方按匿名处理
-	}
 	if len(exclude) > 0 {
-		// 跳槽选备号无号可挑：绝不退匿名。
+		// 跳槽选备号无号可挑（含末号在 try=0 刚被 autoDisableIfDead 停用）：
+		// 绝不静默退匿名——FallbackAnon=false / 带附件 / 多轮的守卫在外层。
 		return &noEligibleAccountError{modelRetryAfter: modelSoonest, shortRetryAfter: shortSoonest}
+	}
+	if !hasCookie() {
+		return nil // 合法空池（首跳 len(exclude)==0）：调用方按匿名处理
 	}
 	// 首跳入口全池冷却：只要有一个号的拦路原因是 45s 短冷却（而非模型降级
 	// 或调用方显式 exclude），报 accounts_cooling_down 更诚实——解冻以秒计，

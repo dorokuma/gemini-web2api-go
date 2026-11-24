@@ -771,6 +771,11 @@ func wireTestBrowserBridge(t *testing.T, srv *fakeCDPServer, bridge *browserProx
 	client := newCDPClient(conn)
 
 	m := browserMgr
+	// 默认把杀进程钩子桩为 no-op：m.proc 填的是测试进程自身 PID/PGID，任何
+	// 调 m.Stop/stopImpl 的用例如果没桩住，会向测试进程自身进程组发
+	// SIGTERM（R3-SF-2.4）。需要观测 killProcGroupFn 的用例可再局部覆盖。
+	oldKill := killProcGroupFn
+	killProcGroupFn = func(pid, pgid int, d time.Duration) {}
 	m.mu.Lock()
 	oldProc, oldClient := m.proc, m.client
 	oldStarted, oldStarting, oldStartErr := m.started, m.starting, m.startErr
@@ -827,6 +832,7 @@ func wireTestBrowserBridge(t *testing.T, srv *fakeCDPServer, bridge *browserProx
 	return func() {
 		client.Close()
 		conn.Close()
+		killProcGroupFn = oldKill
 		m.mu.Lock()
 		m.proc, m.client = oldProc, oldClient
 		m.started, m.starting, m.startErr = oldStarted, oldStarting, oldStartErr

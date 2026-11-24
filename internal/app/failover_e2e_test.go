@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -168,8 +170,11 @@ func TestWithFilesTwoAccountPoisonExempt(t *testing.T) {
 // 未发生过故障跳槽），但 faultHops>=1 后 C3 禁止再跳第 3 号。
 func TestWithFilesC1ThenC3StopsAtSecondAccount(t *testing.T) {
 	resetFailoverE2E(t)
+	rtMu.Lock()
+	rtVal.StrictModelCooldownMin = 300 // markDowngraded 需要冷却分钟数 >0
+	rtMu.Unlock()
 	a1 := addTestAccount(t, "mix-a")
-	_ = addTestAccount(t, "mix-b") // 备号（脚本默认 C3）
+	a2 := addTestAccount(t, "mix-b") // 备号（脚本默认 C3）
 	a3 := addTestAccount(t, "mix-c")
 	calls := stubOncePickReal(t, func(id int64) (*StreamResult, error) {
 		switch id {
@@ -192,6 +197,14 @@ func TestWithFilesC1ThenC3StopsAtSecondAccount(t *testing.T) {
 		if id == a3 {
 			t.Fatalf("faultHops>=1 后 C3 禁止再跳第 3 号，a3 不该被试到：calls=%v", *calls)
 		}
+	}
+	// R2-MF-1 终结路径降级登记（R3-SF-1 一并覆盖）：a2 是混合链第 2 号，
+	// faultHops>=1 时 tryAdvanceHop(classModelDowngrade) 返 false 终结，
+	// 但终结号同样必须记入模型冷却——e1c2cbe 只在 hop-true 分支登记，
+	// a2 漏记必然 FAIL。
+	cooling, _ := coolingAccounts(mc)
+	if !cooling[a2] {
+		t.Fatalf("混合链终结号 a2 必须 markDowngraded：cooling=%v", cooling)
 	}
 }
 
@@ -224,7 +237,7 @@ func TestWithFilesFallbackAnonOnAuthFail(t *testing.T) {
 // 唯一账号鉴权失败后，tryAdvanceHop 消耗 faultHops 允许跳号，但
 // pickAccountForModel 因 exclude 非空无备号返回 noEligibleAccountError；
 // 终结路径必须同样落外层 runAnonFallback 匿名兜底，而不是直接把 C4a
-// 错误丢给客户端。同时断言终结路径的 C3 降级号被 markDowngraded（R2-MF-1）。
+// 错误丢给客户端。
 func TestWithFilesFallbackAnonSingleAccountPool(t *testing.T) {
 	resetFailoverE2E(t)
 	a1 := addTestAccount(t, "anon-single")
@@ -252,10 +265,14 @@ func TestWithFilesFallbackAnonSingleAccountPool(t *testing.T) {
 	}
 }
 
-// 端到端：终结路径的 C3 降级号必须登记 markDowngraded（R2-MF-1）——
-// 双号池两个号都返回 C3 降级：第 1 跳降级消耗 downgradeTry 跳第 2 号，
-// 第 2 号再降级时 tryAdvanceHop 返 false 终结，但终结号同样必须记入
-// 模型冷却（否则下个请求还会挑中它再降级一次）。
+// 端到端：终结路径的 C3 降级号必须登记 markDowngraded（R2-MF-1 / R3-SF-1）——
+// 三号池三个号都返回 C3 降级：第 1、2 跳降级消耗 downgradeTry 跳号，第 3 号
+// （downgradeTry=2, 2+1>=maxCookieTries）tryAdvanceHop 返 false 终结——终结号
+// 同样必须记入模型冷却（否则下个请求还会挑中它再降级一次）。修复前
+// （e1c2cbe）markDowngraded 只在 tryAdvanceHop 返回 true 的分支里调，a3 漏记
+// 冷却必然 FAIL。末尾再发第二条请求断言全池冷却后的降级错带回
+// RetryAfter>0（R2-SF-2 的 nee.retryAfter() 回填：nee 的最早解冻取自
+// model/short 冷却集合，纯首跳降级错本身不携带）。
 func TestWithFilesTerminalDowngradeMarksCooldown(t *testing.T) {
 	resetFailoverE2E(t)
 	rtMu.Lock()
@@ -263,6 +280,7 @@ func TestWithFilesTerminalDowngradeMarksCooldown(t *testing.T) {
 	rtMu.Unlock()
 	a1 := addTestAccount(t, "dg-a")
 	a2 := addTestAccount(t, "dg-b")
+	a3 := addTestAccount(t, "dg-c")
 	calls := stubOncePickReal(t, func(id int64) (*StreamResult, error) {
 		return &StreamResult{AccountID: id},
 			&ModelDowngradedError{Requested: "gemini-3.6-flash", Reported: "flash-lite", AccountID: id}
@@ -271,19 +289,34 @@ func TestWithFilesTerminalDowngradeMarksCooldown(t *testing.T) {
 	_, err := streamGenerateWithFilesOpts(context.Background(), "hi",
 		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
 	if err == nil {
-		t.Fatal("双号都 C3 降级应返回降级错误")
+		t.Fatal("三号都 C3 降级应返回降级错误")
 	}
 	var mde *ModelDowngradedError
 	if !errors.As(err, &mde) {
 		t.Fatalf("终态应报 ModelDowngradedError，得到 %v", err)
 	}
-	// 两个号都被试到且都已确认配额耗尽：终结号 a2 同样必须进冷却。
-	if len(*calls) != 2 {
-		t.Fatalf("纯 C3 链应跳第 2 号，calls=%v", *calls)
+	// 三个号都被试到且都已确认配额耗尽：终结号 a3 同样必须进冷却。
+	if len(*calls) != 3 {
+		t.Fatalf("纯 C3 链应试满 3 号（降级预算独立于故障预算），calls=%v", *calls)
 	}
 	cooling, _ := coolingAccounts(mc)
-	if !cooling[a1] || !cooling[a2] {
-		t.Fatalf("终结路径降级号必须 markDowngraded：cooling=%v (want a1+a2)", cooling)
+	if !cooling[a1] || !cooling[a2] || !cooling[a3] {
+		t.Fatalf("终结路径降级号必须 markDowngraded：cooling=%v (want a1+a2+a3)", cooling)
+	}
+
+	// R2-SF-2 / Reviewer R3 #2：全池已冷却后再来一条请求——终结回传的
+	// 降级错误必须回填最早解冻的 Retry-After。HEAD 上三个号都在 model
+	// 冷却，pick 直接返回 ModelDowngradedError{RetryAfter: modelSoonest≈5h}；
+	// e1c2cbe 上 a3 未登记冷却会被再次挑中降级，随后 nee 结算走 prevErr
+	// 短路不回填，RetryAfter 恒 0 必然 FAIL。
+	_, err2 := streamGenerateWithFilesOpts(context.Background(), "hi",
+		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
+	var mde2 *ModelDowngradedError
+	if !errors.As(err2, &mde2) {
+		t.Fatalf("全池冷却后应报 ModelDowngradedError，得到 %v", err2)
+	}
+	if mde2.RetryAfter <= 0 {
+		t.Fatalf("全池降级终结错误必须回填 RetryAfter>0，得到 %v", mde2.RetryAfter)
 	}
 }
 
@@ -497,5 +530,157 @@ func TestPriorityBoundSwitchContract(t *testing.T) {
 	}
 	if len(*calls) != 2 || (*calls)[0] != main {
 		t.Fatalf("主号应先被挑中再 Bound 换备号，calls=%v", *calls)
+	}
+}
+
+// 端到端：R3-MF-1——单号池末号在 try=0 遇 C4a 被 autoDisableIfDead 停用后，
+// FallbackAnon=false 时绝不能静默走第 2 跳匿名请求。8b2b2d3 上
+// resolvePoolExhaustedErr 先判 !hasCookie() 返回 (nil,nil)，pickAccountForModel
+// 把「跳槽期无号可挑」误报成「合法空池」→ 外层以匿名身份发第 2 跳（本测试桩
+// 把它如实观测为 AccountID==0 的匿名结果，与生产 streamGenerateOnceOpts 拿到
+// (nil,nil) 后的真实路径同构）；本提交将 len(exclude)>0 提前后返回
+// *noEligibleAccountError，终结路径原样回传上一跳真实的 C4a 错误。
+func TestWithFilesAutoDisabledLastAccountRespectsFallbackAnonFalse(t *testing.T) {
+	resetFailoverE2E(t)
+	rtMu.Lock()
+	rtVal.FallbackAnon = false // 显式默认：任何情况下绝不匿名兜底
+	rtMu.Unlock()
+	a1 := addTestAccount(t, "auto-disabled-single")
+
+	// 桩与 stubOncePickReal 同形（挑号走真实 pickAccountForModel，吃
+	// exclude/冷却守卫）；差异只在「挑不到号且 err==nil」时按生产语义返回
+	// 匿名结果（AccountID=0）——8b2b2d3 上 streamGenerateOnceOpts 拿到
+	// (nil,nil) 后真实会走的静默匿名路径，用它直接观测第 2 跳是否匿名。
+	authSentinel := errors.New("no SNlM0e token")
+	got := &[]int64{}
+	old := runStreamGenerateOnce
+	runStreamGenerateOnce = func(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig,
+		pending []pendingUpload, onDelta, onReasoning func(string), stopWhen func(string) bool,
+		opts streamOnceOpts) (*StreamResult, error) {
+		a, _, perr := pickAccountForModel(mc, opts.exclude, opts.fstate)
+		if perr != nil {
+			return &StreamResult{}, perr
+		}
+		if a == nil {
+			// (nil, nil)：生产会静默以匿名身份发本跳——如实建模成匿名结果。
+			return &StreamResult{Raw: conversationTestRaw(t, "anon-2nd-hop"), AccountID: 0}, nil
+		}
+		*got = append(*got, a.ID)
+		// a1 第 3 次鉴权失败达到 fail_count 阈值：autoDisableIfDead 的落库
+		// 效果即 status='disabled'（等价标记，不经网络路径）。
+		_ = accountSetStatus(a.ID, "disabled")
+		return &StreamResult{AccountID: a.ID}, authSentinel
+	}
+	t.Cleanup(func() { runStreamGenerateOnce = old })
+
+	mc := Models["gemini-3.6-flash"]
+	res, err := streamGenerateWithFilesOpts(context.Background(), "hi",
+		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
+	// 必须原样回传上一跳真实的 C4a 错误，绝不返回匿名成功（AccountID=0）。
+	if err == nil || (res != nil && res.AccountID == 0) {
+		t.Fatalf("FallbackAnon=false 且末号被自动停用后绝不能匿名外发：res=%+v err=%v", res, err)
+	}
+	if !errors.Is(err, authSentinel) {
+		t.Fatalf("终结路径应回传上一跳真实的 C4a 错误，得到 %v", err)
+	}
+	if len(*got) != 1 || (*got)[0] != a1 {
+		t.Fatalf("只有 a1 应被真实挑中一次，calls=%v", *got)
+	}
+}
+
+// 端到端：R2-SF-1——xsrfHealOrAdvance 在 singleAccountTry=true 下遇
+// out.boundErr（XSRF 轮转期间号被并发改绑到另一启用出口）必须立即上抛
+// *RateLimitError{Bound:true} 给外层，且先释放本请求在 a1 上占着的半开
+// 探测位；绝不在内层偷换到 a2（内层换号会带着陈旧出口槽外发）。
+// e1c2cbe 上该分支缺 singleAccountTry 上抛与探测位释放：返回 out.next=a2
+// 让内层就地换号（a2 归属进最终错误）且 probeInFlight 残留 → FAIL；
+// 最新 HEAD 立即上抛 Bound 冲突并放探测位 → PASS。
+func TestAcquireXSRFHealExitConflictReleasesProbeAndBubbles(t *testing.T) {
+	resetFailoverE2E(t)
+	pA, pB := withTwoProxies(t, true) // strict_proxy_binding：冲突仲裁走 claimAccountProxy
+	rtMu.Lock()
+	rtVal.FallbackAnon = false // 内层/外层都禁止匿名兜底，错必须原样上抛
+	rtMu.Unlock()
+
+	a1 := addTestAccount(t, "heal-conflict-a")
+	a2 := addTestAccount(t, "heal-conflict-b")
+	// a1/a2 同绑 A（picked 出口）：e1c2cbe 的内层换号会跳过 strictBoundElsewhere
+	// 过滤真实挑出 a2——把「偷换号」从不可能变成旧代码的真实可达路径。
+	bindAccountProxy(a1, pA)
+	bindAccountProxy(a2, pA)
+
+	// a1 置半开探测占用态（本请求 fstate.reqID 认领）+ 冷却刚到期。
+	fstate := newReqFailoverState(false)
+	defer releaseReqProbes(fstate.reqID)
+	accountHealthMu.Lock()
+	accountHealth[a1] = &accountShortHealth{
+		cooldownUntil:  time.Now().Add(-time.Second),
+		probeInFlight:  true,
+		probeReqID:     fstate.reqID,
+		probeStartedAt: time.Now(),
+	}
+	accountHealthMu.Unlock()
+
+	// 把出口 A 的 stdlibClientCache 换成假 RoundTripper：
+	//   - /app 回 200 空页 → getXSRF 报 no SNlM0e 失败进 heal 路径；
+	//   - /app 命中的瞬间把 a1 改绑到另一启用出口 B——模拟管理员在
+	//     挑号之后、XSRF 轮转/重取之间的改绑窗口（heal 的冲突复核必然命中，
+	//     而入口 resolveXSRFConflict 时 a1 仍绑 A 不会提前冲突）；
+	//   - 其余路径（/RotateCookiesPage 等）一律 dial refused → 轮转失败。
+	timeout := rtCfg().RequestTimeout
+	for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+		stdlibClientCache.Store("http://127.0.0.1:1"+suf, &http.Client{Transport: roundTripperFunc(
+			func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/app" {
+					bindAccountProxy(a1, pB)           // 改绑窗口：a1 被绑走 B
+					return respJSON(req, 200, ""), nil // 空页：无 SNlM0e
+				}
+				return nil, errors.New("dial refused")
+			})})
+	}
+	defer func() {
+		for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+			stdlibClientCache.Delete("http://127.0.0.1:1" + suf)
+		}
+	}()
+
+	xs := &xsrfTokenCtx{
+		acct:             accountByID(a1),
+		skip:             map[int64]bool{},
+		picked:           Proxy{ID: pA, URL: "http://127.0.0.1:1"},
+		proxyURL:         "http://127.0.0.1:1",
+		mc:               Models["gemini-3.6-flash"],
+		fstate:           fstate,
+		singleAccountTry: true,
+	}
+	var attrErr error
+	attrib := func(err error) (*StreamResult, error) {
+		attrErr = err
+		return &StreamResult{AccountID: xs.cookieID}, err
+	}
+
+	res, rerr, done := acquireXSRFToken(context.Background(), xs, attrib)
+	if !done {
+		t.Fatal("出口冲突应终局返回 done=true")
+	}
+	var rle *RateLimitError
+	if !errors.As(rerr, &rle) || !rle.Bound || rle.ProxyID != pB {
+		t.Fatalf("冲突必须上抛 *RateLimitError{Bound:true, ProxyID=%d}，得到 err=%v res=%+v", pB, rerr, res)
+	}
+	// 上抛错误必须经 attrib 原样返回 Bound 冲突（与返回值同源）。
+	if !errors.Is(attrErr, rerr) {
+		t.Fatalf("上抛错误应经 attrib 原样返回 Bound 冲突：attrErr=%v rerr=%v", attrErr, rerr)
+	}
+	// 内层绝没偷换到 a2：e1c2cbe 的内层换号路径生效时 next=a2 会继续走
+	// getXSRF 失败并把归属落在 a2——这里 a2 的 ID 绝不能成为最终归属。
+	if res != nil && res.AccountID == a2 {
+		t.Fatalf("singleAccountTry 下绝不能在内层偷换到 a2：res=%+v", res)
+	}
+	// a1 的半开探测位必须已释放（切走旧号先放探测位）。
+	accountHealthMu.Lock()
+	st := accountHealth[a1]
+	accountHealthMu.Unlock()
+	if st != nil && st.probeInFlight {
+		t.Fatalf("a1 的探测位在冲突上抛后必须已释放：st=%+v", st)
 	}
 }
