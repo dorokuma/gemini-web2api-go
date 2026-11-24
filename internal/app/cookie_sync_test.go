@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -296,5 +297,126 @@ func TestAccountSyncManualDisableNotReenabled(t *testing.T) {
 	}
 	if a := accountByID(r3.ID); a.Status != "enabled" || a.AutoDisabled {
 		t.Fatalf("自动停用的号收到新 cookie 应恢复 enabled：%+v", a)
+	}
+}
+
+// R2 丢失更新回归（并发探针）：accountSync 的状态恢复判定已下推数据库原子
+// 条件 UPDATE（不再拿 L1 快照里的 cur.Status 盲写回库）。本用例多轮交错
+// 「同步推新 cookie」与「accountSetStatus 手动停用/启用」，断言管理员的
+// 手动决定绝不落在同步写的中间被覆盖：每轮结束后状态必须等于管理员最后
+// 拍板的目标值。修复前（快照盲写 status）只要交错一次就会静默撤销手动
+// 停用——本测试串行跑不保证必现，故用循环加压并在 -race -count=5 下验证。
+func TestAccountSyncConcurrentManualDisableNotLost(t *testing.T) {
+	resetSeedState(t)
+	vBase := "SID=a; SAPISID=cd; __Secure-1PSID=cd; OSID=o"
+
+	r, err := accountSync("cd@gmail.com", 0, vBase+"; __Secure-1PSIDTS=t0")
+	if err != nil || r.Action != "added" {
+		t.Fatalf("前置新建失败：%+v %v", r, err)
+	}
+	id := r.ID
+
+	const rounds = 64
+	// 两个方向交错：偶数轮管理员停用（同步绝不能恢复），奇数轮管理员启用。
+	for round := 0; round < rounds; round++ {
+		target := "disabled"
+		if round%2 == 1 {
+			target = "enabled"
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func(round int) {
+			defer wg.Done()
+			// 推不同 1PSIDTS 保证走 UPDATE 路径（同会话认回同一行）。
+			v := fmt.Sprintf("%s; __Secure-1PSIDTS=t%d", vBase, round+1)
+			if _, err := accountSync("cd@gmail.com", 0, v); err != nil {
+				t.Errorf("accountSync 报错：%v", err)
+			}
+		}(round)
+		go func(target string) {
+			defer wg.Done()
+			if err := accountSetStatus(id, target); err != nil {
+				t.Errorf("accountSetStatus 报错：%v", err)
+			}
+		}(target)
+		wg.Wait()
+
+		a := accountByID(id)
+		if a == nil {
+			t.Fatalf("轮 %d：账号不见了", round)
+		}
+		if a.Status != target {
+			t.Fatalf("轮 %d：管理员手动设为 %q 却被同步覆盖，现值 %q", round, target, a.Status)
+		}
+		// auto_disabled 恒应为 0：手动 setStatus 清标记；同步的条件 UPDATE
+		// 只在 auto_disabled=1 时才动，而本用例从未产生自动停用。
+		if a.AutoDisabled {
+			t.Fatalf("轮 %d：本用例不该出现 auto_disabled=1：%+v", round, a)
+		}
+	}
+}
+
+// R2 丢失更新回归（反向，自动停用交错）：accountSync 恢复自动停用依赖
+// 「此刻仍 status='disabled' AND auto_disabled=1」的原子条件。交错期间
+// 管理员把自动停用改成手动停用（accountSetStatus 清 auto_disabled）时，
+// 同步的条件 UPDATE 必须 0 行命中、绝不借自动停用名义把手动停用启用回来。
+func TestAccountSyncConcurrentManualEnableNotLost(t *testing.T) {
+	resetSeedState(t)
+	vBase := "SID=a; SAPISID=ce; __Secure-1PSID=ce; OSID=o"
+
+	r, err := accountSync("ce@gmail.com", 0, vBase+"; __Secure-1PSIDTS=t0")
+	if err != nil || r.Action != "added" {
+		t.Fatalf("前置新建失败：%+v %v", r, err)
+	}
+	id := r.ID
+
+	// 先造成真自动停用（auto_disabled=1）。
+	for i := 0; i < maxCookieAuthFailures; i++ {
+		markAccountResult(id, false, "auth fail")
+	}
+	if a := accountByID(id); a.Status != "disabled" || !a.AutoDisabled {
+		t.Fatalf("应自动停用：%+v", a)
+	}
+
+	// 交错：管理员把自动停用翻成手动停用（setStatus disabled → auto_disabled=0）
+	// 与同步推新 cookie 竞争。无论谁先谁后，终态都必须是 disabled 且
+	// auto_disabled=0——同步的条件 UPDATE 看到 auto_disabled=0 就必须放过。
+	const rounds = 64
+	for round := 0; round < rounds; round++ {
+		// 每轮重置回「自动停用」起点，保证交错窗口每轮都成立。
+		if _, err := getDB().Exec(
+			`UPDATE accounts SET status='disabled', auto_disabled=1 WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func(round int) {
+			defer wg.Done()
+			v := fmt.Sprintf("%s; __Secure-1PSIDTS=t%d", vBase, round+1)
+			if _, err := accountSync("ce@gmail.com", 0, v); err != nil {
+				t.Errorf("accountSync 报错：%v", err)
+			}
+		}(round)
+		go func() {
+			defer wg.Done()
+			if err := accountSetStatus(id, "disabled"); err != nil {
+				t.Errorf("accountSetStatus 报错：%v", err)
+			}
+		}()
+		wg.Wait()
+
+		a := accountByID(id)
+		if a == nil {
+			t.Fatalf("轮 %d：账号不见了", round)
+		}
+		// 合法的终态只有两种：
+		//   a) 管理员 setStatus 先到 → auto_disabled=0，同步条件 UPDATE 不命中
+		//      → status='disabled', auto_disabled=0（手动停用被尊重）；
+		//   b) 同步条件 UPDATE 先到 → status='enabled',auto_disabled=0 → 管理员
+		//      setStatus('disabled') 再覆盖 → 同样是 disabled, auto_disabled=0。
+		// 唯一非法终态是 enabled：意味着同步借「自动停用」名义越过了手动停用。
+		if a.Status != "disabled" || a.AutoDisabled {
+			t.Fatalf("轮 %d：手动停用被同步越权恢复：%+v", round, a)
+		}
 	}
 }

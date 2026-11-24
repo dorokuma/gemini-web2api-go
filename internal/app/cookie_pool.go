@@ -177,6 +177,22 @@ func accountInsert(label, cookie, note string) (int64, error) {
 		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix())
 }
 
+// accountInsertWithAuthUser 一步建号：与 accountInsert 相同校验，但单条
+// INSERT 直接带上 authuser——消除「先按 /u/0 插入再补序号」的半成品窗口
+// （R2 consider），窗口内新行可能被挑号器按 /u/0 挑中。
+func accountInsertWithAuthUser(label, cookie, note string, authuser int) (int64, error) {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return 0, fmt.Errorf("cookie 不能为空")
+	}
+	if authuser < 0 || authuser > maxAuthUser {
+		return 0, fmt.Errorf("账号序号要在 0..%d 之间，收到 %d", maxAuthUser, authuser)
+	}
+	return insertID(
+		`INSERT INTO accounts(label, cookie, status, note, created_at, authuser) VALUES (?,?,?,?,?,?)`,
+		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix(), authuser)
+}
+
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
@@ -1147,16 +1163,12 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 		accountSyncCreateMu.Lock()
 		hitID = findSyncTargetAccountID(authuser, ident, label)
 		if hitID == 0 {
-			id, err := accountInsert(label, c, "由浏览器扩展同步")
+			// 首推建号一步带入 authuser：不再「先插 /u/0 再补序号」，
+			// authuser!=0 的新号没有以 /u/0 短暂暴露给挑号器的窗口。
+			id, err := accountInsertWithAuthUser(label, c, "由浏览器扩展同步", authuser)
 			if err != nil {
 				accountSyncCreateMu.Unlock()
 				return accountSyncResult{}, err
-			}
-			if authuser != 0 {
-				if err := accountSetAuthUser(id, authuser); err != nil {
-					accountSyncCreateMu.Unlock()
-					return accountSyncResult{}, err
-				}
 			}
 			accountSyncCreateMu.Unlock()
 			return accountSyncResult{ID: id, Action: "added"}, nil
@@ -1178,9 +1190,11 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 		unlock()
 		return accountSyncResult{}, fmt.Errorf("账号 #%d 已删除", hitID)
 	}
-	// reenable：只对**自动停用**（auto_disabled=1，fail_count 到阈值由
-	// autoDisableIfDead 写入）的号恢复——它停用的原因就是 cookie 失效；
-	// 管理员手动停用（auto_disabled=0，即使 fail_count>=3）绝不动。
+	// reenable 快照判定只服务 unchanged 快路径：只对**自动停用**
+	// （auto_disabled=1，fail_count 到阈值由 autoDisableIfDead 写入）的号
+	// 才可能恢复——它停用的原因就是 cookie 失效；管理员手动停用
+	// （auto_disabled=0，即使 fail_count>=3）绝不动。真正的恢复写不由这份
+	// 快照决定，而是下推给下方条件 UPDATE 原子完成。
 	reenable := cur.Status == "disabled" && cur.AutoDisabled
 	// unchanged 快路径：cookie 完全未变、无失败计数、无需恢复——零写库零 Bump
 	// 零失效，绝不空转误杀健康槽。
@@ -1188,25 +1202,37 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 		unlock()
 		return accountSyncResult{ID: hitID, Action: "unchanged"}, nil
 	}
-	status := cur.Status
-	if reenable {
-		status = "enabled"
-	}
-	// 保留 proxy_id 与 priority：UPDATE 只写
-	// cookie/fail_count/last_error/status/auto_disabled（新凭据在手，
-	// 停用来源记一律清零）。
+	// R2 丢失更新修复：状态恢复判定彻底下推数据库原子条件更新，不在 Go 内存
+	// 拿 cur.Status 盲写回库——accountSetStatus 不经 L1，快照之后落进来的
+	// 手动停用/启用绝不能被本快照覆盖。
+	// 第一条只写凭据与错误计数，完全不碰 status/auto_disabled；
+	// proxy_id 与 priority 同样保留不动。
 	if _, err := getDB().Exec(
-		`UPDATE accounts SET cookie=?, fail_count=0, last_error='', status=?, auto_disabled=0 WHERE id=?`,
-		c, status, hitID); err != nil {
+		`UPDATE accounts SET cookie=?, fail_count=0, last_error='' WHERE id=?`,
+		c, hitID); err != nil {
 		unlock()
 		return accountSyncResult{}, err
+	}
+	// 第二条仅当该行此刻仍是自动停用（status='disabled' AND auto_disabled=1）
+	// 才原子恢复 enabled 并清零标记：快照之后被管理员手动停用/启用的行
+	// 0 行受影响，绝不越过手动决定（三方言通用、无 MySQL 赋值顺序歧义）。
+	reenabled := false
+	res, err := getDB().Exec(
+		`UPDATE accounts SET status='enabled', auto_disabled=0 WHERE id=? AND status='disabled' AND auto_disabled=1`,
+		hitID)
+	if err != nil {
+		unlock()
+		return accountSyncResult{}, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		reenabled = true
 	}
 	// MF-6：真实写库成功后在 L1 内 BumpAccountEpoch（无条件推进，不门控
 	// shouldUseBrowserTransport），杜绝新 cookie 与并发回写交错时代际漂移。
 	browserMgr.BumpAccountEpoch(hitID)
 	unlock()
 
-	if reenable {
+	if reenabled {
 		logf("[cookie] 账号 #%d 收到新 cookie，已从自动停用中恢复", hitID)
 	}
 	// 新旧两份的 XSRF 缓存都作废：新串等懒建后重抓，旧串绝不再信。
