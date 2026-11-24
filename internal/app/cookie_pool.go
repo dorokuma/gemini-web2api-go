@@ -385,14 +385,24 @@ var cookieTemplateOrder = []string{
 
 // normalizeCookie 把各种输入形态归一化成池子要的裸 "k=v; k=v" 串。
 //
-// 吃三种：
+// 吃这几种：
 //   - 裸串，原样返回
 //   - 旧单 cookie 路径的 {"cookie":"k=v; k=v","sapisid":"..."}
 //   - 面板逐项模式的 {"SID":"a","SAPISID":"b",...}
+//   - 浏览器扩展导出的数组 [{"name":"SID","value":"a","domain":".google.com"},...]
+//     以及 Playwright storageState {"cookies":[...]}，按 domain 过滤到 gemini.google.com
 //
 // 不归一化的话池子里会存进一整段 JSON，SAPISID 提取和后续请求全错。
 func normalizeCookie(raw, who string) (string, bool) {
 	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "[") {
+		var arr []cookieJSONEntry
+		if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+			logf("[cookie] %s 是 JSON 数组但解析失败，跳过: %v", who, err)
+			return "", false
+		}
+		return joinCookieEntries(arr, who)
+	}
 	if !strings.HasPrefix(raw, "{") {
 		return raw, true
 	}
@@ -400,6 +410,17 @@ func normalizeCookie(raw, who string) (string, bool) {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		logf("[cookie] %s 是 JSON 但解析失败，跳过: %v", who, err)
 		return "", false
+	}
+	// Playwright / Puppeteer 的 storageState：{"cookies":[{name,value,domain}...], "origins":[...]}
+	if _, ok := m["cookies"].([]interface{}); ok {
+		var st struct {
+			Cookies []cookieJSONEntry `json:"cookies"`
+		}
+		if err := json.Unmarshal([]byte(raw), &st); err != nil {
+			logf("[cookie] %s 的 cookies 数组解析失败，跳过: %v", who, err)
+			return "", false
+		}
+		return joinCookieEntries(st.Cookies, who)
 	}
 	if c, ok := m["cookie"].(string); ok && strings.TrimSpace(c) != "" {
 		return strings.TrimSpace(c), true
@@ -431,6 +452,64 @@ func normalizeCookie(raw, who string) (string, bool) {
 	if len(parts) == 0 {
 		logf("[cookie] %s 是 JSON 但一项非空值都没有，跳过", who)
 		return "", false
+	}
+	return strings.Join(parts, "; "), true
+}
+
+// cookieJSONEntry 是浏览器扩展（Cookie-Editor / EditThisCookie / Get cookies.txt 的 JSON 版）
+// 和 Playwright storageState 导出的单条 cookie。只用得到这三个字段。
+type cookieJSONEntry struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Domain string `json:"domain"`
+}
+
+// cookieExportDomainOK 按 RFC 6265 的 domain-match 规则判断浏览器会不会把这条 cookie
+// 发给 gemini.google.com。导出「全部 cookie」时会混进 youtube.com、
+// accounts.google.com 之类的，那些不该进串里——尤其 accounts.google.com 也有一个
+// OSID，混进来会顶掉真正的那个。domain 为空（有些导出不带）就当匹配。
+// 复用下方 RFC 6265 §5.1.3 的 cookieDomainMatches(host, domain)。
+func cookieExportDomainOK(domain string) bool {
+	d := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(domain), "."))
+	if d == "" {
+		return true
+	}
+	return cookieDomainMatches(geminiCookieTargetHost, d)
+}
+
+// joinCookieEntries 把导出的 cookie 数组拼成 "k=v; k=v"。保留导出里的原始顺序（接近浏览器
+// 实际发送的顺序）；同名的按 domain 更具体的那条为准——host-only 的 gemini.google.com
+// 优先于 .google.com。
+func joinCookieEntries(arr []cookieJSONEntry, who string) (string, bool) {
+	type kept struct {
+		value  string
+		domLen int
+	}
+	var order []string
+	byName := map[string]kept{}
+	for _, e := range arr {
+		name := strings.TrimSpace(e.Name)
+		val := strings.TrimSpace(e.Value)
+		if name == "" || val == "" || !cookieExportDomainOK(e.Domain) {
+			continue
+		}
+		dl := len(strings.TrimPrefix(strings.TrimSpace(e.Domain), "."))
+		if prev, ok := byName[name]; ok {
+			if dl > prev.domLen {
+				byName[name] = kept{val, dl}
+			}
+			continue
+		}
+		order = append(order, name)
+		byName[name] = kept{val, dl}
+	}
+	if len(order) == 0 {
+		logf("[cookie] %s 是 cookie 数组但没有发往 %s 的有效项，跳过", who, geminiCookieTargetHost)
+		return "", false
+	}
+	parts := make([]string, 0, len(order))
+	for _, n := range order {
+		parts = append(parts, n+"="+byName[n].value)
 	}
 	return strings.Join(parts, "; "), true
 }
@@ -986,6 +1065,123 @@ func updateAccountCookie(id int64, cookie string) {
 	if bump && shouldUseBrowserTransport() {
 		browserMgr.InvalidateAccount(id, false, "cookie rotated")
 	}
+}
+
+// accountSyncResult 是 accountSync 的结果：动作是 added / updated / unchanged。
+type accountSyncResult struct {
+	ID     int64  `json:"id"`
+	Action string `json:"action"`
+}
+
+// accountSync 是浏览器扩展定时推 cookie 用的「有就更新、没有就新建」。
+//
+// 找哪一行，按顺序：
+//  1. 同一会话（cookieIdentity：SAPISID + __Secure-1PSID）且同一账号序号 —— 正常的定时刷新
+//  2. 同标签（不分大小写、非空）且同一账号序号 —— 用户重新登录过，会话换了但还是这个号
+//  3. 都没有就新建
+//
+// 账号序号必须一起比：同一串 cookie 可以按不同 /u/N 导入成几个号，
+// 只比会话会把 /u/1 的刷新写进 /u/0 那行。
+//
+// v6.7.0 适配 v6.6.0 锁序：命中更新时走 acquireAcctCookieLock（L1）持锁
+// 快照→写库→BumpAccountEpoch 三段，再放锁后 invalidateXSRF + 清短冷却 +
+// InvalidateAccount——与 updateAccountCookie / rotateAccountOpts 严格互斥，
+// 绝不误杀健康 BrowserContext（unchanged 快路径零副作用），也绝不覆写原账号的
+// proxy_id 与 priority。
+func accountSync(label string, authuser int, cookie string) (accountSyncResult, error) {
+	if authuser < 0 || authuser > maxAuthUser {
+		return accountSyncResult{}, fmt.Errorf("账号序号要在 0..%d 之间", maxAuthUser)
+	}
+	c, ok := normalizeCookie(cookie, "扩展推送的 cookie")
+	if !ok {
+		return accountSyncResult{}, fmt.Errorf("cookie 解析失败：既不是 \"k=v; k=v\" 串，也不是可识别的 JSON")
+	}
+	if extractSAPISID(c) == "" {
+		return accountSyncResult{}, fmt.Errorf("cookie 里没有 SAPISID，浏览器可能没登录 Google")
+	}
+	label = strings.TrimSpace(label)
+	warnMissingOSID(label, c)
+
+	accts := accountList()
+	var hitID int64
+	ident := cookieIdentity(c)
+	for i := range accts {
+		if accts[i].AuthUser == authuser && cookieIdentity(accts[i].Cookie) == ident {
+			hitID = accts[i].ID
+			break
+		}
+	}
+	if hitID == 0 && label != "" {
+		for i := range accts {
+			if accts[i].AuthUser == authuser && strings.EqualFold(strings.TrimSpace(accts[i].Label), label) {
+				hitID = accts[i].ID
+				break
+			}
+		}
+	}
+
+	if hitID == 0 {
+		id, err := accountInsert(label, c, "由浏览器扩展同步")
+		if err != nil {
+			return accountSyncResult{}, err
+		}
+		if authuser != 0 {
+			if err := accountSetAuthUser(id, authuser); err != nil {
+				return accountSyncResult{}, err
+			}
+		}
+		return accountSyncResult{ID: id, Action: "added"}, nil
+	}
+
+	// L1 串行锁内做「重读快照 → 判定 → 写库 → Bump」：与懒建 Context 播种、
+	// syncAccountCookiesBackCtx 回写、rotateAccountOpts、updateAccountCookie 严格互斥，
+	// 拿陈旧快照比较会把刚刷新的 cookie 覆盖回去。
+	unlock, err := acquireAcctCookieLock(context.Background(), hitID)
+	if err != nil {
+		return accountSyncResult{}, err
+	}
+	cur := accountByID(hitID)
+	if cur == nil {
+		unlock()
+		return accountSyncResult{}, fmt.Errorf("账号 #%d 已删除", hitID)
+	}
+	// reenable：被**自动停用**（fail_count 到阈值）的号收到新 cookie 一并恢复——
+	// 它停用的原因就是 cookie 失效；用户手动停用（fail_count 没到阈值）绝不动。
+	reenable := cur.Status == "disabled" && cur.FailCount >= maxCookieAuthFailures
+	// unchanged 快路径：cookie 完全未变、无失败计数、无需恢复——零写库零 Bump
+	// 零失效，绝不空转误杀健康槽。
+	if cur.Cookie == c && cur.FailCount == 0 && !reenable {
+		unlock()
+		return accountSyncResult{ID: hitID, Action: "unchanged"}, nil
+	}
+	status := cur.Status
+	if reenable {
+		status = "enabled"
+	}
+	// 保留 proxy_id 与 priority：UPDATE 只写 cookie/fail_count/last_error/status。
+	if _, err := getDB().Exec(
+		`UPDATE accounts SET cookie=?, fail_count=0, last_error='', status=? WHERE id=?`,
+		c, status, hitID); err != nil {
+		unlock()
+		return accountSyncResult{}, err
+	}
+	// MF-6：真实写库成功后在 L1 内 BumpAccountEpoch（无条件推进，不门控
+	// shouldUseBrowserTransport），杜绝新 cookie 与并发回写交错时代际漂移。
+	browserMgr.BumpAccountEpoch(hitID)
+	unlock()
+
+	if reenable {
+		logf("[cookie] 账号 #%d 收到新 cookie，已从自动停用中恢复", hitID)
+	}
+	// 新旧两份的 XSRF 缓存都作废：新串等懒建后重抓，旧串绝不再信。
+	// 顺手清掉 45s 防雪崩短冷却——换上新 cookie 的号不该再背着旧凭据的失败记录。
+	invalidateXSRF(cur.Cookie)
+	invalidateXSRF(c)
+	recordAccountReqSuccess(hitID, nextClientReqID())
+	if shouldUseBrowserTransport() {
+		browserMgr.InvalidateAccount(hitID, false, "cookie synced")
+	}
+	return accountSyncResult{ID: hitID, Action: "updated"}, nil
 }
 
 // xsrfErrBlamesCookie 判断取 XSRF（抓 /app）失败是不是 cookie 的错。

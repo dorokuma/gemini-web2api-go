@@ -2,6 +2,47 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 6.7.0 - 2026-11-24
+
+### 新增
+
+- **Cookie JSON / cURL 导入与浏览器扩展自动同步**（合入上游 `c46ec6d` + `08407db` 并适配 v6.6.0）：
+  - `normalizeCookie` 新增两种输入形态：Cookie-Editor / EditThisCookie 导出的
+    JSON 数组与 Playwright `storageState`，按 RFC 6265 domain-match 过滤到
+    `gemini.google.com`，同名取 domain 更具体的那条（防止
+    `accounts.google.com` 的 `OSID` 顶掉真 `OSID`）。
+  - 新增 `POST /admin/api/cookies/sync`（`requireAuth`）供扩展定时推送 cookie：
+    按「同会话 + 同账号序号 → 同标签 + 同账号序号 → 新建」三级匹配；
+    更新走 `acquireAcctCookieLock`（L1）持锁快照→写库→`BumpAccountEpoch`、
+    放锁后 `invalidateXSRF`（新旧两份）+ 清 45s 短冷却 + 按开关
+    `InvalidateAccount("cookie synced")`——`unchanged` 快路径零写库零 Bump
+    零失效，绝不误杀健康 BrowserContext，且绝不覆写 `proxy_id`/`priority`；
+    被**自动停用**（`fail_count` 到阈值）的号拿到新 cookie 一并恢复 `enabled`，
+    手动停用的不动。
+  - 面板「导入 Cookie」改为单框粘贴（JSON 数组 / storageState / 对象 / 裸串 /
+    Linux&Windows「复制为 cURL」，含 `curl.exe` + `^"` cmd 转义），支持从文件
+    读取与实时识别预览；**保留**我方的账号序号、`priority` 主备优先级与
+    `proxy_id` 绑定出口（含 `-1` 锁定本机直连）控件。
+- **内存环形系统日志与管理面板「系统日志」页**（合入上游 `f2ce809` + `25c456a`）：
+  - 新增 `logger.go`：`LogRingBuffer`（容量 1000）随 `logf` 全量收录；
+    `parseLogMeta` 从行首 `[tag]` 归类子系统，`logTagSource` 把
+    `[agg]`/`[retention]`/`[autodel]`/`[strict_*]`/`[cdp]` 等我方 tag 映射到
+    scheduler/conv/failover/browser 等筛选桶；级别判定只认独立数字状态码
+    （`401/403/5xx`→ERROR、`429`→WARN），不再把「1500 字节」「账号 #401」
+    误判成错误；`tail` 超容量时封顶给满。
+  - 新增 `GET/DELETE /admin/api/logs`（`requireAuth`）：`tail`/`since_id`/
+    `source`/`level`/`q` 过滤，`format=text` 出纯文本。
+  - 面板新增「系统日志」标签页：来源/级别/行数/关键词过滤、2s 自动刷新、
+    复制日志与清空缓冲。
+
+### 修复
+
+- **视频任务响应数据竞争**（上游 `015e70c`，我方 v6.5.x 已以等价的
+  `videoJobSnapshot` 锁内快照落地，本次复核确认三处响应点
+  `handleCreateVideo`/`handleExtendVideo`/`handleVideoItem` 均已走快照并
+  `-race` 通过）：`POST /v1/videos`、续写、`GET /v1/videos/{id}` 不再把
+  裸 `*videoJob` 交给 `writeJSON` 与后台 goroutine 竞争。
+
 ## 6.6.0 - 2026-11-24
 
 ### 新增

@@ -184,40 +184,45 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		logf("[cookies] 删除账号 #%d", id)
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case http.MethodPost:
-		if action == "rotate" {
-			for _, a := range accountList() {
-				if a.ID == id {
-					iv, names, err := rotateAccount(a)
-					if err != nil {
-						writeJSON(w, 200, map[string]interface{}{"ok": false, "detail": err.Error()})
-						return
-					}
-					detail := "保活成功"
-					if len(names) > 0 {
-						detail = "保活成功，刷新了 " + strings.Join(names, ", ")
-					}
-					writeJSON(w, 200, map[string]interface{}{
-						"ok": true, "detail": detail, "refreshed": names, "next_sec": int(iv.Seconds())})
+		handleAdminCookiePost(w, id, action)
+	case http.MethodPatch:
+		handleAdminCookiePatch(w, r, id)
+	default:
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// handleAdminCookiePost — POST /admin/api/cookies/{id}/{rotate,check,toggle}。
+// 独立成函数控制 handleAdminCookieItem 的认知复杂度。
+func handleAdminCookiePost(w http.ResponseWriter, id int64, action string) {
+	switch action {
+	case "rotate":
+		for _, a := range accountList() {
+			if a.ID == id {
+				iv, names, err := rotateAccount(a)
+				if err != nil {
+					writeJSON(w, 200, map[string]interface{}{"ok": false, "detail": err.Error()})
 					return
 				}
-			}
-			writeJSON(w, 404, map[string]string{"error": "account not found"})
-			return
-		}
-		if action == "check" {
-			for _, a := range accountList() {
-				if a.ID == id {
-					writeJSON(w, 200, checkAccountCookie(a))
-					return
+				detail := "保活成功"
+				if len(names) > 0 {
+					detail = "保活成功，刷新了 " + strings.Join(names, ", ")
 				}
+				writeJSON(w, 200, map[string]interface{}{
+					"ok": true, "detail": detail, "refreshed": names, "next_sec": int(iv.Seconds())})
+				return
 			}
-			writeJSON(w, 404, map[string]string{"error": "account not found"})
-			return
 		}
-		if action != "toggle" {
-			writeJSON(w, 400, map[string]string{"error": "unknown action"})
-			return
+		writeJSON(w, 404, map[string]string{"error": "account not found"})
+	case "check":
+		for _, a := range accountList() {
+			if a.ID == id {
+				writeJSON(w, 200, checkAccountCookie(a))
+				return
+			}
 		}
+		writeJSON(w, 404, map[string]string{"error": "account not found"})
+	case "toggle":
 		cur := ""
 		for _, a := range accountList() {
 			if a.ID == id {
@@ -237,10 +242,8 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 			browserMgr.InvalidateAccount(id, false, "disabled")
 		}
 		writeJSON(w, 200, map[string]interface{}{"status": next})
-	case http.MethodPatch:
-		handleAdminCookiePatch(w, r, id)
 	default:
-		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		writeJSON(w, 400, map[string]string{"error": "unknown action"})
 	}
 }
 
@@ -353,4 +356,56 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 		browserMgr.InvalidateAccount(id, !disabling, "patched")
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// handleAdminCookieSync — POST /admin/api/cookies/sync，给浏览器扩展定时推 cookie。
+//
+// body: {"label":"me@gmail.com","authuser":0,"cookie":<串或扩展导出的 JSON 数组>}
+// cookie 字段可以是字符串，也可以直接是 JSON 数组/对象（扩展里省得再 stringify 一层）。
+// 鉴权跟其它 admin 接口一样，扩展用 Authorization: Bearer <admin_token>。
+func handleAdminCookieSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad body"})
+		return
+	}
+	var p struct {
+		Label    string          `json:"label"`
+		AuthUser int             `json:"authuser"`
+		Cookie   json.RawMessage `json:"cookie"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad json"})
+		return
+	}
+	cookie := strings.TrimSpace(string(p.Cookie))
+	var s string
+	if json.Unmarshal(p.Cookie, &s) == nil {
+		cookie = s
+	}
+	if cookie == "" || cookie == "null" {
+		writeJSON(w, 400, map[string]string{"error": "cookie 不能为空"})
+		return
+	}
+	res, err := accountSync(p.Label, p.AuthUser, cookie)
+	if err != nil {
+		writeJSON(w, 400, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	msg := map[string]string{
+		"added":     "已新建账号 #%d",
+		"updated":   "已更新账号 #%d",
+		"unchanged": "账号 #%d 的 cookie 没有变化",
+	}[res.Action]
+	if res.Action != "unchanged" {
+		logf("[cookies] 扩展同步：账号 #%d %s label=%q authuser=%d", res.ID, res.Action, strings.TrimSpace(p.Label), p.AuthUser)
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"success": true, "id": res.ID, "action": res.Action,
+		"message": fmt.Sprintf(msg, res.ID),
+	})
 }
