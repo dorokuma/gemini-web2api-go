@@ -345,10 +345,10 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 	client := m.client
 	bridge := m.rootBridge
 	gen := m.generation
-	var deadCtxs []*accountBrowserCtx
+	var deadCtxs []detachedCtxSnap
 	for _, ac := range m.ctxs {
-		if ok, _ := m.detachCtxLocked(ac, browserErr("browser instance died")); ok {
-			deadCtxs = append(deadCtxs, ac)
+		if snap := m.detachSnapLocked(ac, browserErr("browser instance died")); snap.ac != nil {
+			deadCtxs = append(deadCtxs, snap)
 		}
 	}
 	m.cleaning = true
@@ -368,9 +368,11 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 	if proc != nil {
 		killProcGroupFn(proc.PID, proc.PGID, 1500*time.Millisecond)
 	}
-	for _, ac := range deadCtxs {
-		m.failStreamsForCtx(ac, browserErr("browser instance died; streams aborted"))
-		m.disposeDetachedCtx(ac, ac.browserContextID, ac.bridge, false, client)
+	for _, snap := range deadCtxs {
+		m.failStreamsForCtx(snap.ac, browserErr("browser instance died; streams aborted"))
+		if !snap.wasCreating {
+			m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, false, client)
+		}
 	}
 	if bridge != nil {
 		bridge.Shutdown(context.Background())
@@ -1632,26 +1634,37 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 		}
 	}
 
-	// 停机前先快照 published 登录槽并强制无节流写回 Cookie（新刷 SIDCC
-	// 不能丢在 jar 里）；必须在摘除槽位前执行——一旦 detach 标记
-	// disposed，syncAllCookiesBackForce 会全部跳过导致零写回。透传
-	// 剩余 ctx 预算（封顶 800ms）。
-	m.syncAllCookiesBackForce(ctx)
-
-	// 全槽位统一摘除：一次性取消全部在飞 buildCancel 并幂等关闭全部
-	// readyCh/drainWait（等待者毫秒级醒来拿到终态错误退出）。
+	// 停机写回 + 全槽位摘除合并进同一个 m.mu 临界区：先在锁内快照全部
+	// 已发布存活登录槽的写回目标（新刷 SIDCC 不能丢在 jar 里），再对
+	// m.ctxs 逐槽 detachSnapLocked——创建/重建中槽位立即 buildCancel 0ms
+	// 唤醒等待者，已发布槽此时尚未 disposeBrowserContext，锁外先用
+	// client 对快照目标执行共享 800ms 预算写回再统一清理（Reviewer #5 & #8）。
 	m.mu.Lock()
-	var deadCtxs []*accountBrowserCtx
+	client := m.client
+	var syncTargets []cookieSyncTarget
+	var deadSnaps []detachedCtxSnap
 	for _, ac := range m.ctxs {
-		if ok, _ := m.detachCtxLocked(ac, browserErr("browser shut down")); ok {
-			deadCtxs = append(deadCtxs, ac)
+		if !ac.disposed && !ac.creating && ac.key.accountID > 0 &&
+			ac.browserContextID != "" {
+			syncTargets = append(syncTargets, cookieSyncTarget{
+				bcID:  ac.browserContextID,
+				accID: ac.key.accountID,
+				epoch: ac.epoch,
+				ident: ac.cookieIdentity,
+			})
+		}
+		if snap := m.detachSnapLocked(ac, browserErr("browser shut down")); snap.ac != nil {
+			deadSnaps = append(deadSnaps, snap)
 		}
 	}
 	m.mu.Unlock()
 
+	// 锁外共享预算写回（所有快照目标共用同一个绝对截止）。
+	m.syncCookieTargetsBack(ctx, client, syncTargets)
+
 	m.mu.Lock()
 	proc := m.proc
-	client := m.client
+	client = m.client
 	bridge := m.rootBridge
 	gen := m.generation
 	m.proc = nil
@@ -1664,10 +1677,13 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	m.generation++
 	m.mu.Unlock()
 
-	// 锁外统一清理全部已摘除槽位（断桥→条件写回→disposeBrowserContext）。
-	for _, ac := range deadCtxs {
-		m.failStreamsForCtx(ac, ac.lastBuildErr)
-		m.disposeDetachedCtx(ac, ac.browserContextID, ac.bridge, false, client)
+	// 锁外统一清理全部已摘除槽位（failStreams→断桥→disposeBrowserContext；
+	// 停机写回已在上方按快照完成，这里 syncCookie 恒 false）。
+	for _, snap := range deadSnaps {
+		m.failStreamsForCtx(snap.ac, snap.err)
+		if !snap.wasCreating {
+			m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, false, client)
+		}
 	}
 
 	if client != nil {
@@ -1692,6 +1708,14 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	}
 	m.failAllStreams(browserErr("browser shut down"))
 
+	m.stopReapLate(ctx, gen, proc, client, bridge)
+}
+
+// stopReapLate 是 stopImpl 的尾声：回锁清理「停机期间被并发重建」的
+// 迟到实例字段（gen 已推进时把它们归零摘出），随后销毁旧/新实例资源
+// 与 profile 记录、复位 stopCh/stopping。锁外调用。
+func (m *browserManager) stopReapLate(ctx context.Context, gen uint64,
+	proc *browserProc, client *cdpClient, bridge *browserProxyBridge) {
 	m.mu.Lock()
 	dir := m.profileDir
 	lateProc, lateClient, lateBridge := m.proc, m.client, m.rootBridge

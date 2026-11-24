@@ -147,6 +147,44 @@ func (ac *accountBrowserCtx) drainWaiterLeaveLocked() {
 	}
 }
 
+// detachedCtxSnap 是 detachCtxLocked 的锁内摘除快照：全部字段在持
+// m.mu 期间从 ac 拷出（Oracle SF-5 / NH-2），解锁后调用方零读取
+// ac.browserContextID / ac.bridge / ac.syncOnDispose / ac.lastBuildErr。
+// ac==nil 表示本次摘除竞争落败（槽已被其它摘除方摘走），调用方不得
+// 再做任何清理——否则会对同一已摘除槽二次 dispose（MF-8.4）。
+// wasCreating=true 表示摘除时槽位仍在构建/重建中：(bcID, bridge) 等
+// 局部资源归 buildAccountCtx/recreateAccountTab owner 唯一所有，外部
+// 摘除方只调 failStreamsForCtx，**绝不** disposeDetachedCtx（防双重清理）。
+type detachedCtxSnap struct {
+	ac          *accountBrowserCtx
+	bcID        string
+	bridge      *browserProxyBridge
+	syncCookie  bool
+	err         error
+	wasCreating bool
+}
+
+// detachSnapLocked 是 detachCtxLocked 的锁内快照包装：胜出时把清理所需
+// 字段全部在 m.mu 内快照后返回；落败（ac==nil / 已 disposed / 未注册）
+// 返回零值 snap。调用方持 m.mu。
+func (m *browserManager) detachSnapLocked(ac *accountBrowserCtx, cause error) detachedCtxSnap {
+	if ac == nil {
+		return detachedCtxSnap{}
+	}
+	ok, wasCreating := m.detachCtxLocked(ac, cause)
+	if !ok {
+		return detachedCtxSnap{}
+	}
+	return detachedCtxSnap{
+		ac:          ac,
+		bcID:        ac.browserContextID,
+		bridge:      ac.bridge,
+		syncCookie:  ac.syncOnDispose,
+		err:         ac.lastBuildErr,
+		wasCreating: wasCreating,
+	}
+}
+
 // detachCtxLocked 是全部回收路径的唯一锁内摘除原语。返回
 // (detached, wasCreating)：detached=true 表示本次调用是「唯一胜出摘除者」
 // （ac 从存活变 disposed），调用方负责锁外 disposeDetachedCtx；
@@ -211,17 +249,17 @@ func (m *browserManager) disposeDetachedCtx(ac *accountBrowserCtx,
 
 // evictIdleOrOverflowLocked 淘汰候选：空闲超 browserCtxIdleTTL 的槽位；
 // 需要腾位时（needSlot=true 且满 maxBrowserContexts）按「匿名优先、登录
-// 最久未用其次」追加淘汰一个。返回已摘除的槽位（锁外清理）。
+// 最久未用其次」追加淘汰一个。返回已摘除槽位的锁内快照（锁外清理）。
 // 调用方持 m.mu。
-func (m *browserManager) evictIdleOrOverflowLocked(now time.Time, needSlot bool) []*accountBrowserCtx {
-	var victims []*accountBrowserCtx
+func (m *browserManager) evictIdleOrOverflowLocked(now time.Time, needSlot bool) []detachedCtxSnap {
+	var victims []detachedCtxSnap
 	for _, ac := range m.ctxs {
 		if ac.creating || ac.recreating || ac.inFlight > 0 || ac.drainWaiters > 0 {
 			continue
 		}
 		if now.Sub(ac.lastUsedAt) > browserCtxIdleTTL {
-			if ok, _ := m.detachCtxLocked(ac, browserErr("idle evicted")); ok {
-				victims = append(victims, ac)
+			if snap := m.detachSnapLocked(ac, browserErr("idle evicted")); snap.ac != nil {
+				victims = append(victims, snap)
 			}
 		}
 	}
@@ -246,8 +284,8 @@ func (m *browserManager) evictIdleOrOverflowLocked(now time.Time, needSlot bool)
 		pick = loginVictim
 	}
 	if pick != nil {
-		if ok, _ := m.detachCtxLocked(pick, browserErr("overflow evicted")); ok {
-			victims = append(victims, pick)
+		if snap := m.detachSnapLocked(pick, browserErr("overflow evicted")); snap.ac != nil {
+			victims = append(victims, snap)
 		}
 	}
 	return victims
@@ -262,21 +300,21 @@ func (m *browserManager) EvictIdleContexts() {
 		return
 	}
 	client := m.client
-	var victims []*accountBrowserCtx
+	var victims []detachedCtxSnap
 	for _, ac := range m.ctxs {
 		if ac.creating || ac.recreating || ac.inFlight > 0 || ac.drainWaiters > 0 {
 			continue
 		}
 		if time.Since(ac.lastUsedAt) > browserCtxIdleTTL {
-			if ok, _ := m.detachCtxLocked(ac, browserErr("idle evicted")); ok {
-				victims = append(victims, ac)
+			if snap := m.detachSnapLocked(ac, browserErr("idle evicted")); snap.ac != nil {
+				victims = append(victims, snap)
 			}
 		}
 	}
 	m.mu.Unlock()
-	for _, ac := range victims {
-		m.failStreamsForCtx(ac, browserErr("idle context evicted"))
-		m.disposeDetachedCtx(ac, ac.browserContextID, ac.bridge, ac.syncOnDispose, client)
+	for _, snap := range victims {
+		m.failStreamsForCtx(snap.ac, browserErr("idle context evicted"))
+		m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, snap.syncCookie, client)
 	}
 }
 
@@ -383,6 +421,57 @@ func (d *acquireDrainReg) leave() {
 	d.target = nil
 }
 
+// refreshAcquireSnapshot 是 acquireAccountCtx 每轮进 m.mu 之前的锁外
+// 账号/代理池快照刷新（m.mu 出度 0，本函数绝不持 m.mu）：
+//   - poolSnap/strictBinding/poolBlocksDirect 取自 proxyMu 与 rtCfg；
+//   - account.ID>0 时 freshAcct 从 DB 读最新行（Reviewer #4：管理员可能
+//     在等待窗口内改绑代理或停用账号，绝不能用调用方传入的旧指针做
+//     R3-M1 复核）；freshAcct 失效时先 InvalidateAccount 摘掉旧槽再清
+//     drain 登记返回终态错；
+//   - origPID/boundID 按 freshAcct.ProxyID 重算；
+//   - 请求级 (proxyURL, allowDirect) 对 freshAcct 已违反 R3-M1 时直接给
+//     终态错（不拿陈旧出口白跑一趟必败的 buildAccountCtx）。
+//
+// 返回 termErr 非空时调用方原样返回它（drain 登记已在锁内清掉）。
+func (m *browserManager) refreshAcquireSnapshot(account *CookieAccount,
+	proxyURL string, allowDirect bool, drain *acquireDrainReg) (
+	freshAcct *CookieAccount, origPID, boundID int64,
+	poolSnap map[int64]proxySnapEntry, strictBinding, poolBlocksDirect bool,
+	termErr error) {
+	poolSnap = snapshotProxyPool()
+	strictBinding = rtCfg().StrictProxyBinding
+	poolBlocksDirect = len(poolSnap) > 0 && !rtCfg().FallbackDirect
+	freshAcct = account
+	if account != nil && account.ID > 0 {
+		freshAcct = accountByID(account.ID)
+		if freshAcct == nil || freshAcct.Status != "enabled" {
+			// 等待窗口内账号被停用/删除：摘掉可能存在的旧槽，清自身
+			// drain 登记后直接终态返回，绝不拿死号跑 buildAccountCtx。
+			m.InvalidateAccount(account.ID, false, "disabled")
+			m.mu.Lock()
+			drain.leave()
+			m.mu.Unlock()
+			return nil, 0, 0, nil, false, false,
+				browserErr("account #%d unavailable", account.ID)
+		}
+		origPID = freshAcct.ProxyID
+		boundID = matchProxyIDByURL(origPID, proxyURL)
+	}
+	// 请求级出口复核：管理员在等待窗口内改绑后，调用方携带的旧
+	// (proxyURL, allowDirect) 可能已违反 R3-M1——在摘除旧槽（上一轮
+	// acquirePlanLocked 已完成）后快速终态返回，绝不拿陈旧出口白跑
+	// 一趟必败的 buildAccountCtx。
+	if requestExitViolation(freshAcct, proxyURL, allowDirect,
+		poolBlocksDirect, strictBinding, poolSnap) {
+		m.mu.Lock()
+		drain.leave()
+		m.mu.Unlock()
+		return nil, 0, 0, nil, false, false,
+			browserErr("account #%d exit binding changed", freshAcct.ID)
+	}
+	return freshAcct, origPID, boundID, poolSnap, strictBinding, poolBlocksDirect, nil
+}
+
 // acquireAccountCtx 是主入口：为 (account, proxyURL, allowDirect) 取一个
 // 就绪的 BrowserContext 租约。返回绑定具体 ac 指针的 (client, ac, sessID,
 // release, err)；release 用 sync.Once 幂等归还 inFlight 并触发排空唤醒。
@@ -401,20 +490,22 @@ func (m *browserManager) acquireAccountCtx(ctx context.Context,
 
 	key := makeBrowserSlotKey(account, proxyURL, allowDirect)
 
-	// ── 进 m.mu 之前预计算全部出口快照（m.mu 出度严格为 0，锁内只做
-	// 纯内存比对）。origPID/boundID/poolSnap/poolBlocksDirect 取自
-	// proxyMu 与 rtCfg，绝不在持 m.mu 期间访问（v2.2 §10(1) /
-	// Oracle MF-5）。
-	origPID := int64(0)
-	if account != nil {
-		origPID = account.ProxyID
-	}
-	boundID := matchProxyIDByURL(origPID, proxyURL)
-	poolSnap := snapshotProxyPool()
-	poolBlocksDirect := len(poolSnap) > 0 && !rtCfg().FallbackDirect
-
+	// 首轮进 m.mu 前的出口快照（每轮循环开头都会用 freshAcct 重算——
+	// 管理员可能在等待窗口内改绑代理/停用账号，绝不能用上一轮的陈旧
+	// 指针做 R3-M1 复核，Reviewer #4）。
 	var drain acquireDrainReg
 	for {
+		// ── 每轮进 m.mu 之前（锁外）刷新账号与代理池快照：poolSnap /
+		// strictBinding / poolBlocksDirect 取自 proxyMu 与 rtCfg，freshAcct
+		// 从 DB 读最新行——全部在持 m.mu 之前完成（m.mu 出度严格为 0，
+		// v2.2 §10(1) / Oracle MF-5）。账号被停用/删除或请求级出口改绑
+		// 违规时 helper 直接给出终态 err。
+		freshAcct, origPID, boundID, poolSnap, strictBinding, poolBlocksDirect,
+			termErr := m.refreshAcquireSnapshot(account, proxyURL, allowDirect, &drain)
+		if termErr != nil {
+			return nil, nil, "", nil, termErr
+		}
+
 		m.mu.Lock()
 		if err := ctx.Err(); err != nil {
 			drain.leave()
@@ -430,7 +521,7 @@ func (m *browserManager) acquireAccountCtx(ctx context.Context,
 		ac := m.ctxs[key]
 		if ac == nil {
 			client, ac2, sessID, release, retry, err := m.acquireClaimOrWait(
-				ctx, key, account, proxyURL, allowDirect, allowCreate,
+				ctx, key, freshAcct, proxyURL, allowDirect, allowCreate,
 				origPID, boundID, &drain)
 			if retry {
 				continue
@@ -438,16 +529,16 @@ func (m *browserManager) acquireAccountCtx(ctx context.Context,
 			return client, ac2, sessID, release, err
 		}
 
-		// ── 等待判定：锁内调度出 (waitCh, kind, proceed, detached) 四元 ──
-		waitCh, kind, proceed, detached := m.acquirePlanLocked(ac, account,
-			proxyURL, allowDirect, poolBlocksDirect, poolSnap, &drain)
-		if detached != nil {
-			client, detErr := m.client, detached.lastBuildErr
-			detBcID, detBridge := detached.browserContextID, detached.bridge
-			detSync := detached.syncOnDispose
+		// ── 等待判定：锁内调度出 (waitCh, kind, proceed, detachedSnap) 四元 ──
+		waitCh, kind, proceed, snap := m.acquirePlanLocked(ac, freshAcct,
+			proxyURL, allowDirect, poolBlocksDirect, strictBinding, poolSnap, &drain)
+		if snap.ac != nil {
+			client := m.client
 			m.mu.Unlock()
-			m.failStreamsForCtx(detached, detErr)
-			m.disposeDetachedCtx(detached, detBcID, detBridge, detSync, client)
+			m.failStreamsForCtx(snap.ac, snap.err)
+			if !snap.wasCreating {
+				m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, snap.syncCookie, client)
+			}
 			continue
 		}
 		if proceed {
@@ -494,8 +585,8 @@ func (m *browserManager) acquireClaimOrWait(ctx context.Context,
 	}
 	m.mu.Unlock()
 	for _, v := range victims {
-		m.failStreamsForCtx(v, browserErr("context evicted"))
-		m.disposeDetachedCtx(v, v.browserContextID, v.bridge, v.syncOnDispose, snapClient)
+		m.failStreamsForCtx(v.ac, browserErr("context evicted"))
+		m.disposeDetachedCtx(v.ac, v.bcID, v.bridge, v.syncCookie, snapClient)
 	}
 	go m.buildAccountCtx(buildCtx, snapClient, snapGen, nac, snapEpoch, account)
 	// 创建者直等自己认领的 nac.readyCh：绝不回循环顶重查
@@ -589,7 +680,7 @@ const (
 func (m *browserManager) acquireClaimCreateLocked(key browserSlotKey,
 	account *CookieAccount, proxyURL string, allowDirect bool,
 	origPID, boundID int64) (
-	nac *accountBrowserCtx, victims []*accountBrowserCtx,
+	nac *accountBrowserCtx, victims []detachedCtxSnap,
 	snapClient *cdpClient, snapGen, snapEpoch uint64,
 	buildCtx context.Context, waitCh chan struct{}, stopCh chan struct{}, err error) {
 
@@ -654,23 +745,25 @@ func snapshotProxyPool() map[int64]proxySnapEntry {
 }
 
 // acquirePlanLocked 是 acquireAccountCtx 的锁内判定段（调用方持 m.mu）。
-// 返回 (waitCh, kind, proceed, detached)：
-//   - detached != nil：本调用是摘除 winner（身份变更 / 唯一替换 / 强绑定
-//     违规），调用方锁外 failStreams+dispose 后 continue；
+// 返回 (waitCh, kind, proceed, snap)：
+//   - snap.ac != nil：本调用是摘除 winner（身份变更 / 唯一替换 / 强绑定
+//     违规），快照字段已在 m.mu 内核出，调用方锁外 failStreams 后按
+//     wasCreating 决定是否 disposeDetachedCtx，再 continue；
 //   - proceed=true：可立即占 inFlight 租约返回；
 //   - waitCh != nil：按 kind 阻塞等 readyCh（构建）或 drainWait（排空）。
 //
-// poolBlocksDirect/poolSnap 是锁外预计算的代理快照，本函数只做纯内存
-// 比对（m.mu 出度 0）。
+// poolBlocksDirect/strictBinding/poolSnap 是锁外预计算的代理快照，本
+// 函数只做纯内存比对（m.mu 出度 0）；account 是本轮从 DB 读出的
+// freshAcct（Reviewer #4）。
 //
 // drain 跟踪本调用方的跨出口等待名额（跨出口状态机）。跨出口等待
 // 名额只在三处递减：客户端 ctx.Done()/stopCh 放弃、成为替换 winner、或
 // ac 已 disposed——绝不在 drainWaiters>0 且 inFlight>0 时放行同出口新
 // 请求（v2.2 §3 唯一替换权状态机）。
 func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *CookieAccount,
-	proxyURL string, allowDirect bool, poolBlocksDirect bool, poolSnap map[int64]proxySnapEntry,
-	drain *acquireDrainReg) (
-	waitCh chan struct{}, kind acquireWaitKind, proceed bool, detached *accountBrowserCtx) {
+	proxyURL string, allowDirect bool, poolBlocksDirect, strictBinding bool,
+	poolSnap map[int64]proxySnapEntry, drain *acquireDrainReg) (
+	waitCh chan struct{}, kind acquireWaitKind, proceed bool, snap detachedCtxSnap) {
 
 	// 构建/重建中：一律等 readyCh（构建失败由唤醒者读 lastBuildErr）。
 	if ac.creating || ac.recreating {
@@ -678,35 +771,36 @@ func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *Cooki
 		if drain.registered && drain.target == ac {
 			drain.leave()
 		}
-		return ac.readyCh, waitReady, false, nil
+		return ac.readyCh, waitReady, false, detachedCtxSnap{}
 	}
 
 	// 匿名槽：同 key 即同出口，无跨出口排空竞争。
 	if ac.key.accountID == 0 {
 		if ac.drainWaiters == 0 {
-			return nil, waitNone, true, nil
+			return nil, waitNone, true, detachedCtxSnap{}
 		}
-		return ac.ensureDrainLocked(), waitDrain, false, nil
+		return ac.ensureDrainLocked(), waitDrain, false, detachedCtxSnap{}
 	}
 
 	// 登录槽身份守卫：jar 身份不符 → 摘除旧槽为自己腾位。
 	if ac.cookieIdentity != "" && account != nil &&
 		cookieIdentity(account.Cookie) != ac.cookieIdentity {
-		if ok, _ := m.detachCtxLocked(ac, browserErr("account #%d identity changed", ac.key.accountID)); ok {
-			return nil, waitNone, false, ac
+		if snap := m.detachSnapLocked(ac, browserErr("account #%d identity changed", ac.key.accountID)); snap.ac != nil {
+			return nil, waitNone, false, snap
 		}
-		return nil, waitNone, false, nil
+		return nil, waitNone, false, snap
 	}
 
 	// R3-M1 强绑定复核：既有就绪槽位在占租约前用锁外预计算的代理快照
-	// 做纯内存比对，命中任一违规立即摘除重建（Oracle MF-5 / Reviewer #4）。
+	// + freshAcct 做纯内存比对，命中任一违规立即摘除重建
+	//（Oracle MF-5 / Reviewer #4）。
 	if account != nil {
-		if ac.readySlotExitViolation(account, poolBlocksDirect, poolSnap) {
-			if ok, _ := m.detachCtxLocked(ac, browserErr(
-				"account #%d exit binding drifted", ac.key.accountID)); ok {
-				return nil, waitNone, false, ac
+		if ac.readySlotExitViolation(account, poolBlocksDirect, strictBinding, poolSnap) {
+			if snap := m.detachSnapLocked(ac, browserErr(
+				"account #%d exit binding drifted", ac.key.accountID)); snap.ac != nil {
+				return nil, waitNone, false, snap
 			}
-			return nil, waitNone, false, nil
+			return nil, waitNone, false, snap
 		}
 	}
 
@@ -717,10 +811,10 @@ func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *Cooki
 			if drain.registered && drain.target == ac {
 				drain.leave()
 			}
-			return nil, waitNone, true, nil
+			return nil, waitNone, true, detachedCtxSnap{}
 		}
 		// 有跨出口等待者：同出口被暂缓，不占名额等 drainWait。
-		return ac.ensureDrainLocked(), waitDrain, false, nil
+		return ac.ensureDrainLocked(), waitDrain, false, detachedCtxSnap{}
 	}
 
 	// 同登录槽非严格模式合法换出口：inFlight==0 时唯一替换 winner。
@@ -728,10 +822,10 @@ func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *Cooki
 		if drain.registered && drain.target == ac {
 			drain.leave()
 		}
-		if ok, _ := m.detachCtxLocked(ac, errExitChanged); ok {
-			return nil, waitNone, false, ac
+		if snap := m.detachSnapLocked(ac, errExitChanged); snap.ac != nil {
+			return nil, waitNone, false, snap
 		}
-		return nil, waitNone, false, nil
+		return nil, waitNone, false, snap
 	}
 
 	// 有在飞：登记跨出口排空等待名额。
@@ -740,17 +834,19 @@ func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *Cooki
 		drain.registered = true
 		drain.target = ac
 	}
-	return ac.ensureDrainLocked(), waitDrain, false, nil
+	return ac.ensureDrainLocked(), waitDrain, false, detachedCtxSnap{}
 }
 
 // readySlotExitViolation 是既有就绪登录槽的 R3-M1 强绑定复核（纯内存
-// 比对，全部代理事实由调用方锁外预计算的 poolSnap 提供）。返回 true
-// 表示该槽位出口已违反绑定规则，应立即摘除重建。规则：
+// 比对，全部代理事实由调用方锁外预计算的 poolSnap + freshAcct 提供）。
+// 返回 true 表示该槽位出口已违反绑定规则，应立即摘除重建。规则：
 //   - (a) 账号已锁直连（proxyIDDirect）但槽位不是显式直连；
 //   - (b) 池禁直连时槽位直连但账号并非锁定直连（-1 -> 0 反向防泄漏）；
+//   - (c) 严格模式下账号新绑定代理启用且其 URL 与槽位出口漂移
+//     （Reviewer #4：管理员在等待窗口内改绑新代理 P2）；
 //   - (d) 槽位 boundProxyID 已删除/禁用或与槽位出口 URL 漂移。
 func (ac *accountBrowserCtx) readySlotExitViolation(account *CookieAccount,
-	poolBlocksDirect bool, poolSnap map[int64]proxySnapEntry) bool {
+	poolBlocksDirect, strictBinding bool, poolSnap map[int64]proxySnapEntry) bool {
 	// (a) 账号锁直连：槽位必须是显式直连。
 	if account.ProxyID == proxyIDDirect && (ac.proxyURL != "" || !ac.allowDirect) {
 		return true
@@ -759,10 +855,49 @@ func (ac *accountBrowserCtx) readySlotExitViolation(account *CookieAccount,
 	if ac.proxyURL == "" && poolBlocksDirect && account.ProxyID != proxyIDDirect {
 		return true
 	}
+	// (c) 严格模式：账号当前绑定代理已启用且 URL 与槽位出口漂移 →
+	// 改绑后的旧槽必须摘除重建，绝不复用陈旧出口。
+	if strictBinding && account.ProxyID > 0 {
+		if ent, ok := poolSnap[account.ProxyID]; ok && ent.enabled &&
+			ent.url != ac.proxyURL {
+			return true
+		}
+	}
 	// (d) 槽位 boundProxyID 已删除/禁用或 URL 漂移。
 	if ac.boundProxyID > 0 {
 		ent, ok := poolSnap[ac.boundProxyID]
 		if !ok || !ent.enabled || ent.url != ac.proxyURL {
+			return true
+		}
+	}
+	return false
+}
+
+// requestExitViolation 是请求级 (proxyURL, allowDirect) 对 freshAcct 的
+// R3-M1 复核（纯内存，锁外调用）：管理员在等待窗口内改绑后，调用方
+// 携带的旧出口可能已不合法——此时直接终态返回比拿陈旧出口跑一趟
+// 必败的 buildAccountCtx 更优。规则与 readySlotExitViolation 同口径：
+//   - (a) 账号锁直连但请求不是显式直连；
+//   - (b) 池禁直连时请求直连但账号并非锁定直连；
+//   - (c) 严格模式下账号新绑定代理启用且其 URL 与请求出口漂移。
+func requestExitViolation(account *CookieAccount, proxyURL string,
+	allowDirect, poolBlocksDirect, strictBinding bool,
+	poolSnap map[int64]proxySnapEntry) bool {
+	if account == nil || account.ID <= 0 {
+		return false
+	}
+	// (a) 账号锁直连：请求必须是显式直连。
+	if account.ProxyID == proxyIDDirect && (proxyURL != "" || !allowDirect) {
+		return true
+	}
+	// (b) 池禁直连：请求直连但账号不是锁直连 → 反向泄漏。
+	if proxyURL == "" && poolBlocksDirect && account.ProxyID != proxyIDDirect {
+		return true
+	}
+	// (c) 严格模式：账号绑定代理启用且 URL 与请求出口漂移。
+	if strictBinding && account.ProxyID > 0 {
+		if ent, ok := poolSnap[account.ProxyID]; ok && ent.enabled &&
+			ent.url != proxyURL {
 			return true
 		}
 	}
@@ -1205,9 +1340,23 @@ func (m *browserManager) SyncAccountCookiesBack(accountID int64, force bool) {
 	m.syncAccountCookiesBackCtx(ctx, client, bcID, accountID, epoch, ident)
 }
 
-// syncAllCookiesBackForce 是 stopImpl 的停机写回：对全部存活登录槽以
-// 共享预算（封顶 800ms）强制写回 Cookie。
-func (m *browserManager) syncAllCookiesBackForce(ctx context.Context) {
+// cookieSyncTarget 是一条停机/强制写回目标的锁内快照（全部字段在
+// m.mu 内核出，锁外零读取 ac.*）。
+type cookieSyncTarget struct {
+	bcID  string
+	accID int64
+	epoch uint64
+	ident string
+}
+
+// syncCookieTargetsBack 对给定目标列表执行共享预算 Cookie 写回
+// （锁外调用）。MF-7：所有目标共用同一个绝对截止（封顶 800ms 单一
+// 总预算），绝不给每条各发一份 800ms 导致停机写回拖长。
+func (m *browserManager) syncCookieTargetsBack(ctx context.Context,
+	client *cdpClient, targets []cookieSyncTarget) {
+	if len(targets) == 0 {
+		return
+	}
 	budget := 800 * time.Millisecond
 	if deadline, ok := ctx.Deadline(); ok {
 		if rem := time.Until(deadline); rem < budget {
@@ -1217,24 +1366,6 @@ func (m *browserManager) syncAllCookiesBackForce(ctx context.Context) {
 	if budget <= 0 {
 		return
 	}
-	type target struct {
-		bcID  string
-		accID int64
-		epoch uint64
-		ident string
-	}
-	m.mu.Lock()
-	client := m.client
-	var targets []target
-	for _, ac := range m.ctxs {
-		if ac.disposed || ac.key.accountID <= 0 || ac.browserContextID == "" {
-			continue
-		}
-		targets = append(targets, target{ac.browserContextID, ac.key.accountID, ac.epoch, ac.cookieIdentity})
-	}
-	m.mu.Unlock()
-	// MF-7：所有快照登录槽共用同一个绝对截止（单一共享 800ms 总预算），
-	// 绝不给每条槽各发一份 800ms 导致停机写回拖长。
 	deadline := time.Now().Add(budget)
 	for _, tg := range targets {
 		rem := time.Until(deadline)
@@ -1247,24 +1378,47 @@ func (m *browserManager) syncAllCookiesBackForce(ctx context.Context) {
 	}
 }
 
-// InvalidateAccount 精准失效指定账号的登录槽（deleted/disabled/proxy 变更 /
-// cookie rotated）。syncCookie=true 且身份未变时先写回 Cookie。
-func (m *browserManager) InvalidateAccount(accountID int64, syncCookie bool, reason string) {
+// syncAllCookiesBackForce 是后台停机写回入口：对全部存活登录槽以
+// 共享预算（封顶 800ms）强制写回 Cookie（stopImpl 已改为同一临界区
+// 内快照+摘除，本函数保留给其它需要单独强制写回的路径）。
+func (m *browserManager) syncAllCookiesBackForce(ctx context.Context) {
 	m.mu.Lock()
-	ac := m.ctxs[browserSlotKey{accountID: accountID}]
-	if ac == nil {
-		m.mu.Unlock()
-		return
+	client := m.client
+	var targets []cookieSyncTarget
+	for _, ac := range m.ctxs {
+		if ac.disposed || ac.key.accountID <= 0 || ac.browserContextID == "" {
+			continue
+		}
+		targets = append(targets, cookieSyncTarget{
+			bcID:  ac.browserContextID,
+			accID: ac.key.accountID,
+			epoch: ac.epoch,
+			ident: ac.cookieIdentity,
+		})
 	}
-	ok, _ := m.detachCtxLocked(ac, browserErr("account #%d invalidated: %s", accountID, reason))
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
+	m.mu.Unlock()
+	m.syncCookieTargetsBack(ctx, client, targets)
+}
+
+// InvalidateAccount 精准失效指定账号的登录槽（deleted/disabled/proxy 变更 /
+// cookie rotated）。callerSync=true 且已发布槽（syncCookie）时先写回 Cookie；
+// 构建中槽位（wasCreating）只 failStreams，局部资源归 buildAccountCtx。
+func (m *browserManager) InvalidateAccount(accountID int64, callerSync bool, reason string) {
+	m.mu.Lock()
+	snap := m.detachSnapLocked(m.ctxs[browserSlotKey{accountID: accountID}],
+		browserErr("account #%d invalidated: %s", accountID, reason))
 	client := m.client
 	m.mu.Unlock()
-	m.failStreamsForCtx(ac, ac.lastBuildErr)
-	m.disposeDetachedCtx(ac, ac.browserContextID, ac.bridge, syncCookie && ac.syncOnDispose, client)
+	if snap.ac == nil {
+		return
+	}
+	m.failStreamsForCtx(snap.ac, snap.err)
+	// 构建中槽位的局部资源归 buildAccountCtx owner——外部摘除方只
+	// failStreams，绝不 dispose（NH-2）；callerSync 只在已发布槽生效。
+	if snap.wasCreating {
+		return
+	}
+	m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, callerSync && snap.syncCookie, client)
 }
 
 // InvalidateByProxy 精准失效绑定 proxyID（或 URL 匹配 oldURL）的全部槽位
@@ -1272,22 +1426,24 @@ func (m *browserManager) InvalidateAccount(accountID int64, syncCookie bool, rea
 // 变更或禁用时调用。
 func (m *browserManager) InvalidateByProxy(proxyID int64, oldURL string, reason string) {
 	m.mu.Lock()
-	var victims []*accountBrowserCtx
+	var victims []detachedCtxSnap
 	for _, ac := range m.ctxs {
 		if ac.disposed {
 			continue
 		}
 		if ac.boundProxyID == proxyID || (oldURL != "" && ac.proxyURL == oldURL) {
-			if ok, _ := m.detachCtxLocked(ac, browserErr("proxy #%d invalidated: %s", proxyID, reason)); ok {
-				victims = append(victims, ac)
+			if snap := m.detachSnapLocked(ac, browserErr("proxy #%d invalidated: %s", proxyID, reason)); snap.ac != nil {
+				victims = append(victims, snap)
 			}
 		}
 	}
 	client := m.client
 	m.mu.Unlock()
-	for _, ac := range victims {
-		m.failStreamsForCtx(ac, ac.lastBuildErr)
-		m.disposeDetachedCtx(ac, ac.browserContextID, ac.bridge, ac.syncOnDispose, client)
+	for _, snap := range victims {
+		m.failStreamsForCtx(snap.ac, snap.err)
+		if !snap.wasCreating {
+			m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, snap.syncCookie, client)
+		}
 	}
 }
 
@@ -1351,13 +1507,23 @@ func (m *browserManager) recreateAccountTab(c *cdpClient, ac *accountBrowserCtx,
 		return
 	}
 	// client 未断连（如单账号代理断流）：仅摘除本槽，兄弟槽零影响。
+	// 单胜出者守卫（Oracle MF-8.4）：InvalidateAccount/stopImpl 可能已抢先
+	// 摘除 ac——snap.ac==nil 时绝不再 failStreams+disposeDetachedCtx（否则
+	// 二次 dispose 且绕过摘除方的 syncCookie=false）。
 	m.mu.Lock()
+	var snap detachedCtxSnap
 	if !ac.disposed && m.ctxs[ac.key] == ac {
-		m.detachCtxLocked(ac, recreateErr)
+		snap = m.detachSnapLocked(ac, recreateErr)
 	}
 	m.mu.Unlock()
-	m.failStreamsForCtx(ac, recreateErr)
-	m.disposeDetachedCtx(ac, bcID, ac.bridge, ac.syncOnDispose, c)
+	if snap.ac == nil {
+		return
+	}
+	m.failStreamsForCtx(snap.ac, snap.err)
+	if snap.wasCreating {
+		return
+	}
+	m.disposeDetachedCtx(snap.ac, snap.bcID, snap.bridge, snap.syncCookie, c)
 }
 
 // doRecreateTab 执行重建的 CDP 序列（锁外，buildCtx 可被取消打断）。

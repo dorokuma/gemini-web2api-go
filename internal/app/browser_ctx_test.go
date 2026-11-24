@@ -21,6 +21,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -511,13 +512,14 @@ func TestBrowserAcquireReadySlotStrongBinding(t *testing.T) {
 	// 持 m.mu 时调用——这里是纯内存比对，不依赖代理池）。
 	poolSnap := snapshotProxyPool()
 	poolBlocksDirect := len(poolSnap) > 0 && !rtCfg().FallbackDirect
-	if !ac.readySlotExitViolation(acct, poolBlocksDirect, poolSnap) {
+	strictBinding := rtCfg().StrictProxyBinding
+	if !ac.readySlotExitViolation(acct, poolBlocksDirect, strictBinding, poolSnap) {
 		t.Fatal("readySlotExitViolation must flag lock-direct account on proxied slot")
 	}
 
 	// 反向：账号锁直连且槽位显式直连 → 不违规。
 	acDirect := &accountBrowserCtx{key: key, proxyURL: "", allowDirect: true}
-	if acDirect.readySlotExitViolation(acct, poolBlocksDirect, poolSnap) {
+	if acDirect.readySlotExitViolation(acct, poolBlocksDirect, strictBinding, poolSnap) {
 		t.Fatal("readySlotExitViolation wrongly flagged explicit-direct slot")
 	}
 }
@@ -639,11 +641,11 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	var drain acquireDrainReg
 	poolSnap := snapshotProxyPool()
 	m.mu.Lock()
-	waitCh, kind, proceed, detached := m.acquirePlanLocked(ac, acct,
-		"http://proxy-new:8080", false, false, poolSnap, &drain)
+	waitCh, kind, proceed, snap := m.acquirePlanLocked(ac, acct,
+		"http://proxy-new:8080", false, false, false, poolSnap, &drain)
 	m.mu.Unlock()
-	if detached != nil || proceed {
-		t.Fatalf("acquirePlanLocked on busy slot: detached=%v proceed=%v, want drain-wait", detached, proceed)
+	if snap.ac != nil || proceed {
+		t.Fatalf("acquirePlanLocked on busy slot: snap=%+v proceed=%v, want drain-wait", snap, proceed)
 	}
 	if kind != waitDrain || waitCh == nil {
 		t.Fatalf("acquirePlanLocked kind=%v waitCh=%v, want waitDrain non-nil", kind, waitCh)
@@ -732,5 +734,198 @@ func TestBrowserBumpAccountEpochAdvances(t *testing.T) {
 	}
 	if !superseded {
 		t.Fatalf("stale slot epoch=%d not superseded (would overwrite new token)", first)
+	}
+}
+
+// TestBrowserStopImplSyncsPublishedCookiesToDB 复核 Reviewer #5：stopImpl
+// 在摘除全部槽位前，先在同一个 m.mu 临界区内快照已发布存活登录槽的
+// 写回目标，锁外用共享预算把 jar 新 Cookie 真实合并写回 DB——jar 里的
+// SIDCC=rotated-on-stop 绝不能丢。这里经真实生产路径（stopImpl →
+// 快照 syncTargets → detachSnapLocked → syncCookieTargetsBack →
+// Storage.getCookies → updateAccountCookieCASLocked）命中 fakeCDPServer
+// jar 写回，断言 DB 中该账号 Cookie 已含 SIDCC=rotated-on-stop。
+func TestBrowserStopImplSyncsPublishedCookiesToDB(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	// proc 是测试进程自身（PID=Getpid），绝不能真杀：桩住杀进程钩子。
+	oldKill := killProcGroupFn
+	defer func() { killProcGroupFn = oldKill }()
+	killProcGroupFn = func(pid, pgid int, d time.Duration) {}
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+	})
+
+	// 真实 DB 账号 + 已发布存活登录槽（bc-stop-1），cookieIdentity 与 DB
+	// 中 Cookie 一致（回写前置校验通过，CAS 能命中）。
+	cookie := "SAPISID=sa; __Secure-1PSID=ps; SID=oldsid"
+	acctID, err := accountInsert("stopsync", cookie, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	defer accountDelete(acctID)
+	acct := accountByID(acctID)
+
+	key := slotKeyForAccount(acct, "", true)
+	ac := &accountBrowserCtx{
+		key:              key,
+		epoch:            1,
+		cookieIdentity:   cookieIdentity(cookie),
+		browserContextID: "bc-stop-1",
+		targetID:         "t-stop-1",
+		sessionID:        "sess-stop-1",
+		allowDirect:      true,
+		readyClosed:      true,
+		lastUsedAt:       time.Now(),
+	}
+	ac.readyCh = make(chan struct{})
+	close(ac.readyCh)
+	m.mu.Lock()
+	m.ctxs[key] = ac
+	m.sessionIndex["sess-stop-1"] = ac
+	m.targetIndex["t-stop-1"] = ac
+	// 已发布槽不得进入写回黑名单：epoch 必须 >= maxSeededEpoch。
+	m.maxSeededEpoch[acctID] = 0
+	m.mu.Unlock()
+
+	// fakeCDPServer 的 bc-stop-1 jar 里放刷新后的新 Cookie——Storage.
+	// getCookies 读它回写。
+	srv.bcMu.Lock()
+	srv.bcStore["bc-stop-1"] = map[string]string{
+		"SAPISID":          "sa",
+		"__Secure-1PSID":   "ps",
+		"SID":              "oldsid",
+		"SIDCC":            "rotated-on-stop",
+		"__Secure-1PSIDCC": "rotated-psidcc",
+	}
+	srv.sessToBC["sess-stop-1"] = "bc-stop-1"
+	srv.bcMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	m.stopImpl(ctx, true)
+
+	// 断言 DB 中该账号 Cookie 已真实合并写入 SIDCC=rotated-on-stop。
+	fresh := accountByID(acctID)
+	if fresh == nil {
+		t.Fatal("account vanished after stopImpl")
+	}
+	if !strings.Contains(fresh.Cookie, "SIDCC=rotated-on-stop") {
+		t.Fatalf("stopImpl write-back lost rotated cookie: DB cookie=%q", fresh.Cookie)
+	}
+	if !strings.Contains(fresh.Cookie, "__Secure-1PSIDCC=rotated-psidcc") {
+		t.Fatalf("stopImpl write-back lost rotated PSIDCC: DB cookie=%q", fresh.Cookie)
+	}
+}
+
+// TestBrowserRecreateTabConcurrentlyInvalidatedNoDoubleDispose 复核 Oracle
+// MF-8.4：recreateAccountTab 在飞（doRecreateTab CDP 阶段）期间，
+// InvalidateAccount 抢先摘除同一槽——recreate 的摘除分支必须看到
+// snap.ac==nil 直接返回，绝不二次 failStreams+disposeDetachedCtx（否则
+// 会对同一已摘除槽二次 dispose 且绕过摘除方的 syncCookie=false）。
+// 这里经真实并发路径：recreateAccountTab 协程 vs InvalidateAccount，断言
+// Target.disposeBrowserContext 只调用 1 次且不触发 Storage.getCookies
+// 回写（InvalidateAccount 用 syncCookie=false）。
+func TestBrowserRecreateTabConcurrentlyInvalidatedNoDoubleDispose(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+	})
+
+	id, _ := accountInsert("recreate", "SAPISID=r; __Secure-1PSID=rr; SID=rs", "")
+	defer accountDelete(id)
+	acct := accountByID(id)
+
+	key := slotKeyForAccount(acct, "", true)
+	ac := &accountBrowserCtx{
+		key:              key,
+		epoch:            1,
+		cookieIdentity:   cookieIdentity("SAPISID=r; __Secure-1PSID=rr; SID=rs"),
+		browserContextID: "bc-recreate-1",
+		targetID:         "t-recreate-1",
+		sessionID:        "sess-recreate-1",
+		allowDirect:      true,
+		readyClosed:      true,
+		lastUsedAt:       time.Now(),
+	}
+	ac.readyCh = make(chan struct{})
+	close(ac.readyCh)
+	m.mu.Lock()
+	m.ctxs[key] = ac
+	m.sessionIndex["sess-recreate-1"] = ac
+	m.targetIndex["t-recreate-1"] = ac
+	gen := m.generation
+	client := m.client
+	m.mu.Unlock()
+	srv.bcMu.Lock()
+	srv.targetToBC["t-recreate-1"] = "bc-recreate-1"
+	srv.sessToBC["sess-recreate-1"] = "bc-recreate-1"
+	srv.bcMu.Unlock()
+
+	// 卡住 recreate 的 CDP 阶段（Target.createTarget 不回复）让 Invalidate
+	// 在飞中抢先摘除。gotCalls 是 buffered chan，不并发读（readLoop
+	// send 与 close 存在 send-on-closed 竞态）——全部结束后统一排干计数。
+	srv.holdReplies.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.recreateAccountTab(client, ac, gen)
+	}()
+	// 让 recreate 进入 doRecreateTab 的 CDP 阶段（createTarget 被 hold）。
+	time.Sleep(80 * time.Millisecond)
+
+	// 并发 Invalidate：抢先摘除 ac（detach 胜出，buildCancel 打断
+	// doRecreateTab，readyCh 关闭）。
+	m.InvalidateAccount(id, false, "cookie rotated")
+
+	// 放行被 hold 的 CDP 回复让 recreate 的 doRecreateTab 走完（或拿到
+	// buildCtx 取消），进入锁内单胜出者守卫：此时 ac 已 disposed，
+	// snap.ac 必须 == nil → 直接返回，零二次清理。
+	srv.holdReplies.Store(false)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recreateAccountTab did not return after concurrent invalidate")
+	}
+
+	// 排干 gotCalls 计数：bc-recreate-1 只允许被 disposeBrowserContext
+	// 恰好 1 次（Invalidate 的锁外 disposeDetachedCtx），且绝不出现
+	// Storage.getCookies 回写（InvalidateAccount 用 syncCookie=false）。
+	// readLoop 已不再 send（holdReplies 已放行 + client 已断连），
+	// 仅排空 buffered 积压，绝不 close(chan)（send/close 竞态）。
+	disposeCalls, getCookieCalls := 0, 0
+	drainDone := time.After(150 * time.Millisecond)
+	drain := func() bool {
+		for {
+			select {
+			case call := <-srv.gotCalls:
+				if call.method == "Target.disposeBrowserContext" {
+					disposeCalls++
+				}
+				if call.method == "Storage.getCookies" {
+					getCookieCalls++
+				}
+			case <-drainDone:
+				return true
+			}
+		}
+	}
+	drain()
+	if getCookieCalls > 0 {
+		t.Fatalf("Storage.getCookies write-back fired %d times on syncCookie=false invalidate", getCookieCalls)
+	}
+	if disposeCalls != 1 {
+		t.Fatalf("disposeBrowserContext calls=%d, want exactly 1 (single-winner)", disposeCalls)
 	}
 }
