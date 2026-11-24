@@ -761,6 +761,11 @@ func classifyError(errStr string) string {
 		// 常驻浏览器没装/拉不起来：不是上游问题也不是出口问题，面板单列一类。
 		// "browser:" 是 browserLocalError.Error() 的统一前缀（见 browser.go）。
 		return "browser_unavailable"
+	case strings.Contains(errStr, "accounts_cooling_down") ||
+		strings.Contains(errStr, "[accounts_cooling_down]"):
+		// 45s 防雪崩短冷却：不是上游故障也不是限流满，面板单列一类——
+		// 连续出现说明这批账号在被上游集中拒绝（多半 cookie 过期或被风控）。
+		return "accounts_cooling_down"
 	case strings.Contains(errStr, "upstream HTTP"):
 		return "upstream_http_error"
 	case strings.Contains(errStr, "unknown model"), strings.Contains(errStr, "not supported"):

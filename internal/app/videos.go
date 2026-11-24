@@ -297,18 +297,55 @@ var videoCall = callGemini
 // consumed) or not signed in, the same job moves on to the next account. With no account
 // left it fails with the pool-exhausted error and the earliest reset.
 func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*StreamResult, error) {
+	// v2.2 §10[R3-S1]：视频任务独立 reqID 占探测位——它是后台长任务，
+	// 不跟前台请求共享 reqID；defer 兜底防任何退出路径泄漏探测位。
+	videoReqID := nextClientReqID()
+	defer releaseReqProbes(videoReqID)
 	skip := videoCoolingAccounts()
+	// v2.2 §3.4/S6：45s 聊天短冷却先并进 skip——全池恰在短冷却时先让它们
+	// 歇着；全跳完没号可挑时原地回退（短冷却不是视频配额问题，几秒就解冻）。
+	usedShortSkip := false
+	for id := range shortCoolingAccountsOnly() {
+		skip[id] = true
+		usedShortSkip = true
+	}
+	triedVideo := map[int64]bool{}
 	var res *StreamResult
 	var err error
 	var boundErr error
-	for tries := len(accountList()); tries > 0; tries-- {
+	// inShortFallback：已进入「全池短冷却原地回退」——回退挑出的活跃短冷却号
+	// 绝不能再过 tryClaimHalfOpenProbe（它对活跃冷却恒 false，过了等于把刚
+	// 回退的号 100% 拒杀，视频回退整体失效）；探测单飞只在半开态有意义。
+	inShortFallback := false
+	// 防死循环硬上限：正常路径每轮最多 triedVideo+1 个新号，回退至多触发 1 次，
+	// 上限放宽到 2*池+1 覆盖「回退后又被 skip 重挑」的全部组合。
+	for tries := 2*len(accountList()) + 1; tries > 0; tries-- {
 		acct, ok := pickCookieAccountExcept(skip)
+		if !ok && usedShortSkip {
+			// 全池账号恰在 45s 短冷却：原地回退把短冷却号放回候选——
+			// 异步长视频任务等得起，让它们再试一次。
+			usedShortSkip = false
+			inShortFallback = true
+			skip = videoCoolingAccounts()
+			for id := range triedVideo {
+				skip[id] = true
+			}
+			acct, ok = pickCookieAccountExcept(skip)
+		}
 		if !ok {
 			break
 		}
+		if !inShortFallback && !tryClaimHalfOpenProbe(acct.ID, videoReqID) {
+			skip[acct.ID] = true // 探测位被占：并入 skip 重挑
+			continue
+		}
 		skip[acct.ID] = true
+		triedVideo[acct.ID] = true
 		mc.PinAccountID = acct.ID
 		_, _, res, err = videoCall(context.Background(), j.Prompt, promptCtx{Latest: j.Prompt}, mc, nil, images, nil, nil)
+		// 每轮 videoCall 返回后立即放探测位：本轮已结算（成功/失败/换号），
+		// 下一轮若挑回同号会重新认领。
+		releaseAccountProbeIfMatch(acct.ID, videoReqID)
 		if err == nil {
 			return res, nil
 		}
@@ -341,6 +378,13 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 		err = fmt.Errorf("no signed-in account is available for video")
 	}
 	return res, err
+}
+
+// shortCoolingAccountsOnly 是 shortCoolingAccounts 的单返回值便捷包装
+// （callOnVideoAccount 只要集合不要解冻时长）。
+func shortCoolingAccountsOnly() map[int64]bool {
+	m, _ := shortCoolingAccounts()
+	return m
 }
 
 func finishVideoJob(j *videoJob, mp4 []byte, mime, errStr string) {

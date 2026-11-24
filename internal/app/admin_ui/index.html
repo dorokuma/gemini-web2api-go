@@ -684,7 +684,8 @@ const pages = {
           <div class="body">
             粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
             APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个
-            启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
+            启用的账号；<b>优先级</b>列可配主备（数值越大越先挑，主力号 100、备用号 10 / 5、默认 0），
+            媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
             凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
             SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄，
             首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出
@@ -696,12 +697,12 @@ const pages = {
             <colgroup>
               <col style="width:48px"><col style="width:160px"><col style="width:80px">
               <col style="width:150px"><col style="width:92px"><col style="width:64px">
-              <col style="width:150px"><col><col style="width:150px">
+              <col style="width:72px"><col style="width:150px"><col><col style="width:150px">
             </colgroup>
             <thead><tr>
               <th class="nw">ID</th><th class="nw">标签</th><th class="nw">状态</th>
               <th class="nw">关键 Cookie</th><th class="nw">SAPISID</th><th class="nw">失败</th>
-              <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
+              <th class="nw">优先级</th><th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${items.map(a => `
               <tr class="${a.health === 'dead' ? 'row-dead' : ''}">
@@ -712,7 +713,7 @@ const pages = {
                   : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
                   : a.health === 'unknown' ? '<span class="badge warn" title="还没成功用过，点「检测」确认">待检测</span>'
                   : '<span class="badge ok">正常</span>'
-                }</td>
+                }${a.cooldown_left_sec > 0 ? ' <span class="badge warn" title="' + t('连续上游失败后进入 45s 防雪崩短冷却，期间挑号自动跳过本号') + '">' + a.cooldown_left_sec + 's</span>' : ''}</td>
                 <td class="nw" title="${LANG === 'en' ? 'Total ' + a.cookie_count + ' cookies, key items: ' + (a.key_cookies||[]).join(' / ') : '共 ' + a.cookie_count + ' 个 cookie，关键项：' + (a.key_cookies||[]).join(' / ')}">
                   <span class="badge ${a.has_1psidts && a.has_osid ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/10 项</span>
                   ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出">缺 TS</span>'}
@@ -720,6 +721,7 @@ const pages = {
                 </td>
                 <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
                 <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
+                <td class="num nw" title="${LANG === 'en' ? 'Higher is picked first; main=100, backup=10/5, default=0' : '数值越大越先被挑中：主力号填 100，备用号填 10 / 5，默认 0'}">${a.priority || 0}</td>
                 <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
                 <td class="pre truncate" title="${escapeHtml(t(a.last_error || ''))}">${escapeHtml(t(a.last_error) || '—')}</td>
                 <td class="nw">
@@ -727,11 +729,11 @@ const pages = {
                     <button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button>
                     <button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>
                     <button class="btn muted" onclick="toggleCookieAcct(${a.id})">${a.status === 'enabled' ? '禁用' : '启用'}</button>
-                    <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')}, ${a.authuser || 0}, ${a.proxy_id || 0})">编辑</button>
+                    <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')}, ${a.authuser || 0}, ${a.proxy_id || 0}, ${a.priority || 0})">编辑</button>
                     <button class="btn danger" onclick="delCookieAcct(${a.id})">删除</button>
                   </span>
                 </td>
-              </tr>`).join('') || '<tr><td colspan="9" class="empty">Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。</td></tr>'}
+              </tr>`).join('') || '<tr><td colspan="10" class="empty">Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -1091,7 +1093,7 @@ const RT_GROUPS = [
     title: '常驻浏览器传输层',
     fields: [
       { k: 'browser_transport', label: '浏览器传输（常驻 Chromium）', type: 'bool',
-        hint: '开：对话请求改走常驻真实浏览器（Chromium CDP + 页内流式 fetch），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管自动续期。默认关——不主动拉起 Chromium（常驻约 1.45 GB 内存）。浏览器路径与 profile 目录是部署级配置（--browser-path / config.json），不在本面板。单常驻粘性主号（策略 M1）：同一份登录态下 authuser=0..9 共用一个 /app Tab，驻留号失效或该模型冷却时才在 30s 最小冷却下切号' },
+        hint: '开：对话请求改走常驻真实浏览器（Chromium CDP + 页内流式 fetch），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管自动续期。默认关——不主动拉起 Chromium（常驻约 1.45 GB 内存）。浏览器路径与 profile 目录是部署级配置（--browser-path / config.json），不在本面板。单 Chromium 多 BrowserContext 物理隔离：每个登录账号与每个匿名出口各驻留独立的 BrowserContext + 专属代理桥，账号间 Cookie/出口 100% 物理隔离，多账号并发互不串出口、零切号冷却' },
       { k: 'browser_fallback_http', label: '浏览器缺席时回退 HTTP', type: 'bool',
         hint: '关（默认）：浏览器传输开着但本机找不到/拉不起浏览器时，请求直接回 502 browser_unavailable，绝不静默降级回纯 Go HTTP（开这个功能图的就是浏览器指纹，悄悄换回 Go 等于没开）。开：可用性优先，浏览器缺席时回退原有纯 Go HTTP 路径' },
     ],
@@ -1344,6 +1346,12 @@ async function addCookieAcct() {
         <div class="hint">浏览器里同时登了多个 Google 号才需要改：打开那个号的 Gemini，地址栏是 /u/1/ 就填 1，没有 /u/ 就是 0。同一串 cookie 想当几个号用，就导入几次、各填各的序号。</div>
       </div>
 
+      <div class="field">
+        <label>优先级</label>
+        <input data-name="priority" type="text" inputmode="numeric" value="0" />
+        <div class="hint">主备优先级：数值越大越先被挑中。主力号填 100，备用号填 10 / 5，默认 0 与旧行为一致（同级仍按最久未用轮转）。范围 -1000..10000。</div>
+      </div>
+
       <div class="segbar" data-role="seg">
         <button type="button" data-mode="raw" class="on">整串粘贴（推荐）</button>
         <button type="button" data-mode="fields">逐项填写</button>
@@ -1429,6 +1437,8 @@ async function addCookieAcct() {
       const note = (overlay.querySelector('[data-name=note]').value || '').trim();
       const authuser = parseAuthUser(overlay.querySelector('[data-name=authuser]').value);
       if (authuser === null) return { error: '账号序号要填 0 到 9 的整数' };
+      const priority = parsePriority(overlay.querySelector('[data-name=priority]').value);
+      if (priority === null) return { error: '优先级要填 -1000 到 10000 的整数' };
       const isRaw =overlay.querySelector('[data-role=seg] button.on').dataset.mode === 'raw';
       let cookie;
       if (isRaw) {
@@ -1442,7 +1452,7 @@ async function addCookieAcct() {
       }
       if (!cookie) return { error: 'Cookie 不能为空' };
       if (!cookie.includes('SAPISID')) return { error: 'cookie 里没有 SAPISID，多半没复制全' };
-      return { label, cookie, note, authuser };
+      return { label, cookie, note, authuser, priority };
     },
   });
   if (!data) return;
@@ -1474,7 +1484,17 @@ function parseAuthUser(v) {
   return parseInt(s, 10);
 }
 
-async function editCookieAcct(id, label, note, authuser, proxyId) {
+// parsePriority 把优先级输入框的值转成 -1000..10000 的整数，不合法返回 null。空 = 0。
+function parsePriority(v) {
+  const s = String(v ?? '').trim();
+  if (s === '') return 0;
+  if (!/^-?\d+$/.test(s)) return null;
+  const n = parseInt(s, 10);
+  if (n < -1000 || n > 10000) return null;
+  return n;
+}
+
+async function editCookieAcct(id, label, note, authuser, proxyId, priority) {
   const proxies = (await api('api/proxies')).items || [];
   const proxyOptions = [
     { value: '0', label: '自动（第一次用到哪个代理就绑哪个）' },
@@ -1484,6 +1504,8 @@ async function editCookieAcct(id, label, note, authuser, proxyId) {
     { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
     { name: 'authuser', label: '账号序号', value: String(authuser || 0),
       hint: '浏览器里同时登了多个 Google 号时用：地址栏 /u/1/ 填 1，没有 /u/ 填 0。' },
+    { name: 'priority', label: '优先级', value: String(priority ?? 0),
+      hint: '主备优先级：数值越大越先被挑中。主力号填 100，备用号填 10 / 5，默认 0。' },
     { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
     // 代理池为空也始终显示：支持「先锁本机直连再加代理」的部署顺序。
     { name: 'proxy_id', label: '绑定出口', value: String(proxyId ?? 0), options: proxyOptions,
@@ -1497,7 +1519,9 @@ async function editCookieAcct(id, label, note, authuser, proxyId) {
   if (!data) return;
   const au = parseAuthUser(data.authuser);
   if (au === null) return flash(t('账号序号要填 0 到 9 的整数'));
-  const body = { label: data.label, note: data.note, authuser: au };
+  const pri = parsePriority(data.priority);
+  if (pri === null) return flash(t('优先级要填 -1000 到 10000 的整数'));
+  const body = { label: data.label, note: data.note, authuser: au, priority: pri };
   if (data.proxy_id !== undefined) body.proxy_id = parseInt(data.proxy_id, 10) || 0;
   const j = await api('api/cookies/' + id, {
     method: 'PATCH', body: JSON.stringify(body),
@@ -2296,6 +2320,14 @@ const I18N_EN = {
   '标签': 'Label',
   '关键 Cookie': 'Key Cookies',
   '最近成功': 'Last success',
+  '优先级': 'Priority',
+  '主备优先级：数值越大越先被挑中。主力号填 100，备用号填 10 / 5，默认 0 与旧行为一致（同级仍按最久未用轮转）。范围 -1000..10000。':
+    'Failover priority: higher is picked first. Main=100, backup=10 / 5, default=0 keeps legacy behaviour (round-robin within the same tier). Range -1000..10000.',
+  '主备优先级：数值越大越先被挑中。主力号填 100，备用号填 10 / 5，默认 0。':
+    'Failover priority: higher is picked first. Main=100, backup=10 / 5, default=0.',
+  '优先级要填 -1000 到 10000 的整数': 'Priority must be an integer between -1000 and 10000',
+  '连续上游失败后进入 45s 防雪崩短冷却，期间挑号自动跳过本号':
+    'In a 45s anti-avalanche cooldown after repeated upstream refusals; skipped by account picking meanwhile',
   '未命名': 'Unnamed',
   '缺 TS': 'Missing TS',
   '缺 OSID': 'Missing OSID',
@@ -2586,8 +2618,8 @@ const I18N_HTML_EN = {
   '每个代理享有独立的并发 / RPM / RPH 配额，<b>配越多代理，总容量线性放大</b>。 请求会自动找有空位的代理，都满则返回 HTTP 429。失败 5 次自动熔断， 「重置」可手动恢复。<br><br> 注意：配了至少一个代理后<b>默认不会再退回直连</b>，避免代理满了把主机 IP 也打爆； 要可用性优先可以在「设置」页打开「无可用代理时退回直连」。熔断的代理默认歇 120 分钟自动放回池子（实测被拦的出口 106-121 分钟自恢复），也可以在这里手动重置。 实测单个出口打 80-180 次就会被 Google 拦，所以扩容只能靠加出口。':
     'Each proxy has its own independent concurrency / RPM / RPH quota; <b>the more proxies configured, the more total capacity scales linearly</b>. Requests automatically route to an available proxy, returning HTTP 429 if all are full. 5 consecutive failures trigger an automatic circuit breaker; "Reset" restores manually.<br><br> Note: once at least one proxy is configured, requests <b>no longer fall back to direct by default</b> to prevent host IP burnout when proxies saturate. If availability is preferred, enable "Fall back to direct when no proxy is available" in Settings. Tripped proxies rest for 120 minutes before returning to the pool (blocked egresses measured 106-121 min to recover), or can be reset manually here. Testing showed single egresses get blocked by Google after 80-180 requests, so scaling capacity requires adding egresses.',
 
-  '粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID / APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个 启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br> 凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄， 首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出 （Chrome 新版本的设备绑定会话续不了）。':
-    'Paste the <b>full cookie string</b> from gemini.google.com (must include at least SID / HSID / SSID / APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS). Requests rotate among enabled accounts using <b>least-recently-used first</b>. Media generation has a quota of 10/day per account; configuring more accounts increases overall capacity.<br><br> Credentials are <b>never sent back to the browser</b> once saved; the list displays only sanitized summaries (cookie count / key items / last 4 digits of SAPISID / failure count). Accounts missing <code>__Secure-1PSIDTS</code> are highlighted in yellow and the first keepalive attempts to mint one with Google; if repeated failures occur, re-export using <b>Firefox</b> (recent Chrome versions use device-bound sessions that cannot be renewed).',
+  '粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID / APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个 启用的账号；<b>优先级</b>列可配主备（数值越大越先挑，主力号 100、备用号 10 / 5、默认 0）， 媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br> 凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄， 首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出 （Chrome 新版本的设备绑定会话续不了）。':
+    'Paste the <b>full cookie string</b> from gemini.google.com (must include at least SID / HSID / SSID / APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS). Requests rotate among enabled accounts using <b>least-recently-used first</b>; the <b>Priority</b> column configures failover tiers (higher is picked first — main=100, backup=10 / 5, default=0). Media generation has a quota of 10/day per account; configuring more accounts increases overall capacity.<br><br> Credentials are <b>never sent back to the browser</b> once saved; the list displays only sanitized summaries (cookie count / key items / last 4 digits of SAPISID / failure count). Accounts missing <code>__Secure-1PSIDTS</code> are highlighted in yellow and the first keepalive attempts to mint one with Google; if repeated failures occur, re-export using <b>Firefox</b> (recent Chrome versions use device-bound sessions that cannot be renewed).',
 
   '改完点保存<b>立刻生效</b>，不用重启。存在数据库里，优先级高于 <code>config.json</code> 和命令行参数。':
     'Click save to <b>apply immediately</b> without restart. Stored in database with higher priority than <code>config.json</code> and CLI flags.',

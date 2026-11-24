@@ -81,14 +81,11 @@ func refreshBL(proxyURL string) {
 	var body []byte
 	var err error
 	// 浏览器传输模式：从常驻页面拿（页内 fetch /app 的 HTML 里有 cfb2h）。
-	// 匿名语义不变——这个值跟登录态无关，浏览器 jar 里登着谁也不影响。
-	// 但存在代理池（或浏览器已绑定特定出口）时绝不能为了抓 bl 去抢切共享
-	// 浏览器桥：匿名刷新按目标出口走纯 Go HTTP，避免一次后台抓取把桥的
-	// 出口从正在用的代理切走（跨出口泄漏，见 acquireBridgeExit 协调）。
-	if shouldUseBrowserTransport() && !hasProxyPool() && browserMgr.seedAccountBound() == 0 {
+	// 匿名语义不变——这个值跟登录态无关。v6.6.0 多 Context：匿名槽按出口分
+	// 键互不干扰，浏览器活着即可用；槽位未就绪（auxSlotReady 拒绝）时无缝
+	// 落纯 Go HTTP，不打印错误也不丢弃刷新机会。
+	if shouldUseBrowserTransport() && !hasProxyPool() && browserRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		// proxyURL 传进浏览器层：冷启动刚建好的桥用首航保守出口，本次选定
-		// 的 proxyURL 在 ensureRunning 返回后同步（见 doBrowserStreamRequestCtx）。
 		status, b, berr := browserMgr.doBrowserFetchCtx(ctx, proxyURL, nil,
 			"https://gemini.google.com/app", "GET",
 			map[string]string{
@@ -97,11 +94,12 @@ func refreshBL(proxyURL string) {
 			}, nil, false, nil)
 		cancel()
 		if berr != nil {
-			if isBrowserLocalError(berr) && !rtCfg().BrowserFallbackHTTP {
+			if isBrowserAuxSkip(berr) {
+				body, err = fetchAppPage("", 0, proxyURL)
+			} else if isBrowserLocalError(berr) && !rtCfg().BrowserFallbackHTTP {
 				logf("[bl] 浏览器不可用，继续用当前值: %v", berr)
 				return
-			}
-			if isBrowserLocalError(berr) {
+			} else if isBrowserLocalError(berr) {
 				logf("[bl] 浏览器抓 /app 失败，回退纯 Go HTTP（browser_fallback_http 已开）: %v", berr)
 				body, err = fetchAppPage("", 0, proxyURL)
 			} else {

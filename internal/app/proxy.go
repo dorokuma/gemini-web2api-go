@@ -385,6 +385,13 @@ func validateProxyURL(s string) error {
 }
 
 func proxyUpdate(id int64, name, url string, enabled *bool, weight *int) error {
+	// 快照旧值：InvalidateByProxy 按 oldURL/oldEnabled 精准判定（仅删除、
+	// URL 变更或禁用时失效；仅改名称/权重不打断在途流）。
+	old := proxyByID(id)
+	oldURL, oldEnabled := "", false
+	if old != nil {
+		oldURL, oldEnabled = old.URL, old.Enabled
+	}
 	q := `UPDATE proxies SET `
 	args := []interface{}{}
 	parts := []string{}
@@ -416,14 +423,40 @@ func proxyUpdate(id int64, name, url string, enabled *bool, weight *int) error {
 	_, err := getDB().Exec(q, args...)
 	if err == nil {
 		loadProxies()
+		urlChanged := url != "" && oldURL != "" && url != oldURL
+		disabled := enabled != nil && !*enabled && (old == nil || oldEnabled)
+		if shouldUseBrowserTransport() && (urlChanged || disabled) {
+			browserMgr.InvalidateByProxy(id, oldURL, "proxy updated")
+		}
 	}
 	return err
 }
 
+// proxyByID 按 id 取代理（含 disabled），取不到返回 nil。
+func proxyByID(id int64) *Proxy {
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	for _, p := range proxyCache {
+		if p.ID == id {
+			cp := p
+			return &cp
+		}
+	}
+	return nil
+}
+
 func proxyDelete(id int64) error {
+	old := proxyByID(id)
+	oldURL := ""
+	if old != nil {
+		oldURL = old.URL
+	}
 	_, err := getDB().Exec(`DELETE FROM proxies WHERE id=?`, id)
 	if err == nil {
 		loadProxies()
+		if shouldUseBrowserTransport() {
+			browserMgr.InvalidateByProxy(id, oldURL, "proxy deleted")
+		}
 	}
 	return err
 }

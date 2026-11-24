@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,21 @@ type CookieAccount struct {
 	// AuthUser 是浏览器里多号登录时的账号序号：同一串 cookie 里登着好几个号，
 	// 请求路径带 /u/N 才落到第 N 个号，0 = 默认号（裸路径）。
 	AuthUser int `json:"authuser"`
+	// Priority 是主备优先级（v6.6.0）：数值越大越先被挑中，建议主力号 100、
+	// 备用号 10 / 5，默认 0 与旧行为一致（同级之间仍按失败数与最久未用轮转）。
+	Priority int `json:"priority"`
+}
+
+// 账号优先级的合法范围：面板/API 越界直接 400 零写库。
+const (
+	minAccountPriority = -1000
+	maxAccountPriority = 10000
+)
+
+// accountSetPriority 改主备优先级（PATCH 用；值已由调用方校验过范围）。
+func accountSetPriority(id int64, priority int) error {
+	_, err := getDB().Exec(`UPDATE accounts SET priority=? WHERE id=?`, priority, id)
+	return err
 }
 
 // splitCookiePairs 把 "k=v; k=v" 拆成键值对。
@@ -161,8 +177,8 @@ func accountInsert(label, cookie, note string) (int64, error) {
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
-		 FROM accounts ORDER BY id`)
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		 FROM accounts ORDER BY priority DESC, id`)
 	if err != nil {
 		return nil
 	}
@@ -171,7 +187,7 @@ func accountList() []CookieAccount {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
 			continue
 		}
 		out = append(out, a)
@@ -186,10 +202,10 @@ func accountList() []CookieAccount {
 func accountByID(id int64) *CookieAccount {
 	var a CookieAccount
 	err := getDB().QueryRow(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
 		 FROM accounts WHERE id=?`, id).
 		Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser)
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority)
 	if err != nil {
 		return nil
 	}
@@ -456,8 +472,8 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	// 出口就按"无偏好"选了；等换号换到好号，出口已经定死 —— 于是好号的出口
 	// 粘性被坏号带偏。实测 1 好 2 坏时出口在两个代理间对半分。
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
-		 FROM accounts WHERE status='enabled' ORDER BY fail_count ASC, last_used_at ASC, id ASC`)
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		 FROM accounts WHERE status='enabled' ORDER BY priority DESC, fail_count ASC, last_used_at ASC, id ASC`)
 	if err != nil {
 		return nil, false
 	}
@@ -465,7 +481,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
 			continue
 		}
 		if skip[a.ID] {
@@ -545,6 +561,11 @@ func autoDisableIfDead(id int64) {
 	if _, err := getDB().Exec(
 		`UPDATE accounts SET status='disabled' WHERE id=? AND status='enabled'`, id); err == nil {
 		logf("[cookie] 账号 #%d 连续 %d 次鉴权失败，已自动停用", id, fails)
+		// SF-1：停用成功后精准失效其常驻 BrowserContext，避免停用槽
+		// 继续被懒建复用。
+		if shouldUseBrowserTransport() {
+			browserMgr.InvalidateAccount(id, false, "disabled")
+		}
 	}
 }
 
@@ -933,18 +954,38 @@ func cookieIdentity(cookie string) string {
 // 带了另一个账号的 SID），照单全收就等于把 A 号的凭据写进 B 号那一行。之后这个号
 // 在面板上显示的还是原来的标签，实际发出去的却是别人的会话，而且**完全静默**。
 // 身份对不上就不写，宁可让这次刷新白费。
+//
+// v6.6.0：串行经 acquireAcctCookieLock（L1）与 rotateAccountOpts / 浏览器
+// buildAccountCtx 播种 / syncAccountCookiesBackCtx 写回严格互斥；写库走
+// updateAccountCookieCASLocked（merged==cur 不发 UPDATE，变化时 CAS 条件更新）。
+// 真实写库成功后 BumpAccountEpoch + 放锁 InvalidateAccount（`cookie rotated`）——
+// 无变化快路径绝不空转误杀健康槽。
 func updateAccountCookie(id int64, cookie string) {
 	if id <= 0 || cookie == "" {
 		return
 	}
-	var cur string
-	if err := getDB().QueryRow(`SELECT cookie FROM accounts WHERE id=?`, id).Scan(&cur); err == nil {
-		if got, want := cookieIdentity(cookie), cookieIdentity(cur); got != want {
-			logf("[cookie] 账号 #%d 的刷新结果身份对不上，已丢弃不写回", id)
-			return
-		}
+	unlock, err := acquireAcctCookieLock(context.Background(), id)
+	if err != nil {
+		return
 	}
-	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`, cookie, id)
+	var cur string
+	if err := getDB().QueryRow(`SELECT cookie FROM accounts WHERE id=?`, id).Scan(&cur); err != nil {
+		unlock()
+		return
+	}
+	written := updateAccountCookieCASLocked(id, cur, cookie)
+	// MF-6：真实写库成功后先在 acctCookieLock（L1）内 BumpAccountEpoch，
+	// 杜绝新刷 Cookie 与并发回写交错时代际漂移；再放锁，最后 Invalidate。
+	// R2-NH-3：Bump 无条件推进（不门控 shouldUseBrowserTransport），
+	// Invalidate 仍按开关门控。
+	bump := written && cookie != cur
+	if bump {
+		browserMgr.BumpAccountEpoch(id)
+	}
+	unlock()
+	if bump && shouldUseBrowserTransport() {
+		browserMgr.InvalidateAccount(id, false, "cookie rotated")
+	}
 }
 
 // xsrfErrBlamesCookie 判断取 XSRF（抓 /app）失败是不是 cookie 的错。

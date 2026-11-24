@@ -284,7 +284,13 @@ func writeGeminiCallError(w http.ResponseWriter, err error, res *StreamResult) {
 	var mde *ModelDowngradedError
 	var ptl *PromptTooLongError
 	var rle *RateLimitError
+	var ace *AccountCooldownError
 	switch {
+	case errors.As(err, &ace):
+		if ace.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(ace.RetryAfter.Seconds()))))
+		}
+		writeGeminiError(w, 429, ace.Error())
 	case errors.As(err, &mde):
 		if mde.RetryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(mde.RetryAfter.Seconds()))))
@@ -587,7 +593,8 @@ func handleGenerateContent(w http.ResponseWriter, r *http.Request, model string)
 		}
 		status := 502
 		var mde *ModelDowngradedError
-		if errors.As(err, &mde) {
+		var ace *AccountCooldownError
+		if errors.As(err, &mde) || errors.As(err, &ace) {
 			status = 429
 		}
 		recordUpstreamFailure("gemini.generateContent", g.modelName, g.prompt, res, status, err, false)
@@ -736,7 +743,8 @@ func handleStreamGenerateContent(w http.ResponseWriter, r *http.Request, model s
 		}
 		status := 502
 		var mde *ModelDowngradedError
-		if errors.As(err, &mde) {
+		var ace *AccountCooldownError
+		if errors.As(err, &mde) || errors.As(err, &ace) {
 			status = 429
 		}
 		recordUpstreamFailure("gemini.streamGenerateContent", g.modelName, g.prompt, res, status, err, true)

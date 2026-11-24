@@ -73,6 +73,11 @@ type browserProxyBridge struct {
 	// allowLoopback 仅测试用：允许 CONNECT 回环目标。生产恒 false，
 	// 回环 + 自身端口一律拒绝（防自环 FD 耗尽与 /admin SSRF）。
 	allowLoopback bool
+
+	// onConnectTarget 仅测试用：每条进入 handleConnect 的 CONNECT 目标
+	// host:port 上报一次（含被拒项），生产恒 nil。让冒烟测试可断言
+	// rootBridge（根 Profile）零业务流量。
+	onConnectTarget func(target string)
 }
 
 // newBrowserProxyBridge 起监听但**不**接请求——Chromium 真正连过来之前，
@@ -139,6 +144,9 @@ func (b *browserProxyBridge) handleConnect(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Allow", http.MethodConnect)
 		http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
 		return
+	}
+	if cb := b.onConnectTarget; cb != nil {
+		cb(r.Host)
 	}
 	if err := b.checkTarget(r.Host); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

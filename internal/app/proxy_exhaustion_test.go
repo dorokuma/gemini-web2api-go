@@ -230,128 +230,12 @@ func TestStrictBindingSwitchesAccountNotProxy(t *testing.T) {
 // 高危冲突 1 回归：browser_transport 的 M1 粘性 + strict_proxy_binding 同时开。
 // 驻留号绑的出口满 → Bound 换号必须把受阻驻留号并进 exclude，否则
 // stickyResidentAccountFor 会把它原样返回，外层每次重试都撞同一个 Bound 错。
-func TestStrictBindingExcludesBlockedResident(t *testing.T) {
-	a, _ := withTwoProxies(t, true)
-	rtMu.Lock()
-	rtVal.BrowserTransport = true
-	rtMu.Unlock()
-	resident := addTestAccount(t, "resident")
-	bindAccountProxy(resident, a) // 驻留号绑在满出口 A 上
-
-	m := browserMgr
-	m.mu.Lock()
-	oldSeed := m.seed
-	m.seed = browserSeedState{AccountID: resident, SeededAt: time.Now().Unix()}
-	m.mu.Unlock()
-	t.Cleanup(func() { m.mu.Lock(); m.seed = oldSeed; m.mu.Unlock() })
-
-	// 换号重试入口：Bound 错误应把驻留号并入 exclude 并放行重试（未吐过内容）。
-	exclude := map[int64]bool{}
-	berr := &RateLimitError{Reason: "concurrent", ProxyID: a, Bound: true}
-	if !retryOnAnotherAccount(&StreamResult{AccountID: resident}, berr,
-		Models["gemini-3.6-flash"], exclude) {
-		t.Fatal("Bound 错误且未吐内容时应换号重试")
-	}
-	if !exclude[resident] {
-		t.Fatal("受阻驻留号必须并进 exclude，否则 stickyResidentAccountFor 会反复返回它")
-	}
-	// 断言核心语义：受阻驻留号进了 exclude 后不再被 M1 粘性挑回。
-	if got := stickyResidentAccountFor(exclude, Models["gemini-3.6-flash"].Upstream); got != nil {
-		t.Fatalf("受阻驻留号 #%d 还被挑回：%+v", resident, got)
-	}
-
-	// 多轮续接同样走这条换号：会话绑的号 Bound 出错 → conv.accountID 进 exclude，
-	// 下一轮 stickyResidentAccountFor 不会把同一个受阻驻留号再挑回来。
-	exclude2 := map[int64]bool{}
-	if !retryOnAnotherAccount(&StreamResult{AccountID: resident}, berr,
-		Models["gemini-3.6-flash"], exclude2) || !exclude2[resident] {
-		t.Fatal("多轮换号同样要把受阻驻留号并进 exclude")
-	}
-	if got := stickyResidentAccountFor(exclude2, ""); got != nil {
-		t.Fatalf("多轮路径受阻驻留号还被挑回：%+v", got)
-	}
-
-	// 换号已吐过内容时不能重试（客户端会收到两遍），Bound 同样受守。
-	if retryOnAnotherAccount(&StreamResult{AccountID: resident, Emitted: "部分"}, berr,
-		Models["gemini-3.6-flash"], map[int64]bool{}) {
-		t.Fatal("已吐过内容的 Bound 不该换号重来")
-	}
-}
 
 // R1 修复 3 真实入口回归：M1 + strict_model 下 Bound 内层换号绝不挑中冷却号。
 // 驻留号绑 A（满）受阻 → 内层换号时 cooling 号虽然在池里也必须被 busy 跳过；
 // healthy 绑 B 胜出后会去走 getXSRF（M1 下走常驻浏览器 fetch，127.0.0.1:1 立即
 // 失败 → cookie 不可用错），它出现在归属字段本身就证明冷却号被跳过。
 // 冷却号 + 受阻驻留号之外没有健康号时，返回 *RateLimitError{Bound:true}。
-func TestStrictBindingM1BoundSwitchSkipsCoolingAccount(t *testing.T) {
-	a, b := withTwoProxies(t, true)
-	rtMu.Lock()
-	rtVal.BrowserTransport = true
-	rtVal.StrictModel = true
-	rtVal.StrictModelCooldownMin = 300
-	rtVal.FallbackAnon = false
-	rtMu.Unlock()
-	resetDowngrades(t)
-	mc := Models["gemini-3.6-flash"]
-
-	resident := addTestAccount(t, "m1resident")
-	cooling := addTestAccount(t, "m1cooling")
-	healthy := addTestAccount(t, "m1healthy")
-	bindAccountProxy(resident, a) // 驻留号绑在满出口 A
-	bindAccountProxy(healthy, b)
-	markDowngraded(cooling, mc) // cooling 号在 mc 上冷却：未绑定，绝不能被挑中
-
-	m := browserMgr
-	m.mu.Lock()
-	oldSeed := m.seed
-	m.seed = browserSeedState{AccountID: resident, SeededAt: time.Now().Unix()}
-	m.mu.Unlock()
-	t.Cleanup(func() { m.mu.Lock(); m.seed = oldSeed; m.mu.Unlock() })
-
-	// 调用方的 exclude 只能被 Bound 内层的驻留号有意并入（让下一轮
-	// stickyResidentAccountFor 不再挑回它）；XSRF 换号往 skip 加的冷却号 /
-	// 挑过的号绝不能写回调用方的 exclude（R5-S2：skip 已是独立浅拷贝）。
-	callerExclude := map[int64]bool{}
-	res, err := streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
-		mc, nil, nil, nil, nil, callerExclude)
-	if err == nil {
-		t.Fatal("127.0.0.1:1 不可达，请求不该成功")
-	}
-	// 胜出的是 healthy：它的归属必须记在结果里，且绝不能是冷却号。
-	if res == nil || res.AccountID != healthy {
-		t.Fatalf("Bound 换号应挑中健康号 #%d（冷却号 #%d 必须被跳过），得到 res=%+v err=%v",
-			healthy, cooling, res, err)
-	}
-	var rle *RateLimitError
-	if res.AccountID == cooling {
-		t.Fatalf("Bound 换号绕过了 strict_model 冷却：挑中了冷却号 #%d", cooling)
-	}
-	// 加严断言（R2）：冷却号必须从未被挑中——既没被首绑仲裁写库（ProxyID 仍为 0），
-	// 也没被挑号记录过 last_used_at（仍 0）。任何一次误挑都会留下这两者之一。
-	if acc := accountByID(cooling); acc == nil || acc.ProxyID != 0 || acc.LastUsedAt != 0 {
-		t.Fatalf("冷却号绝不能被挑中/绑定：%+v", acc)
-	}
-	// exclude 里只能有驻留号这个有意并入项，绝不能混入冷却号或 healthy。
-	if callerExclude[cooling] {
-		t.Fatalf("冷却号绝不能被写进调用方 exclude：%v", callerExclude)
-	}
-	if callerExclude[healthy] {
-		t.Fatalf("挑中过的健康号绝不能被写回调用方 exclude：%v", callerExclude)
-	}
-
-	// 健康号也没了：只剩绑 A 的驻留号 + 冷却号 → 全阻应报 Bound 429（A 满），
-	// 绝不能报 ModelDowngradedError（排除集里塞的是 Bound 受阻号，不是降级号）。
-	_ = accountDelete(healthy)
-	_, err = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
-		mc, nil, nil, nil, nil, map[int64]bool{})
-	if !errors.As(err, &rle) || !rle.Bound || rle.ProxyID != a {
-		t.Fatalf("驻留号受阻、另一号冷却时应报 Bound 429(出口 %d)，得到 %v", a, err)
-	}
-	var mde *ModelDowngradedError
-	if errors.As(err, &mde) {
-		t.Fatalf("Bound 耗尽不能谎报 ModelDowngradedError：%v", err)
-	}
-}
 
 // R1 修复 5 回归：claimAccountProxy 并发首次绑定原子化——两个并发竞争者
 // 对同一未绑定账号只能产出一个胜者出口，且绑定落库后与胜者一致。

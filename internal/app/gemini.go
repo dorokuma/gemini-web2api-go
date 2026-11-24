@@ -396,6 +396,13 @@ type StreamResult struct {
 	// true；零值 false 表示本轮可能已碰上游（或与本路无关），被 convTake
 	// 消费的会话 head 绝不归还复用。多轮续接靠它判断被消费的 head 能否安全归还。
 	CanRestoreConvHead bool
+
+	// ── 延迟代理记账暂挂（v6.6.0 防雪崩）──
+	// deferProxyCommit 模式下代理成败先记在这里、不写库，由各返回路径统一
+	// commitPendingProxy 结算：毒载荷（双号同落 C1/C1b）双端零扣分，非毒才记。
+	PendingProxyFail string // 暂挂的代理失败原因（"" = 无失败）
+	PendingProxyOK   bool   // 暂挂的代理成功
+	proxyCommitted   bool   // commitPendingProxy 幂等防双计
 }
 
 // proxyIDDirect 是账号绑定表里的「锁定本机直连」哨兵（#proxyIDDirect）：
@@ -866,34 +873,395 @@ type fileRef struct {
 // ctx 是客户端请求的 context：客户端断开后中止上游读取、上传和重试等待，不再替
 // 已经走掉的请求生成（否则账号照样被占用、重试还会再发一次，限流名额也一直占着）。
 // 取消导致的失败不记进代理 / cookie 健康度，那不是它们的错。
+// streamOnceOpts 是 streamGenerateOnceOpts 的可选参数集（防雪崩接线的
+// 内部门面）：direct 调用走全部零值，外层 streamGenerateWithFilesOpts
+// 统一打开 singleAccountTry + deferProxyCommit 并透传共享 fstate。
+type streamOnceOpts struct {
+	exclude          map[int64]bool            // 本请求已处理过的账号（外层降级/跳槽排除集）
+	singleAccountTry bool                      // true：内层绝不跨号（XSRF/生成），全部交给外层
+	deferProxyCommit bool                      // true：代理成败暂挂 res，出口统一 commitPendingProxy
+	fstate           *reqFailoverState         // 顶层共享跳槽准入状态；nil 时懒建
+	postValidate     func(*StreamResult) error // 每跳成功（err==nil）后的循环内输出校验（C1b 可达）
+	forceAnon        bool                      // v2.2 §8 外层 FallbackAnon：跳过挑号直接匿名（出口仍走正常 slot 规则）
+}
+
 func streamGenerateWithFiles(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string), stopWhen func(string) bool) (*StreamResult, error) {
-	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
-	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
+	return streamGenerateWithFilesOpts(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, nil)
+}
+
+// streamGenerateWithFilesOpts 是带防雪崩状态机的单轮入口：统一跨号跳槽准入
+// （reqFailoverState）、延迟账号失败提交（pendingHop0）与延迟代理记账。
+//
+// 跳槽预算（v2.2 §4/§7）：故障/毒载荷类（C1/C1b/C2/C4a/C5a）最多 1 次跨号
+// 跳槽（含故障的请求至多触碰 2 个号）；纯 C3 降级保留 maxCookieTries=3。
+// postValidate 非 nil 时，每跳 err==nil 后在循环内执行输出校验——C1b
+// （errEmptyContent）由此可达，能与第 0 跳 C1 构成 isPoisonPair 双端免责。
+func streamGenerateWithFilesOpts(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), stopWhen func(string) bool,
+	postValidate func(*StreamResult) error) (*StreamResult, error) {
+	fstate := newReqFailoverState(mc.PinAccountID > 0)
+	defer releaseReqProbes(fstate.reqID)
+	// 跨号跳槽统一收口到 fstate.tryAdvanceHop(cls, emitted) + exclude[acctID]：
+	// 故障类（C1/C1b/C2/C4a/C5a）至多 1 跳（触碰 2 号）；C3 降级受
+	// fstate.tryAdvanceHop 的降级预算限制（至多触碰 3 号），仅 C3 调
+	// markDowngraded；C4b 门前 Bound 豁免预算但受 boundBudget 截断，且仅
+	// 在该号尚未 touched 时豁免。
 	exclude := map[int64]bool{}
-	var res *StreamResult
-	var err error
-	for try := 0; try < maxCookieTries; try++ {
-		next, nextErr := streamGenerateOnce(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, exclude)
-		var exhausted *ModelDowngradedError
-		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
-			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
-			var last *ModelDowngradedError
-			if errors.As(err, &last) {
-				last.RetryAfter = exhausted.RetryAfter
-			}
-			return res, err
-		}
-		res, err = next, nextErr
-		if !retryOnAnotherAccount(res, err, mc, exclude) {
-			return res, err
+	var pendingHop0 *pendingHopFailure // 第 0 跳毒载荷敏感类的延迟暂挂（未结算）
+	boundTries := 0
+	boundBudget := maxCookieTries
+	if strictOrLockedPool() {
+		if total, _ := accountCount(); total > boundBudget {
+			boundBudget = total
 		}
 	}
-	return res, err
+	// 退出路径统一兜底：暂挂的第 0 跳按「失败离场」结算（毒载荷已判不出，
+	// 按非毒因果提交），本跳代理记账照常落。
+	finish := func(res *StreamResult, err error) (*StreamResult, error) {
+		settlePendingHop(pendingHop0, fstate, true)
+		commitPendingProxy(res)
+		return res, err
+	}
+	var res *StreamResult
+	var err error
+	var prevRes *StreamResult
+	var prevErr error
+	// 物理上限防死循环：故障 1 + 降级 2 + Bound 全池 + 首跳，足够覆盖任意路径。
+	hardCap := maxCookieTries + boundBudget + 1
+	for try := 0; try < hardCap; try++ {
+		opts := streamOnceOpts{
+			exclude: exclude, singleAccountTry: true, deferProxyCommit: true,
+			fstate: fstate, postValidate: postValidate,
+		}
+		next, nextErr := runStreamGenerateOnce(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, opts)
+		// 「没号可挑」不覆盖上一跳真实错误：prevErr/prevRes 留给
+		// resolveHopPickErr 回填，res/err 只在确认要换新跳时才推进。
+		if done, dres, derr, isNoEligible := resolveHopPickErr(next, nextErr, prevRes, prevErr, try == 0, mc); done {
+			// 单号池（或其余号冷却/已排除）C4a 终结路径同样落外层
+			// FallbackAnon（R2-MF-2）：上一跳未吐字鉴权失败、无暂挂结算、
+			// 无附件且 Pin==0 时先结代理记账再统一匿名兜底。出口仍走
+			// runStreamGenerateOnce 的正常 slot 规则，防漏 IP 不变量不变。
+			if isNoEligible && derr != nil && classifyFailoverError(derr) == classAuthFail &&
+				pendingHop0 == nil && len(pending) == 0 && mc.PinAccountID == 0 &&
+				rtCfg().FallbackAnon && !resultEmitted(dres) {
+				commitPendingProxy(dres)
+				anonRes, anonErr := runAnonFallback(ctx, prompt, pc, mc,
+					onDelta, onReasoning, stopWhen, postValidate, fstate)
+				return finish(anonRes, anonErr)
+			}
+			return finish(dres, derr)
+		}
+		res, err = next, nextErr
+		res, err, pendingHop0 = settleHop(res, err, pendingHop0, fstate, mc, exclude)
+		if err == nil {
+			return res, nil
+		}
+		// 毒载荷判定已出结果（settleHop 包装）：双端零记账，直接返回。
+		var ppe *poisonPayloadError
+		if errors.As(err, &ppe) {
+			return res, err
+		}
+		// 外层 FallbackAnon 仅无附件且开关开时可用（匿名必拒附件引用）。
+		var anonTry func() (*StreamResult, error)
+		anonOK := len(pending) == 0 && rtCfg().FallbackAnon && mc.PinAccountID == 0
+		if anonOK {
+			anonTry = func() (*StreamResult, error) {
+				return runAnonFallback(ctx, prompt, pc, mc, onDelta, onReasoning, stopWhen, postValidate, fstate)
+			}
+		}
+		adv, fres, ferr := advanceOuterHop(res, err, fstate, mc, exclude,
+			boundBudget, &boundTries, pendingHop0, anonOK, anonTry)
+		if !adv {
+			return finish(fres, ferr)
+		}
+		prevRes, prevErr = res, err
+	}
+	return finish(res, err)
 }
+
+// resolveHopPickErr 处理「跳号重选时没号可挑 / 全池冷却」的返回：
+// done=true 表示本条请求就此终结，应返回 (dres, derr)。
+// 上一跳真实错误永远优先——「没号可挑」不该覆盖现场。
+func resolveHopPickErr(next *StreamResult, nextErr error, prevRes *StreamResult, prevErr error,
+	firstHop bool, mc ModelConfig) (done bool, dres *StreamResult, derr error, noEligible bool) {
+	var exhausted *ModelDowngradedError
+	if !firstHop && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
+		// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间。
+		var last *ModelDowngradedError
+		if prevErr != nil && errors.As(prevErr, &last) && last.Reported != "" {
+			last.RetryAfter = exhausted.RetryAfter
+			return true, prevRes, last, false
+		}
+		if prevErr != nil {
+			return true, prevRes, prevErr, false // 上一跳真实失败比「全池冷却」更有信息量
+		}
+		return true, next, nextErr, false
+	}
+	var nee *noEligibleAccountError
+	if !errors.As(nextErr, &nee) {
+		return false, nil, nil, false
+	}
+	// prevErr!=nil 也统一经 resolveNoEligibleFallback 回填（R2-SF-2）：上一跳是
+	// 带自报名降级时补 Retry-After，否则原样报上一跳真实失败。
+	if rerr := resolveNoEligibleFallback(prevRes, prevErr, nee, mc); rerr != nil {
+		return true, prevRes, rerr, true
+	}
+	return true, next, nextErr, true
+}
+
+// advanceOuterHop 是单轮/多轮共用的跳槽准入收口：分类判定 + Bound 预算 +
+// fstate.tryAdvanceHop + 类别侧效果（exclude / markDowngraded）。
+// 返回 (advance, finRes, finErr)：advance=true 继续下一跳；false 时应以
+// (finRes, finErr) 收尾（含外层 FallbackAnon 兜底成功的匿名结果）。
+func advanceOuterHop(res *StreamResult, err error, fstate *reqFailoverState, mc ModelConfig,
+	exclude map[int64]bool, boundBudget int, boundTries *int,
+	pendingHop0 *pendingHopFailure, anonAllowed bool,
+	anonTry func() (*StreamResult, error)) (bool, *StreamResult, error) {
+	cls := classifyFailoverError(err)
+	acctID := int64(0)
+	emitted := false
+	if res != nil {
+		acctID = res.AccountID
+		emitted = res.Emitted != "" || res.EmittedReasoning != ""
+	}
+	var rle *RateLimitError
+	isBound := errors.As(err, &rle) && rle.Bound
+	if cls == classLocalBound {
+		if isBound {
+			*boundTries++
+		}
+		// C4b 仅当该号尚未碰上游时豁免预算；已触碰的 Bound（如 XSRF 循环里
+		// 挑出的号被并发改绑）不再豁免——按故障预算走。
+		hopOK := false
+		if acctID > 0 && fstate.touched[acctID] {
+			hopOK = fstate.tryAdvanceHop(classNetFail, emitted)
+		} else {
+			hopOK = fstate.tryAdvanceHop(classLocalBound, emitted)
+		}
+		if !hopOK || (isBound && *boundTries >= boundBudget) {
+			return false, res, err
+		}
+		if acctID > 0 {
+			exclude[acctID] = true
+			logf("[strict_proxy_binding] 账号 #%d 绑定出口 #%d 不可用，换下一个号", acctID, rle.ProxyID)
+		}
+		return true, nil, nil
+	}
+	// 降级冷却登记必须在跳槽准入判定之前无条件完成（R2-MF-1）：纯 C3 链
+	// 第 3 个号、C1->C3 第 2 个号、Pin/已吐字遇降级时 tryAdvanceHop 返回
+	// false，但这几个已确认配额耗尽的号同样必须记入 5h 模型冷却，否则
+	// 后续请求会反复挑中同一个降级号。
+	if cls == classModelDowngrade {
+		var mde *ModelDowngradedError
+		if errors.As(err, &mde) && mde.AccountID > 0 {
+			markDowngraded(mde.AccountID, mc)
+			logf("[strict_model] 账号 #%d 在 %s 上被降级成 %s", mde.AccountID, mc.Upstream, mde.Reported)
+		}
+	}
+	if fstate.tryAdvanceHop(cls, emitted) {
+		if acctID > 0 {
+			exclude[acctID] = true
+		}
+		return true, nil, nil
+	}
+	// v2.2 §8 外层 FallbackAnon 兜底：仅当终态是 C4a（鉴权/XSRF 不可用）、
+	// 无暂挂毒载荷结算且未吐字时放行单次匿名；出口仍走正常 slot 规则，
+	// 池非空关 fallback_direct 时绝不从本机 IP 漏出（守直连防漏 IP）。
+	if cls == classAuthFail && pendingHop0 == nil && anonAllowed && !emitted && anonTry != nil {
+		if anonRes, anonErr := anonTry(); anonErr == nil || anonRes != nil {
+			return false, anonRes, anonErr
+		}
+	}
+	return false, res, err
+}
+
+// runAnonFallback 是外层 FallbackAnon 兜底（v2.2 §8）：外层跳槽链在
+// C4a（cookie/XSRF 全不可用）终态耗尽后，由外层统一做一次匿名尝试——
+// 出口仍走 acquireClaimedSlot 的正常规则（池非空且关 fallback_direct 时
+// 直连槽拿不到，绝不漏本机 IP）。仅无附件、未吐字、非 Pin 时才会被调。
+func runAnonFallback(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig,
+	onDelta, onReasoning func(string), stopWhen func(string) bool,
+	postValidate func(*StreamResult) error, fstate *reqFailoverState) (*StreamResult, error) {
+	logf("[cookie] 全部登录号鉴权不可用，本次降级匿名（能力会退化到匿名档）")
+	return runStreamGenerateOnce(ctx, prompt, pc, mc, nil, onDelta, onReasoning, stopWhen,
+		streamOnceOpts{singleAccountTry: true, deferProxyCommit: true, fstate: fstate,
+			postValidate: postValidate, forceAnon: true})
+}
+
+// resultEmitted 报告本跳结果是否已向上游/客户端吐出内容（吐字后不可换号
+// 也不可匿名兜底——客户端已收到一部分响应）。
+func resultEmitted(res *StreamResult) bool {
+	return res != nil && (res.Emitted != "" || res.EmittedReasoning != "")
+}
+
+// resolveNoEligibleFallback 决定 noEligibleAccountError 的最终上报形态：
+// 上一个号有真实错误就报它（补解冻时间），没有就按冷却/降级类型报。
+func resolveNoEligibleFallback(res *StreamResult, err error, nee *noEligibleAccountError, mc ModelConfig) error {
+	var last *ModelDowngradedError
+	if errors.As(err, &last) && last.Reported != "" {
+		// R2-SF-2：回填用 nee.retryAfter()（model/short 取最早），与多轮
+		// conversation.go resolveConvPickErr 同口径——上一跳降级号在全池
+		// 短冷却主导时也该拿到最早解冻时间。
+		if ra := nee.retryAfter(); ra > 0 {
+			last.RetryAfter = ra
+		}
+		return last
+	}
+	if err != nil && !errors.Is(err, nee) {
+		return err // 上一个号的真实失败比「没号可挑」更有信息量
+	}
+	if nee.shortRetryAfter > 0 {
+		return &AccountCooldownError{RetryAfter: nee.shortRetryAfter}
+	}
+	return &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: nee.modelRetryAfter}
+}
+
+// settleHop 是每跳返回后的统一结算（防雪崩核心）：
+//   - 成功：提交上一跳暂挂（若有）+ 记账号成功 + 代理记账；
+//   - C1/C1b 毒载荷敏感类：Pin>0 豁免短冷却、只代理记账；非 Pin 且可跳第 1 跳
+//     时暂挂 pendingHop0（不写全局）；第 1 跳落定后由本函数或 settlePendingHop
+//     按 isPoisonPair 判定毒载荷双端零记账/单次提交；
+//   - C2/C4a：立即记账号失败 + 代理记账；
+//   - C5a：只代理记账（不拉黑好账号）；C3/C4b/C5b：零记账。
+//
+// 返回更新后的 (res, err, pendingHop0)。
+func settleHop(res *StreamResult, err error, pendingHop0 *pendingHopFailure,
+	fstate *reqFailoverState, mc ModelConfig, exclude map[int64]bool) (*StreamResult, error, *pendingHopFailure) {
+	if err == nil {
+		// 成功落定：第 0 跳暂挂的 C1 不是毒载荷（备号成功证明载荷可用），
+		// 按因果时序单次提交它，再记本跳成功。
+		settlePendingHop(pendingHop0, fstate, true)
+		if res != nil && res.AccountID > 0 {
+			recordAccountReqSuccess(res.AccountID, fstate.reqID)
+		}
+		commitPendingProxy(res)
+		return res, nil, nil
+	}
+	cls := classifyFailoverError(err)
+	acctID := int64(0)
+	if res != nil {
+		acctID = res.AccountID
+	}
+	// 已吐字：不能换号也不能延迟结算（毒载荷判定要求未吐字），照常单次提交。
+	emitted := res != nil && (res.Emitted != "" || res.EmittedReasoning != "")
+	if cls == classContentRefuse && mc.PinAccountID > 0 {
+		// 裁决 3：Pin 会话对 C1 豁免账号短冷却记账（内容拒单不是号的错）；
+		// 代理记账照常，C2/C4a 在下方常规分支记。
+		commitPendingProxy(res)
+		return res, err, pendingHop0
+	}
+	if cls == classContentRefuse && !emitted && pendingHop0 == nil && acctID > 0 {
+		// 第 0 跳毒载荷敏感类：尝试换第 1 跳双号交叉验证。能换（预算+备号存在）
+		// 时暂挂不写全局；第 1 跳落定后由本函数/收尾统一结算。
+		canHop := fstate.tryAdvanceHopPreview(cls)
+		if canHop && mc.PinAccountID == 0 {
+			// 预算在 streamGenerateOnceOpts 内层已被准入过：外层仅当内层未消耗
+			// 故障预算时才接管第 1 跳。faultHops 在 tryAdvanceHop 真正跳槽时计。
+			return res, err, &pendingHopFailure{
+				acctID: acctID, cls: cls,
+				occurredAt: firstFailureAt(res), res: res, err: err,
+			}
+		}
+		// 不能换号（预算满/已吐字/pin）：单次结算——记账号失败 + 代理记账。
+		if cls == classContentRefuse && !isEmptyContentErr(err) {
+			recordAccountReqFailureAt(acctID, fstate.reqID, cls, firstFailureAt(res))
+		}
+		commitPendingProxy(res)
+		return res, err, nil
+	}
+	// 第 1 跳落定：先按 isPoisonPair 结算第 0 跳暂挂。
+	if pendingHop0 != nil {
+		if isPoisonPair(pendingHop0.err, err) {
+			// 实锤毒载荷：双端零账号记账、零冷却、零代理扣分。
+			// 第 0 跳的 res 代理暂挂直接作废（不 commit）；本跳 res 同样不记。
+			if res != nil {
+				res.proxyCommitted = true // 吞掉本跳暂挂：毒载荷代理零扣分
+			}
+			return res, wrapPoisonPayloadError(err), nil
+		}
+		// 非毒：按因果时序补交第 0 跳（occurredAt 保持首次失败时刻）。
+		settlePendingHop(pendingHop0, fstate, true)
+		pendingHop0 = nil
+	}
+	// 本跳常规结算。
+	if classAccountsBlame(cls) && acctID > 0 {
+		recordAccountReqFailureAt(acctID, fstate.reqID, cls, firstFailureAt(res))
+	}
+	commitPendingProxy(res)
+	return res, err, pendingHop0
+}
+
+// firstFailureAt 取一跳失败的「发生时刻」：res.TotalMs>0 时用
+// now-TotalMs 回溯近似（延迟提交需要的因果时序），取不到就用 now。
+func firstFailureAt(res *StreamResult) time.Time {
+	if res != nil && res.TotalMs > 0 {
+		return time.Now().Add(-time.Duration(res.TotalMs) * time.Millisecond)
+	}
+	return time.Now()
+}
+
+// isEmptyContentErr 判定错误是否为 C1b（errEmptyContent）：C1b 不记账号
+// 短冷却（只参与毒载荷互认），与 C1 区分。
+func isEmptyContentErr(err error) bool {
+	if errors.Is(err, errEmptyContent) {
+		return true
+	}
+	var de *diagErr
+	return errors.As(err, &de) && de.reason == reasonEmptyContent
+}
+
+// settlePendingHop 结算第 0 跳暂挂：commit=true 时按因果时序单次提交账号
+// 失败（仅 C1 计，C1b 不计账号）并提交其代理记账；commit=false（毒载荷）
+// 时直接作废。
+func settlePendingHop(p *pendingHopFailure, fstate *reqFailoverState, commit bool) {
+	if p == nil {
+		return
+	}
+	if !commit {
+		if p.res != nil {
+			p.res.proxyCommitted = true // 毒载荷：作废代理暂挂
+		}
+		return
+	}
+	if p.acctID > 0 && p.cls == classContentRefuse && !isEmptyContentErr(p.err) {
+		recordAccountReqFailureAt(p.acctID, fstate.reqID, p.cls, p.occurredAt)
+	}
+	commitPendingProxy(p.res)
+}
+
+// tryAdvanceHopPreview 只看不消费：第 0 跳 C1 想换第 1 跳时先确认预算允许，
+// 真正消耗在 streamGenerateOnceOpts 的准入里（faultHops++ 在跳槽时记）。
+// 复用 tryAdvanceHop 的判定但回滚计数：预览不该预支预算。
+func (f *reqFailoverState) tryAdvanceHopPreview(cls failoverClass) bool {
+	if f == nil || f.pinned {
+		return false
+	}
+	fh, dt := f.faultHops, f.downgradeTry
+	ok := f.tryAdvanceHop(cls, false)
+	f.faultHops, f.downgradeTry = fh, dt
+	return ok
+}
+
+// runStreamGenerateOnce 是单轮外层跳槽状态机的上游缝（e2e 回归测试把
+// 它换成按号编剧的桩，真实生产路径仍直指 streamGenerateOnceOpts）。
+// 签名与 streamGenerateOnceOpts 完全一致（v2.2 §8 runConversationTurn 同形）。
+var runStreamGenerateOnce = streamGenerateOnceOpts
 
 func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string), stopWhen func(string) bool, exclude map[int64]bool) (*StreamResult, error) {
+	return streamGenerateOnceOpts(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen,
+		streamOnceOpts{exclude: exclude})
+}
+
+func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), stopWhen func(string) bool, opts streamOnceOpts) (*StreamResult, error) {
+	exclude := opts.exclude
+	fstate := opts.fstate
+	if fstate == nil {
+		fstate = newReqFailoverState(mc.PinAccountID > 0)
+		defer releaseReqProbes(fstate.reqID)
+	}
 	var files []fileRef
 
 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
@@ -923,32 +1291,25 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			return &StreamResult{}, &pinnedAccountError{ID: mc.PinAccountID}
 		}
 		acct = a
-	} else if !anonFirstEligible(mc, len(pending) > 0, len(prompt)) {
-		if shouldUseBrowserTransport() {
-			// 策略 M1：常驻浏览器有粘性主号且它还能用时，优先继续驻留
-			// （同 cookieIdentity 的 authuser=0..9 共用同一 /app Tab），
-			// 不轻易切号——切一次就是 30s 冷却 + 清种 cookie。
-			// 传真实 mc.Upstream：strict_model 的模型级冷却按模型登记，
-			// 传空串等于把「这个模型正被该号降级冷却」的事实吞掉。
-			acct = stickyResidentAccountFor(exclude, mc.Upstream)
+	} else if !opts.forceAnon && !anonFirstEligible(mc, len(pending) > 0, len(prompt)) {
+		a, s, err := pickAccountForModel(mc, exclude, fstate)
+		if err != nil {
+			return &StreamResult{}, err
 		}
-		if acct == nil {
-			a, s, err := pickAccountForModel(mc, exclude)
-			if err != nil {
-				return &StreamResult{}, err
-			}
-			acct, skip = a, s
-		}
+		acct, skip = a, s
 	}
-	// M1 驻留号路径（shouldUseBrowserTransport 且 stickyResidentAccountFor 命中）跳过了
-	// pickAccountForModel，skip 里没有 strict_model 的冷却集合——后面 XSRF 换号走
+	// skip 里要含 strict_model/短冷却的冷却集合——后面 XSRF 换号走
 	// pickCookieAccountExcept(skip) 会把正在冷却的号挑回来，Bound 内层换号也一样。
-	// 统一在挑号分支结束后把冷却并进 skip；pickAccountForModel 已经并过一次的是幂等重并。
+	// pickAccountForModel 已经并过一次的是幂等重并。
 	if rtCfg().StrictModel && mc.Upstream != "" {
 		cooling, _ := coolingAccounts(mc)
 		for id := range cooling {
 			skip[id] = true
 		}
+	}
+	shortCooling, _ := shortCoolingAccounts()
+	for id := range shortCooling {
+		skip[id] = true
 	}
 	preferProxy := int64(0)
 	if acct != nil {
@@ -969,6 +1330,11 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	var t0 time.Time
 	var lastTTFB int64
 	var tracker, rtracker *deltaTracker
+	// hopRes 是本跳（当前账号+出口）的代理记账暂挂载体：内层每轮重试都往
+	// 同一个 res 写，noteProxyResult 幂等累计一次；attrib 早退路径把它带回，
+	// 成功路径另建 result（暂挂字段手工随迁）。
+	hopRes := &StreamResult{}
+	currentRes := func() *StreamResult { return hopRes }
 	attrib := func(err error) (*StreamResult, error) {
 		res := &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
@@ -985,6 +1351,9 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		if rtracker != nil {
 			res.EmittedReasoning = rtracker.emitted
 		}
+		// 代理记账暂挂随迁：早退路径的代理成败也要能结算。
+		res.PendingProxyFail, res.PendingProxyOK, res.proxyCommitted =
+			hopRes.PendingProxyFail, hopRes.PendingProxyOK, hopRes.proxyCommitted
 		return res, err
 	}
 
@@ -1014,15 +1383,23 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		}
 		for pp == nil && errors.As(slotErr, &bindErr) && bindErr.Bound {
 			busy[acct.ID] = true
-			// M1 × strict_proxy_binding：受阻的驻留号必须并进 exclude——外层换号
-			// 重试时 stickyResidentAccountFor 读的是 exclude，只记在 skip 里它还会
-			// 把这个出不去的驻留号原样返回，重试路径就死循环了。
+			// 换号前释放旧号的半开探测位（v2.2 §5：Bound 切走旧 acct 立即释放）。
+			releaseAccountProbeIfMatch(acct.ID, fstate.reqID)
+			// strict_proxy_binding：受阻的号必须并进 exclude——外层换号
+			// 重试时 pickAccountForModel 读的是 exclude，只记在 skip 里它还会
+			// 把这个出不去的号原样返回，重试路径就死循环了。
 			if exclude != nil {
 				exclude[acct.ID] = true
 			}
 			next, ok := pickCookieAccountExcept(busy)
 			if !ok {
 				break
+			}
+			// 半开单飞：挑中的冷却到期号必须认领探测位，认不到并入 busy 重挑
+			//（防并发雪崩回切未恢复的主号）。
+			if fstate.reqID != 0 && !tryClaimHalfOpenProbe(next.ID, fstate.reqID) {
+				busy[next.ID] = true
+				continue
 			}
 			acct = next
 			pp, release, slotErr = acquireClaimedSlot(acct.ID, acct.ProxyID)
@@ -1053,141 +1430,24 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	// 请求挂掉，而每次失败看起来都像上游的问题，用户只会觉得"成功率莫名很低"。
 	//
 	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
-	cookieStr, sapisid, xsrfToken := "", "", ""
-	authUser := 0 // 最终用上的那个号的账号序号（/u/N），匿名为 0
-	var lastCookieErr error
-	var lastBoundErr *RateLimitError
-	tried := map[int64]bool{}
-	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
-	rotatedOnce := map[int64]bool{}
-	for acct != nil && len(tried) < maxCookieTries {
-		if err := ctx.Err(); err != nil {
-			return attrib(err)
-		}
-		// 严格绑定下换号不换出口：XSRF 换号循环挑出的第 2+ 个号还拿着自己在库里的
-		// 绑定值，必须先仲裁——并发请求/管理员已把它绑到别的出口时，绝不能拿
-		// picked 出口替它外发（那等于「换号不换出口」不变量被反着破坏）。
-		// acct.ID>0 是匿名兜底防御（acct 恒来自池，但判空成本为零）。
-		//
-		// 仲裁排在 tried/cookieID 之前：被并发绑走跳过的健康号不算「试过一个坏号」
-		//（不消耗 maxCookieTries 预算），归属也不记它——错不在 cookie 在绑定。
-		// picked.ID>0 走 claimAccountProxy 仲裁；picked.ID==0（fallback_direct 直连
-		// 兜底）时库里绑在启用出口上的号同样绝不能从本机 IP 外发。
-		//
-		// proxyIDDirect（-1 锁定直连）双向隔离（无论 strict_proxy_binding 开不开）：
-		//   - 库里锁定直连的号绝不能借代理槽外发（TR 绝不借代理）；
-		//   - 直连槽是 fallback_direct 兜底时，没锁直连的号（绑定代理或未绑）绝不能
-		//     借 TR 的直连槽漏本机 IP。
-		if acct.ID > 0 {
-			conflictID, conflict, _ := xsrfExitConflict(acct.ID, picked.ID)
-			if conflict {
-				// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
-				skip = ensureSkipMap(skip)
-				skip[acct.ID] = true // 挡回挑号；不写 tried，不占换号预算
-				lastBoundErr = &RateLimitError{Reason: "rebound", ProxyID: conflictID, Bound: true}
-				if mc.PinAccountID > 0 {
-					// 会话钉住的号被绑走：直接报 Bound，绝不能换号，也绝不能匿名下发。
-					return &StreamResult{AccountID: acct.ID}, lastBoundErr
-				}
-				acct = pickNextUnboundAccount(skip, tried, picked.ID)
-				continue
-			}
-		}
-		tried[acct.ID] = true
-		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
-		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
-		if err == nil {
-			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
-			authUser = acct.AuthUser
-			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
-			//
-			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
-			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
-			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
-			// 粘性打散一次 —— 实测就是这么散掉的。
-			// 只在非严格模式写：严格模式的落库只走 claimMu 里的 claimAccountProxy
-			//（上面已仲裁过），锁外写库会覆盖管理员的并发改绑。
-			// acct.ProxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
-			if !rtCfg().StrictProxyBinding && acct.ProxyID != proxyIDDirect &&
-				(acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
-				autoBindAccountProxy(acct.ID, picked.ID)
-			}
-			break
-		}
-		// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
-		// 换号之前先给它一次机会：强制轮转一次再重取。
-		//
-		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
-		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
-		// 只试一次，且只在这一轮。
-		if !rotatedOnce[acct.ID] {
-			rotatedOnce[acct.ID] = true
-			out := healXSRFByRotation(mc, acct, picked, proxyURL, skip, tried)
-			skip = out.skip
-			if out.boundErr != nil {
-				lastBoundErr = out.boundErr
-				if out.failRes != nil {
-					// 钉会话的号被绑走：直接报 Bound，绝不能换号。
-					return out.failRes, out.boundErr
-				}
-				acct = out.next
-				continue
-			}
-			if out.healed {
-				acct = out.acct
-				cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), out.xsrf
-				authUser = acct.AuthUser
-				if !rtCfg().StrictProxyBinding && acct.ProxyID != proxyIDDirect &&
-					(acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
-					autoBindAccountProxy(acct.ID, picked.ID)
-				}
-				break
-			}
-		}
-		// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
-		// 断网、出口被拦不记（见 xsrfErrBlamesCookie）。然后换下一个。
-		if xsrfErrBlamesCookie(err) {
-			markCookieByStatus(acct.ID, 401, err.Error())
-		}
-		lastCookieErr = err
-		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
-		if mc.PinAccountID > 0 {
-			acct = nil // pinned: never switch to another account mid-conversation
-			continue
-		}
-		// 严格绑定：出口已经定了，绑在别的仍然有效的出口上的号不能借用这个出口
-		// （pickNextUnboundAccount 内部过滤 strictBoundElsewhere）。
-		acct = pickNextUnboundAccount(skip, tried, picked.ID)
+	// 整段挑号+取 token 闭环抽进 acquireXSRFToken（cccc 复杂度拆分）；返回
+	// done=true 时调用方直接返回（Pin Bound/冲突/全失败兜底各早退路径）。
+	xs := &xsrfTokenCtx{
+		acct: acct, skip: skip, picked: picked, proxyURL: proxyURL,
+		mc: mc, fstate: fstate, singleAccountTry: opts.singleAccountTry,
 	}
-	if cookieStr == "" && lastCookieErr == nil && lastBoundErr != nil {
-		// 循环里只遇到并发改绑冲突、没试过任何 cookie：绝不能绕过
-		// FallbackAnon=false 静默匿名外发——报真实的 Bound 冲突。
-		return attrib(lastBoundErr)
+	// attrib 包一层：早退路径先把本轮最终挑中的号回填给外层 cookieID/
+	// cookieLabel（attrib 闭包读的是外层变量，xs 内部的归属不写回去
+	// 早退 res 的 AccountID 会是 0——看着像匿名错，排查对不上号）。
+	xattrib := func(err error) (*StreamResult, error) {
+		cookieID, cookieLabel = xs.cookieID, xs.cookieLabel
+		return attrib(err)
 	}
-	if lastCookieErr != nil && cookieStr == "" {
-		if mc.PinAccountID > 0 {
-			return attrib(&pinnedAccountError{ID: mc.PinAccountID, Err: lastCookieErr})
-		}
-		if !rtCfg().FallbackAnon {
-			// 默认报错而不是降级：cookie 失效后上游不会拒绝，只是把你当匿名用户，
-			// 纯文本请求照样 200 —— 于是 3.1 Pro 被静默降级成 3.5 Flash-Lite、
-			// 思考链消失，客户端完全看不出来。宁可明确失败也不给假的成功。
-			return attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
-				"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
-				len(tried), lastCookieErr))
-		}
-		if picked.ID == 0 && hasProxyPool() && !rtCfg().FallbackDirect {
-			// 手上是锁定直连号留下/误取的直连槽：池非空且关 fallback 时本机
-			// 直连不合法，降级匿名会把真实 IP 漏出去——报真实错误不匿名外发。
-			if lastBoundErr != nil {
-				return attrib(lastBoundErr)
-			}
-			return attrib(lastCookieErr)
-		}
-		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
-		cookieID, cookieLabel = 0, ""
+	if res, rerr, done := acquireXSRFToken(ctx, xs, xattrib); done {
+		return res, rerr
 	}
+	cookieStr, sapisid, xsrfToken, authUser := xs.cookieStr, xs.sapisid, xs.xsrfToken, xs.authUser
+	cookieID, cookieLabel = xs.cookieID, xs.cookieLabel
 
 	// endpoint 要等号和出口都定下来才能拼：
 	//   - 路径带 /u/N 才落到第 N 个号，而上面的循环可能换了号（序号跟着变）
@@ -1440,6 +1700,8 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 		} else {
 			statusCode, raw, ttfb, setCookie, err = doGeminiRequestStopMode(ctx, endpoint, body, geminiHeaders, proxyURL, lh.cb, &lh.stop, mc.TaskMode)
 		}
+		// 本轮生成请求是账号对上游的真实使用：记在 touched（XSRF 已记的幂等）。
+		fstate.markTouched(cookieID)
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookieForHost(cookieStr, setCookie, reqEndpoint, geminiCookieTargetHost); merged != cookieStr {
 				cookieStr = merged
@@ -1487,8 +1749,10 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			// 跟出口质量无关，也不该算 cookie 的错。
 			// errStreamIdle 正常记：开流后断流/黑洞的坏代理该累计失败次数，
 			// 否则半路卡死的脏出口永远熔断不掉、账号也迁不走。
+			// v2.2 §7：deferProxyCommit 下同号内层重试期间绝不提前写代理分——
+			// 本跳全部尝试耗尽后由出口统一结算（毒载荷可零扣分）。
 			if pickedOK && !errors.Is(err, errUpstreamFailureReply) && !isBrowserLocalError(err) {
-				recordProxyResult(picked.ID, false, err.Error())
+				noteProxyResult(currentRes(), picked.ID, false, err.Error(), opts.deferProxyCommit)
 			}
 			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
 			if tracker.emitted != "" || rtracker.emitted != "" {
@@ -1533,7 +1797,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			lastStatus = statusCode
 			// 浏览器自身问题回的非 200（不该发生，但保险）也不扣出口分。
 			if pickedOK && !isBrowserLocalError(lastErr) {
-				recordProxyResult(picked.ID, false, lastErr.Error())
+				noteProxyResult(currentRes(), picked.ID, false, lastErr.Error(), opts.deferProxyCommit)
 			}
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
@@ -1564,7 +1828,7 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			if pickedOK {
 				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
 				// 脏出口一天约 9 次），连续踩中说明这个出口该歇了。
-				recordProxyResult(picked.ID, false, lastErr.Error())
+				noteProxyResult(currentRes(), picked.ID, false, lastErr.Error(), opts.deferProxyCommit)
 			}
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
@@ -1591,8 +1855,32 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			}
 			continue
 		}
+		if opts.postValidate != nil {
+			// v2.2 §3.3(4)：C1b（errEmptyContent）循环内可达——成功帧但抽不出
+			// 正文时在本跳内判定，让它跟 C1 一样能参与 isPoisonPair 毒载荷互认
+			// 与跨号跳槽；postValidate 由 callGemini 注入（canvas/媒体工具放行）。
+			// MF-2：代理成功记账与 markCookieByStatus(200) 必须排在 postValidate
+			// 通过之后——C1b 失败绝不能先被记成「本号成功」（会把 failStreak
+			// 清零并提前释放半开探针），成功记账只在整跳真正落定后写。
+			probe := &StreamResult{Raw: string(raw), AccountID: cookieID,
+				Emitted: tracker.emitted, EmittedReasoning: rtracker.emitted,
+				UpstreamModel: extractUpstreamModel(string(raw))}
+			if verr := opts.postValidate(probe); verr != nil {
+				lastErr = verr
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, verr)
+					if werr := retryWait(attempt, verr); werr != nil {
+						return attrib(werr)
+					}
+				}
+				continue
+			}
+		}
 		if pickedOK {
-			recordProxyResult(picked.ID, true, "")
+			noteProxyResult(currentRes(), picked.ID, true, "", opts.deferProxyCommit)
 		}
 		markCookieByStatus(cookieID, 200, "")
 		result := &StreamResult{
@@ -1607,6 +1895,14 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 			AccountLabel:     cookieLabel,
 			TTFBMs:           ttfb,
 			TotalMs:          time.Since(t0).Milliseconds(),
+			// 代理记账暂挂随迁到成功结果。
+			PendingProxyFail: hopRes.PendingProxyFail,
+			PendingProxyOK:   hopRes.PendingProxyOK,
+			proxyCommitted:   hopRes.proxyCommitted,
+		}
+		// 成功落定：记账号成功（半开探测成功会清零 streak 并放探测位）。
+		if cookieID > 0 {
+			recordAccountReqSuccess(cookieID, fstate.reqID)
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
@@ -1646,7 +1942,13 @@ func streamGenerateOnce(ctx context.Context, prompt string, pc promptCtx, mc Mod
 	if lastErr != nil {
 		markCookieByStatus(cookieID, lastStatus, lastErr.Error())
 	}
-	return attrib(lastErr)
+	res, rerr := attrib(lastErr)
+	// 延迟提交模式外（direct 调用、存量测试）：退出前直接结算代理暂挂；
+	// deferProxyCommit 模式下由外层统一 commit（毒载荷可零扣分）。
+	if !opts.deferProxyCommit {
+		commitPendingProxy(res)
+	}
+	return res, rerr
 }
 
 // lineHandler 是每读到一行上游数据时的处理：推思考链、推正文增量、判断能否提前收尾。
@@ -1705,6 +2007,297 @@ func newLineHandler(onDelta, onReasoning func(string), stopWhen func(string) boo
 		return nil
 	}
 	return lh
+}
+
+// xsrfTokenCtx 是 acquireXSRFToken 的输入/输出载具：进参是挑号与出口现场，
+// 出参是最终用上的 (cookie, token, authuser) 与归属（cookieID/cookieLabel）。
+type xsrfTokenCtx struct {
+	acct             *CookieAccount
+	skip             map[int64]bool
+	picked           Proxy
+	proxyURL         string
+	mc               ModelConfig
+	fstate           *reqFailoverState
+	singleAccountTry bool
+	// 出参
+	cookieStr   string
+	sapisid     string
+	xsrfToken   string
+	authUser    int
+	cookieID    int64
+	cookieLabel string
+}
+
+// acquireXSRFToken 跑完「挑号 -> 仲裁 -> getXSRF -> 轮转救号 -> 换号」整条
+// XSRF 获取闭环（从 streamGenerateOnceOpts 抽出的复杂度拆分）。
+//
+// 返回 done=true 时调用方直接返回 (res, err)：含 Pin Bound 冲突、
+// singleAccountTry 上抛、XSRF 全失败的 FallbackAnon/拒绝兜底。
+// done=false 时 xs 已回填最终 cookieStr/sapisid/xsrfToken/authUser 与归属。
+func acquireXSRFToken(ctx context.Context, xs *xsrfTokenCtx,
+	attrib func(error) (*StreamResult, error)) (*StreamResult, error, bool) {
+	acct, skip, picked, proxyURL := xs.acct, xs.skip, xs.picked, xs.proxyURL
+	fstate := xs.fstate
+	var lastCookieErr error
+	var lastBoundErr *RateLimitError
+	tried := map[int64]bool{}
+	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
+	rotatedOnce := map[int64]bool{}
+	for acct != nil && len(tried) < maxCookieTries {
+		if err := ctx.Err(); err != nil {
+			res, e := attrib(err)
+			return res, e, true
+		}
+		// 严格绑定下换号不换出口：XSRF 换号循环挑出的第 2+ 个号还拿着自己在库里的
+		// 绑定值，必须先仲裁——并发请求/管理员已把它绑到别的出口时，绝不能拿
+		// picked 出口替它外发（那等于「换号不换出口」不变量被反着破坏）。
+		// acct.ID>0 是匿名兜底防御（acct 恒来自池，但判空成本为零）。
+		//
+		// 仲裁排在 tried/cookieID 之前：被并发绑走跳过的健康号不算「试过一个坏号」
+		//（不消耗 maxCookieTries 预算），归属也不记它——错不在 cookie 在绑定。
+		// picked.ID>0 走 claimAccountProxy 仲裁；picked.ID==0（fallback_direct 直连
+		// 兜底）时库里绑在启用出口上的号同样绝不能从本机 IP 外发。
+		//
+		// proxyIDDirect（-1 锁定直连）双向隔离（无论 strict_proxy_binding 开不开）：
+		//   - 库里锁定直连的号绝不能借代理槽外发（TR 绝不借代理）；
+		//   - 直连槽是 fallback_direct 兜底时，没锁直连的号（绑定代理或未绑）绝不能
+		//     借 TR 的直连槽漏本机 IP。
+		if acct.ID > 0 {
+			nextAcct, conflictRes, conflictErr, conflictDone := resolveXSRFConflict(
+				xs, acct, skip, tried, attrib, &lastBoundErr)
+			if conflictDone {
+				return conflictRes, conflictErr, true
+			}
+			skip = xs.skip
+			if nextAcct != acct {
+				acct = nextAcct
+				continue
+			}
+		}
+		tried[acct.ID] = true
+		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
+		xs.cookieID, xs.cookieLabel = acct.ID, accountDisplayName(acct)
+		// 统一准入登记：getXSRF 是本号对上游的第一发，记入 touched——
+		// 之后的 Bound 门前豁免与故障/降级预算都按它判「碰没碰过上游」。
+		fstate.markTouched(acct.ID)
+		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
+		if err == nil {
+			xs.cookieStr, xs.sapisid, xs.xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
+			xs.authUser = acct.AuthUser
+			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
+			//
+			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
+			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
+			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
+			// 粘性打散一次 —— 实测就是这么散掉的。
+			// 只在非严格模式写：严格模式的落库只走 claimMu 里的 claimAccountProxy
+			//（上面已仲裁过），锁外写库会覆盖管理员的并发改绑。
+			// acct.ProxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
+			if !rtCfg().StrictProxyBinding && acct.ProxyID != proxyIDDirect &&
+				(acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID)) {
+				autoBindAccountProxy(acct.ID, picked.ID)
+			}
+			break
+		}
+		var healed bool
+		var failRes *StreamResult
+		var failErr error
+		acct, failErr, skip, healed, failRes = xsrfHealOrAdvance(xs, acct, err, skip, tried,
+			rotatedOnce, &lastBoundErr, attrib)
+		if failRes != nil {
+			return failRes, failErr, true
+		}
+		if healed {
+			break
+		}
+		// boundErr 跳号路径返回 failErr=nil：不动 lastCookieErr，让收尾走
+		// 「只冲突没试过 cookie」的 Bound 早退（与原 continue 语义一致）。
+		if failErr != nil {
+			lastCookieErr = failErr
+		}
+		if acct == nil {
+			break
+		}
+	}
+	if res, e, done := xsrfFailTail(xs, lastCookieErr, lastBoundErr, tried, attrib); done {
+		return res, e, true
+	}
+	return nil, nil, false
+}
+
+// resolveXSRFConflict 处理一轮 XSRF 挑号前的出口仲裁：命中并发改绑/直连
+// 锁冲突时要么直接终局（Pin Bound / singleAccountTry 上抛），要么跳过换号。
+// 返回（下一个候选, 终局 res, 终局 err, done）；done=true 表示调用方直接返回。
+// xs.skip 在内部被更新（调用方读 xs.skip 接续）。
+func resolveXSRFConflict(xs *xsrfTokenCtx, acct *CookieAccount, skip, tried map[int64]bool,
+	attrib func(error) (*StreamResult, error), lastBoundErr **RateLimitError) (*CookieAccount, *StreamResult, error, bool) {
+	conflictID, conflict, _ := xsrfExitConflict(acct.ID, xs.picked.ID)
+	if !conflict {
+		return acct, nil, nil, false
+	}
+	// 这个号已被绑到别的启用出口：跳过，换下一个号，绝不从 picked 外发。
+	skip = ensureSkipMap(skip)
+	skip[acct.ID] = true // 挡回挑号；不写 tried，不占换号预算
+	*lastBoundErr = &RateLimitError{Reason: "rebound", ProxyID: conflictID, Bound: true}
+	// v2.2 §8：xsrfExitConflict 早退必须补填归属——否则失败结果
+	// AccountID=0 看着像匿名错误，排查时对不上是哪个号被绑走。
+	xs.cookieID, xs.cookieLabel = acct.ID, accountDisplayName(acct)
+	releaseAccountProbeIfMatch(acct.ID, xs.fstate.reqID) // 切走旧号放探测位
+	xs.skip = skip
+	if xs.mc.PinAccountID > 0 {
+		// 会话钉住的号被绑走：直接报 Bound，绝不能换号，也绝不能匿名下发。
+		return nil, &StreamResult{AccountID: acct.ID}, *lastBoundErr, true
+	}
+	if xs.singleAccountTry {
+		// v2.2 §8：外层接管跳槽时冲突立即上抛——内层不再换号，让外层
+		// 释放本跳出口槽后按 fstate 准入挑备号（防漏 IP 不变量在内层
+		// 也成立：冲突号绝不能从 picked 出口外发，故只能上抛）。
+		res, e := attrib(*lastBoundErr)
+		return nil, res, e, true
+	}
+	next := pickNextUnboundAccount(skip, tried, xs.picked.ID)
+	if xs.fstate.reqID != 0 {
+		for next != nil && !tryClaimHalfOpenProbe(next.ID, xs.fstate.reqID) {
+			skip[next.ID] = true
+			next = pickNextUnboundAccount(skip, tried, xs.picked.ID)
+		}
+	}
+	return next, nil, nil, false
+}
+
+// xsrfHealOrAdvance 是 getXSRF 失败后的「轮转救号 -> 记账 -> 换号」一步：
+// 轮转成功回填 xs 并返回 healed=true；换号/停手后返回新的 acct（nil=停）。
+// failRes!=nil 表示直接终局（Pin 号被绑走的 Bound 早退），调用方直接返回
+// (failRes, ferr)。
+func xsrfHealOrAdvance(xs *xsrfTokenCtx, acct *CookieAccount, err error,
+	skip, tried, rotatedOnce map[int64]bool, lastBoundErr **RateLimitError,
+	attrib func(error) (*StreamResult, error)) (next *CookieAccount, ferr error,
+	newSkip map[int64]bool, healed bool, failRes *StreamResult) {
+	mc, fstate, picked, proxyURL := xs.mc, xs.fstate, xs.picked, xs.proxyURL
+	// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
+	// 换号之前先给它一次机会：强制轮转一次再重取。
+	//
+	// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
+	// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
+	// 只试一次，且只在这一轮。
+	if !rotatedOnce[acct.ID] {
+		rotatedOnce[acct.ID] = true
+		out := healXSRFByRotation(mc, acct, picked, proxyURL, skip, tried)
+		skip = out.skip
+		if out.boundErr != nil {
+			*lastBoundErr = out.boundErr
+			// 切走旧号先放探测位（R2-SF-1，与 resolveXSRFConflict 同口径）。
+			releaseAccountProbeIfMatch(acct.ID, fstate.reqID)
+			if out.failRes != nil {
+				// 钉会话的号被绑走：直接报 Bound，绝不能换号。
+				return nil, out.boundErr, skip, false, out.failRes
+			}
+			if xs.singleAccountTry {
+				// 外层统一跳槽：冲突上抛交外层按 fstate 准入重选，内层绝不
+				// 就地换号（旧号出口槽由外层释放，防漏 IP 不变量不变）。
+				res, e := attrib(out.boundErr)
+				return nil, e, skip, false, res
+			}
+			// 内层换号：healXSRFByRotation 挑出的 out.next 未认领半开探测位，
+			// 认领不到并入 skip 重挑（v2.2 §5 全选号入口半开单飞契约）。
+			for out.next != nil && fstate.reqID != 0 &&
+				!tryClaimHalfOpenProbe(out.next.ID, fstate.reqID) {
+				skip[out.next.ID] = true
+				out.next = pickNextUnboundAccount(skip, tried, picked.ID)
+			}
+			// ferr=nil：调用方不动 lastCookieErr（对应原 continue 语义）。
+			return out.next, nil, skip, false, nil
+		}
+		if out.healed {
+			xs.cookieStr, xs.sapisid, xs.xsrfToken = out.acct.Cookie, extractSAPISID(out.acct.Cookie), out.xsrf
+			xs.authUser = out.acct.AuthUser
+			if !rtCfg().StrictProxyBinding && out.acct.ProxyID != proxyIDDirect &&
+				(out.acct.ProxyID == 0 || !proxyUsableByID(out.acct.ProxyID)) {
+				autoBindAccountProxy(out.acct.ID, picked.ID)
+			}
+			return out.acct, nil, skip, true, nil
+		}
+	}
+	// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
+	// 断网、出口被拦不记（见 xsrfErrBlamesCookie）。然后换下一个。
+	if xsrfErrBlamesCookie(err) {
+		markCookieByStatus(acct.ID, 401, err.Error())
+	}
+	logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
+	if mc.PinAccountID > 0 {
+		return nil, err, skip, false, nil // pinned: never switch to another account
+	}
+	// singleAccountTry（外层统一跳槽）：XSRF 内层绝不换号——本号 XSRF
+	// 失败直接上抛给外层统一跳槽/结算；非 singleAccountTry（直接调用
+	// streamGenerateOnce 的存量入口）内层换号必须过 fstate 故障准入——
+	// 已触碰 2 号/故障预算满时停在内层，错误照常上抛。
+	if xs.singleAccountTry {
+		return nil, err, skip, false, nil
+	}
+	if !fstate.tryAdvanceHop(classifyFailoverError(err), false) {
+		return nil, err, skip, false, nil
+	}
+	// 严格绑定：出口已经定了，绑在别的仍然有效的出口上的号不能借用这个出口
+	// （pickNextUnboundAccount 内部过滤 strictBoundElsewhere）。
+	releaseAccountProbeIfMatch(acct.ID, fstate.reqID) // 切走旧号放探测位
+	next = pickNextUnboundAccount(skip, tried, picked.ID)
+	if fstate.reqID != 0 {
+		for next != nil && !tryClaimHalfOpenProbe(next.ID, fstate.reqID) {
+			skip[next.ID] = true
+			next = pickNextUnboundAccount(skip, tried, picked.ID)
+		}
+	}
+	return next, err, skip, false, nil
+}
+
+// xsrfFailTail 是 XSRF 闭环的收尾：全失败/冲突路径的早退判定
+// （Pin Bound / singleAccountTry 上抛 / FallbackAnon 拒绝兜底）。
+// 返回 done=true 表示调用方直接返回。
+func xsrfFailTail(xs *xsrfTokenCtx, lastCookieErr error, lastBoundErr *RateLimitError,
+	tried map[int64]bool, attrib func(error) (*StreamResult, error)) (*StreamResult, error, bool) {
+	mc := xs.mc
+	if xs.cookieStr == "" && lastCookieErr == nil && lastBoundErr != nil {
+		// 循环里只遇到并发改绑冲突、没试过任何 cookie：绝不能绕过
+		// FallbackAnon=false 静默匿名外发——报真实的 Bound 冲突。
+		res, e := attrib(lastBoundErr)
+		return res, e, true
+	}
+	if lastCookieErr == nil || xs.cookieStr != "" {
+		return nil, nil, false
+	}
+	if mc.PinAccountID > 0 {
+		res, e := attrib(&pinnedAccountError{ID: mc.PinAccountID, Err: lastCookieErr})
+		return res, e, true
+	}
+	// v2.2 §8：singleAccountTry（外层接管跳槽）时禁止内层 FallbackAnon
+	// 抢跑——XSRF 全失败原样返回给外层，由外层释放主号出口槽后跳备号；
+	// 匿名兜底只在外层全链耗尽且满足 C4a+pending 为空时统一决定。
+	if xs.singleAccountTry {
+		res, e := attrib(lastCookieErr)
+		return res, e, true
+	}
+	if !rtCfg().FallbackAnon {
+		// 默认报错而不是降级：cookie 失效后上游不会拒绝，只是把你当匿名用户，
+		// 纯文本请求照样 200 —— 于是 3.1 Pro 被静默降级成 3.5 Flash-Lite、
+		// 思考链消失，客户端完全看不出来。宁可明确失败也不给假的成功。
+		res, e := attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
+			"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
+			len(tried), lastCookieErr))
+		return res, e, true
+	}
+	if xs.picked.ID == 0 && hasProxyPool() && !rtCfg().FallbackDirect {
+		// 手上是锁定直连号留下/误取的直连槽：池非空且关 fallback 时本机
+		// 直连不合法，降级匿名会把真实 IP 漏出去——报真实错误不匿名外发。
+		if lastBoundErr != nil {
+			res, e := attrib(lastBoundErr)
+			return res, e, true
+		}
+		res, e := attrib(lastCookieErr)
+		return res, e, true
+	}
+	logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
+	xs.cookieID, xs.cookieLabel = 0, ""
+	return nil, nil, false
 }
 
 // rotationHeal 是 healXSRFByRotation 的结果。

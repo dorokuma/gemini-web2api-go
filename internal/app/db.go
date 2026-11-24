@@ -114,10 +114,16 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_error    TEXT NOT NULL DEFAULT '',
     fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
     proxy_id      INTEGER NOT NULL DEFAULT 0,     -- 绑定的出口，0 = 还没绑
-    authuser      INTEGER NOT NULL DEFAULT 0      -- 浏览器多号登录时的账号序号（/u/N），0 = 默认号
+    authuser      INTEGER NOT NULL DEFAULT 0,     -- 浏览器多号登录时的账号序号（/u/N），0 = 默认号
+    priority      INTEGER NOT NULL DEFAULT 0      -- 主备优先级：数值越大越先被挑中（主 100 / 备 10 / 默认 0）
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
 `
+
+// 挑号索引不能放进 schema 的 CREATE 段：v6.5.0 老库的 accounts 表还没有
+// priority 列，schema 先跑的话 CREATE INDEX 会因 no such column 失败被
+// 静默吞掉、索引永远建不上。老库要等下面 ALTER TABLE 跑完、探针确认列
+// 存在之后才建（见 getDB 迁移段，Oracle S1）。
 
 func getDB() *dbx {
 	dbOnce.Do(func() {
@@ -174,6 +180,24 @@ func getDB() *dbx {
 		// authuser 列三种库的老库都要补：缺这一列时查账号的 SELECT 整条失败、池子直接空掉。
 		// 这句语法三种库通用，已有该列时报错忽略。
 		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN authuser INTEGER NOT NULL DEFAULT 0`)
+		// priority 列（v6.6.0 主备优先级）同规则补列，三方言语法通用。
+		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`)
+		// 列存在性探针：ALTER 在方言/老库上被静默吞掉时，这里能发现并报硬错，
+		// 不能让挑号 SQL 在运行期才炸。
+		pRows, pErr := conn.Query(`SELECT priority FROM accounts LIMIT 1`)
+		if pErr != nil {
+			fmt.Fprintf(os.Stderr, "[db] accounts.priority 列缺失且自动迁移失败: %v\n", pErr)
+			os.Exit(1)
+		}
+		_ = pRows.Close()
+		// 挑号排序索引：必须在 ALTER + 探针之后建（老库列刚补上），
+		// 且不能放 schema 段（schema 先于迁移跑，老库会因缺列报错被吞）。
+		// mysql 不支持 CREATE INDEX IF NOT EXISTS，重启重复执行报错容忍。
+		idxPriority := `CREATE INDEX IF NOT EXISTS idx_accounts_priority_pick ON accounts(status, priority, fail_count, last_used_at, id)`
+		if curDialect == dialectMySQL {
+			idxPriority = `CREATE INDEX idx_accounts_priority_pick ON accounts(status, priority, fail_count, last_used_at, id)`
+		}
+		_, _ = conn.Exec(idxPriority)
 		db = conn
 		dbw = &dbx{conn}
 		logf("[db] opened dialect=%d driver=%s", curDialect, driver)
