@@ -728,11 +728,14 @@ func browserDetected() string {
 // 校验 generation/session，nil client / 过时实例的事件一律丢弃。
 func (m *browserManager) registerCDPEvents(c *cdpClient) {
 	c.On("Runtime.bindingCalled", func(evt cdpEvent) {
+		// disposed/sessionID 的判定必须在锁内完成（R2-MF-3）：Invalidate /
+		// stopImpl / recreate 都在 m.mu 下写这些字段，锁外读是 data race。
 		m.mu.Lock()
 		cur := m.client
 		ac := m.sessionIndex[evt.SessionID]
+		stale := ac == nil || ac.disposed || ac.sessionID != evt.SessionID
 		m.mu.Unlock()
-		if cur != c || ac == nil || ac.disposed || ac.sessionID != evt.SessionID {
+		if cur != c || stale {
 			return
 		}
 		var p struct {
@@ -749,8 +752,9 @@ func (m *browserManager) registerCDPEvents(c *cdpClient) {
 		cur := m.client
 		ac := m.sessionIndex[evt.SessionID]
 		gen := m.generation
+		stale := ac == nil || ac.disposed
 		m.mu.Unlock()
-		if cur != c || ac == nil || ac.disposed {
+		if cur != c || stale {
 			return
 		}
 		logf("[browser] target crashed (slot %v), recreating tab", ac.key)
@@ -771,8 +775,9 @@ func (m *browserManager) registerCDPEvents(c *cdpClient) {
 		cur := m.client
 		gen := m.generation
 		shut := m.shuttingDown
+		stale := ac == nil || ac.disposed
 		m.mu.Unlock()
-		if ac == nil || cur != c || ac.disposed || shut {
+		if stale || cur != c || shut {
 			return
 		}
 		logf("[browser] tab destroyed (slot %v), recreating", ac.key)
@@ -1698,7 +1703,7 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 		}
 	}
 	if proc != nil {
-		killBrowserProcessGroup(proc.PID, proc.PGID, stopRemaining(ctx))
+		killProcGroupFn(proc.PID, proc.PGID, stopRemaining(ctx))
 	}
 	if client != nil {
 		client.Close()
@@ -1729,7 +1734,7 @@ func (m *browserManager) stopReapLate(ctx context.Context, gen uint64,
 	m.stopping = false
 	m.mu.Unlock()
 	if lateProc != nil && lateProc != proc {
-		killBrowserProcessGroup(lateProc.PID, lateProc.PGID, 1500*time.Millisecond)
+		killProcGroupFn(lateProc.PID, lateProc.PGID, 1500*time.Millisecond)
 	}
 	if lateClient != nil && lateClient != client {
 		lateClient.Close()

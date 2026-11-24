@@ -976,12 +976,14 @@ func updateAccountCookie(id int64, cookie string) {
 	written := updateAccountCookieCASLocked(id, cur, cookie)
 	// MF-6：真实写库成功后先在 acctCookieLock（L1）内 BumpAccountEpoch，
 	// 杜绝新刷 Cookie 与并发回写交错时代际漂移；再放锁，最后 Invalidate。
-	bump := written && cookie != cur && shouldUseBrowserTransport()
+	// R2-NH-3：Bump 无条件推进（不门控 shouldUseBrowserTransport），
+	// Invalidate 仍按开关门控。
+	bump := written && cookie != cur
 	if bump {
 		browserMgr.BumpAccountEpoch(id)
 	}
 	unlock()
-	if bump {
+	if bump && shouldUseBrowserTransport() {
 		browserMgr.InvalidateAccount(id, false, "cookie rotated")
 	}
 }

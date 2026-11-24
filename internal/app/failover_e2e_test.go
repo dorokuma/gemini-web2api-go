@@ -220,6 +220,73 @@ func TestWithFilesFallbackAnonOnAuthFail(t *testing.T) {
 	}
 }
 
+// 端到端：单号池 C4a + FallbackAnon=true（R2-MF-2 / Reviewer M1）——
+// 唯一账号鉴权失败后，tryAdvanceHop 消耗 faultHops 允许跳号，但
+// pickAccountForModel 因 exclude 非空无备号返回 noEligibleAccountError；
+// 终结路径必须同样落外层 runAnonFallback 匿名兜底，而不是直接把 C4a
+// 错误丢给客户端。同时断言终结路径的 C3 降级号被 markDowngraded（R2-MF-1）。
+func TestWithFilesFallbackAnonSingleAccountPool(t *testing.T) {
+	resetFailoverE2E(t)
+	a1 := addTestAccount(t, "anon-single")
+	calls := stubOncePickReal(t, func(id int64) (*StreamResult, error) {
+		// 单号 C4a：第 0 跳鉴权失败，第 1 跳无备号可挑。
+		return &StreamResult{AccountID: id}, errors.New("no SNlM0e token")
+	})
+	mc := Models["gemini-3.6-flash"]
+	res, err := streamGenerateWithFilesOpts(context.Background(), "hi",
+		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
+	// 单号池 C4a 终结路径必须经外层 FallbackAnon 匿名兜底成功
+	//（forceAnon 分支 res.AccountID=0），绝不直接向上游报 502。
+	if err != nil || res == nil || res.AccountID != 0 {
+		t.Fatalf("单号池 C4a+FallbackAnon 应匿名兜底成功，得到 res=%+v err=%v calls=%v", res, err, *calls)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("单号池只能试到 1 个号，calls=%v", *calls)
+	}
+	// a1 鉴权失败应被记一次账号失败（C4a 立即记账）。
+	accountHealthMu.Lock()
+	st1 := accountHealth[a1]
+	accountHealthMu.Unlock()
+	if st1 == nil || st1.failStreak != 1 {
+		t.Fatalf("C4a 应立即给 a1 记一次失败，得到 %+v", st1)
+	}
+}
+
+// 端到端：终结路径的 C3 降级号必须登记 markDowngraded（R2-MF-1）——
+// 双号池两个号都返回 C3 降级：第 1 跳降级消耗 downgradeTry 跳第 2 号，
+// 第 2 号再降级时 tryAdvanceHop 返 false 终结，但终结号同样必须记入
+// 模型冷却（否则下个请求还会挑中它再降级一次）。
+func TestWithFilesTerminalDowngradeMarksCooldown(t *testing.T) {
+	resetFailoverE2E(t)
+	rtMu.Lock()
+	rtVal.StrictModelCooldownMin = 300 // markDowngraded 需要冷却分钟数 >0
+	rtMu.Unlock()
+	a1 := addTestAccount(t, "dg-a")
+	a2 := addTestAccount(t, "dg-b")
+	calls := stubOncePickReal(t, func(id int64) (*StreamResult, error) {
+		return &StreamResult{AccountID: id},
+			&ModelDowngradedError{Requested: "gemini-3.6-flash", Reported: "flash-lite", AccountID: id}
+	})
+	mc := Models["gemini-3.6-flash"]
+	_, err := streamGenerateWithFilesOpts(context.Background(), "hi",
+		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
+	if err == nil {
+		t.Fatal("双号都 C3 降级应返回降级错误")
+	}
+	var mde *ModelDowngradedError
+	if !errors.As(err, &mde) {
+		t.Fatalf("终态应报 ModelDowngradedError，得到 %v", err)
+	}
+	// 两个号都被试到且都已确认配额耗尽：终结号 a2 同样必须进冷却。
+	if len(*calls) != 2 {
+		t.Fatalf("纯 C3 链应跳第 2 号，calls=%v", *calls)
+	}
+	cooling, _ := coolingAccounts(mc)
+	if !cooling[a1] || !cooling[a2] {
+		t.Fatalf("终结路径降级号必须 markDowngraded：cooling=%v (want a1+a2)", cooling)
+	}
+}
+
 // 端到端：上游 429（C2）跨号跳槽——主号 429 立即记账进短冷却，跳备号成功。
 func TestWithFilesUpstream429Hops(t *testing.T) {
 	resetFailoverE2E(t)

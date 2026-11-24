@@ -308,12 +308,14 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	// rootBridge 业务目标零命中：Chromium 导航期间 ctx-target-*.test 绝不
 	// 经根 Profile 偷跑（onConnectTarget 在 handleConnect 入口计数，含被
 	// 恒拒 502 的项）。
+	// 锁内格式化为字符串再解锁打印（R2-SF-4：onConnectTarget 回调仍在
+	// 并发写 rootTargets，锁外遍历史 map 是 fatal concurrent map 竞态）。
 	rootTargetsMu.Lock()
 	rootBiz1 := rootTargets[want1]
 	rootBiz2 := rootTargets[want2]
-	rootSnapshot := rootTargets
+	rootSnapStr := fmt.Sprint(rootTargets)
 	rootTargetsMu.Unlock()
-	t.Logf("rootBridge connect targets: %v", rootSnapshot)
+	t.Logf("rootBridge connect targets: %s", rootSnapStr)
 	if rootBiz1 != 0 || rootBiz2 != 0 {
 		t.Fatalf("rootBridge received business targets: %q=%d %q=%d (root profile leak)",
 			want1, rootBiz1, want2, rootBiz2)

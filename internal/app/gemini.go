@@ -937,7 +937,19 @@ func streamGenerateWithFilesOpts(ctx context.Context, prompt string, pc promptCt
 		next, nextErr := runStreamGenerateOnce(ctx, prompt, pc, mc, pending, onDelta, onReasoning, stopWhen, opts)
 		// 「没号可挑」不覆盖上一跳真实错误：prevErr/prevRes 留给
 		// resolveHopPickErr 回填，res/err 只在确认要换新跳时才推进。
-		if done, dres, derr := resolveHopPickErr(next, nextErr, prevRes, prevErr, try == 0, mc); done {
+		if done, dres, derr, isNoEligible := resolveHopPickErr(next, nextErr, prevRes, prevErr, try == 0, mc); done {
+			// 单号池（或其余号冷却/已排除）C4a 终结路径同样落外层
+			// FallbackAnon（R2-MF-2）：上一跳未吐字鉴权失败、无暂挂结算、
+			// 无附件且 Pin==0 时先结代理记账再统一匿名兜底。出口仍走
+			// runStreamGenerateOnce 的正常 slot 规则，防漏 IP 不变量不变。
+			if isNoEligible && derr != nil && classifyFailoverError(derr) == classAuthFail &&
+				pendingHop0 == nil && len(pending) == 0 && mc.PinAccountID == 0 &&
+				rtCfg().FallbackAnon && !resultEmitted(dres) {
+				commitPendingProxy(dres)
+				anonRes, anonErr := runAnonFallback(ctx, prompt, pc, mc,
+					onDelta, onReasoning, stopWhen, postValidate, fstate)
+				return finish(anonRes, anonErr)
+			}
 			return finish(dres, derr)
 		}
 		res, err = next, nextErr
@@ -972,31 +984,30 @@ func streamGenerateWithFilesOpts(ctx context.Context, prompt string, pc promptCt
 // done=true 表示本条请求就此终结，应返回 (dres, derr)。
 // 上一跳真实错误永远优先——「没号可挑」不该覆盖现场。
 func resolveHopPickErr(next *StreamResult, nextErr error, prevRes *StreamResult, prevErr error,
-	firstHop bool, mc ModelConfig) (done bool, dres *StreamResult, derr error) {
+	firstHop bool, mc ModelConfig) (done bool, dres *StreamResult, derr error, noEligible bool) {
 	var exhausted *ModelDowngradedError
 	if !firstHop && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
 		// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间。
 		var last *ModelDowngradedError
 		if prevErr != nil && errors.As(prevErr, &last) && last.Reported != "" {
 			last.RetryAfter = exhausted.RetryAfter
-			return true, prevRes, last
+			return true, prevRes, last, false
 		}
 		if prevErr != nil {
-			return true, prevRes, prevErr // 上一跳真实失败比「全池冷却」更有信息量
+			return true, prevRes, prevErr, false // 上一跳真实失败比「全池冷却」更有信息量
 		}
-		return true, next, nextErr
+		return true, next, nextErr, false
 	}
 	var nee *noEligibleAccountError
 	if !errors.As(nextErr, &nee) {
-		return false, nil, nil
+		return false, nil, nil, false
 	}
-	if prevErr != nil {
-		return true, prevRes, prevErr
+	// prevErr!=nil 也统一经 resolveNoEligibleFallback 回填（R2-SF-2）：上一跳是
+	// 带自报名降级时补 Retry-After，否则原样报上一跳真实失败。
+	if rerr := resolveNoEligibleFallback(prevRes, prevErr, nee, mc); rerr != nil {
+		return true, prevRes, rerr, true
 	}
-	if rerr := resolveNoEligibleFallback(next, nextErr, nee, mc); rerr != nil {
-		return true, next, rerr
-	}
-	return true, next, nextErr
+	return true, next, nextErr, true
 }
 
 // advanceOuterHop 是单轮/多轮共用的跳槽准入收口：分类判定 + Bound 预算 +
@@ -1037,16 +1048,20 @@ func advanceOuterHop(res *StreamResult, err error, fstate *reqFailoverState, mc 
 		}
 		return true, nil, nil
 	}
+	// 降级冷却登记必须在跳槽准入判定之前无条件完成（R2-MF-1）：纯 C3 链
+	// 第 3 个号、C1->C3 第 2 个号、Pin/已吐字遇降级时 tryAdvanceHop 返回
+	// false，但这几个已确认配额耗尽的号同样必须记入 5h 模型冷却，否则
+	// 后续请求会反复挑中同一个降级号。
+	if cls == classModelDowngrade {
+		var mde *ModelDowngradedError
+		if errors.As(err, &mde) && mde.AccountID > 0 {
+			markDowngraded(mde.AccountID, mc)
+			logf("[strict_model] 账号 #%d 在 %s 上被降级成 %s", mde.AccountID, mc.Upstream, mde.Reported)
+		}
+	}
 	if fstate.tryAdvanceHop(cls, emitted) {
 		if acctID > 0 {
 			exclude[acctID] = true
-		}
-		if cls == classModelDowngrade {
-			var mde *ModelDowngradedError
-			if errors.As(err, &mde) && mde.AccountID > 0 {
-				markDowngraded(mde.AccountID, mc)
-				logf("[strict_model] 账号 #%d 在 %s 上被降级成 %s", mde.AccountID, mc.Upstream, mde.Reported)
-			}
 		}
 		return true, nil, nil
 	}
@@ -1074,13 +1089,22 @@ func runAnonFallback(ctx context.Context, prompt string, pc promptCtx, mc ModelC
 			postValidate: postValidate, forceAnon: true})
 }
 
+// resultEmitted 报告本跳结果是否已向上游/客户端吐出内容（吐字后不可换号
+// 也不可匿名兜底——客户端已收到一部分响应）。
+func resultEmitted(res *StreamResult) bool {
+	return res != nil && (res.Emitted != "" || res.EmittedReasoning != "")
+}
+
 // resolveNoEligibleFallback 决定 noEligibleAccountError 的最终上报形态：
 // 上一个号有真实错误就报它（补解冻时间），没有就按冷却/降级类型报。
 func resolveNoEligibleFallback(res *StreamResult, err error, nee *noEligibleAccountError, mc ModelConfig) error {
 	var last *ModelDowngradedError
 	if errors.As(err, &last) && last.Reported != "" {
-		if nee.modelRetryAfter > 0 {
-			last.RetryAfter = nee.modelRetryAfter
+		// R2-SF-2：回填用 nee.retryAfter()（model/short 取最早），与多轮
+		// conversation.go resolveConvPickErr 同口径——上一跳降级号在全池
+		// 短冷却主导时也该拿到最早解冻时间。
+		if ra := nee.retryAfter(); ra > 0 {
+			last.RetryAfter = ra
 		}
 		return last
 	}
@@ -2162,9 +2186,24 @@ func xsrfHealOrAdvance(xs *xsrfTokenCtx, acct *CookieAccount, err error,
 		skip = out.skip
 		if out.boundErr != nil {
 			*lastBoundErr = out.boundErr
+			// 切走旧号先放探测位（R2-SF-1，与 resolveXSRFConflict 同口径）。
+			releaseAccountProbeIfMatch(acct.ID, fstate.reqID)
 			if out.failRes != nil {
 				// 钉会话的号被绑走：直接报 Bound，绝不能换号。
 				return nil, out.boundErr, skip, false, out.failRes
+			}
+			if xs.singleAccountTry {
+				// 外层统一跳槽：冲突上抛交外层按 fstate 准入重选，内层绝不
+				// 就地换号（旧号出口槽由外层释放，防漏 IP 不变量不变）。
+				res, e := attrib(out.boundErr)
+				return nil, e, skip, false, res
+			}
+			// 内层换号：healXSRFByRotation 挑出的 out.next 未认领半开探测位，
+			// 认领不到并入 skip 重挑（v2.2 §5 全选号入口半开单飞契约）。
+			for out.next != nil && fstate.reqID != 0 &&
+				!tryClaimHalfOpenProbe(out.next.ID, fstate.reqID) {
+				skip[out.next.ID] = true
+				out.next = pickNextUnboundAccount(skip, tried, picked.ID)
 			}
 			// ferr=nil：调用方不动 lastCookieErr（对应原 continue 语义）。
 			return out.next, nil, skip, false, nil

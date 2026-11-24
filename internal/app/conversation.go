@@ -990,12 +990,14 @@ func settleFreshConvHop(res *StreamResult, err error, tools []map[string]interfa
 	}
 	if err == nil {
 		// 本跳成功：第 0 跳暂挂非毒按因果提交，代理记账 + 记账号成功。
+		// 暂挂已结算，返回 nil 而非 *pendingHop0（Reviewer N3：settleExit
+		// 幂等但目前靠幂等兜底，语义上不应再交回已结算的暂挂）。
 		settlePendingHop(*pendingHop0, fstate, true)
 		commitPendingProxy(res)
 		if res != nil && res.AccountID > 0 {
 			recordAccountReqSuccess(res.AccountID, fstate.reqID)
 		}
-		return res, nil, *pendingHop0, true
+		return res, nil, nil, true
 	}
 	// fresh 失败：与单轮同构的延迟结算——C1/C1b 可跳槽时暂挂 pendingHop0
 	//（不写全局），落定后按 isPoisonPair 判毒载荷双端免责或单次提交。

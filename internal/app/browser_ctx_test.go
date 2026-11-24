@@ -20,7 +20,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -527,8 +526,9 @@ func TestBrowserAcquireReadySlotStrongBinding(t *testing.T) {
 // TestBrowserAcquireCreatorFastFailNoRebuild 复核 MF-4：创建者认领构建后
 // buildAccountCtx 快速失败摘除 nac，创建者直等 nac.readyCh 唤醒拿到
 // lastBuildErr 返回——绝不回循环顶重查 m.ctxs[key] 拿陈旧形参无限重建。
-// 这里直接对 nac 调 detachCtxLocked（模拟构建失败摘除），断言等 readyCh
-// 的创建者唤醒后看到 disposed + lastBuildErr。
+// 驱动真实生产路径 acquireAccountCtx -> go buildAccountCtx：fakeCDPServer
+// 的 Target.createBrowserContext 注入错误，断言 acquire 返回该错误且
+// createBrowserContext 恰好只被调 1 次（旧缺陷回环重查会无限重建）。
 func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -540,62 +540,69 @@ func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
 		c.BrowserTransport = true
 	})
 
+	// 注入 Target.createBrowserContext 失败：buildAccountCtx 在步骤 1 即
+	// 快速失败摘除 nac。
+	srv.failMethods.Store("Target.createBrowserContext", true)
+
 	id, _ := accountInsert("fastfail", "SAPISID=ff; __Secure-1PSID=f2; SID=f3", "")
 	defer accountDelete(id)
 	acct := accountByID(id)
 	acct.ProxyID = proxyIDDirect
 	key := slotKeyForAccount(acct, "", true)
 
-	// 用生产 acquireClaimCreateLocked 认领一个 creating 槽（返回 waitCh=
-	// nac.readyCh）。
-	m.mu.Lock()
-	nac, _, _, _, _, _, waitCh, _, err :=
-		m.acquireClaimCreateLocked(key, acct, "", true, proxyIDDirect, 0)
-	if err != nil {
-		m.mu.Unlock()
-		t.Fatalf("acquireClaimCreateLocked: %v", err)
-	}
-	m.mu.Unlock()
-
-	// 模拟 buildAccountCtx 快速失败：detach 写 lastBuildErr + 摘 nac +
-	// closeReadyLocked 唤醒创建者。
-	buildErr := browserErr("createBrowserContext: injected fail")
-	m.mu.Lock()
-	ok, _ := m.detachCtxLocked(nac, buildErr)
-	m.mu.Unlock()
-	if !ok {
-		t.Fatal("detachCtxLocked did not win on creating slot")
-	}
-
-	// 创建者直等 nac.readyCh：唤醒后必须看到 disposed + lastBuildErr
-	//（绝不重查 m.ctxs[key]——nac 已被 delete，重查只会空槽无限重建）。
+	// 真实 acquire（创建者路径）：必须在构建快速失败后返回错误，而不是
+	// 回循环顶重查 m.ctxs[key] 无限重建。
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, _, aerr := m.acquireAccountCtx(
+			context.Background(), acct, "", true, true)
+		done <- aerr
+	}()
 	select {
-	case <-waitCh:
-	case <-time.After(time.Second):
-		t.Fatal("creator waitCh (nac.readyCh) did not fire on build fail")
+	case aerr := <-done:
+		if aerr == nil {
+			t.Fatal("acquireAccountCtx returned nil error on injected createBrowserContext failure")
+		}
+		if !strings.Contains(aerr.Error(), "createBrowserContext") &&
+			!strings.Contains(aerr.Error(), "injected") {
+			t.Fatalf("acquireAccountCtx err=%v, want createBrowserContext failure", aerr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquireAccountCtx did not return after build fast-fail (re-create loop?)")
 	}
+
+	// Target.createBrowserContext 只被调用 1 次：失败即终态返回，绝不重建。
+	createCalls := 0
+	drainUntil := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case <-srv.createBCHit:
+			createCalls++
+		case call := <-srv.gotCalls:
+			if call.method == "Target.createBrowserContext" {
+				createCalls++
+			}
+		case <-drainUntil:
+			goto drained
+		}
+	}
+drained:
+	if createCalls != 1 {
+		t.Fatalf("Target.createBrowserContext called %d times, want exactly 1 (no rebuild loop)", createCalls)
+	}
+	// 槽位已摘除：m.ctxs 不再留死 nac（下次请求会重新认领而不是误复用）。
 	m.mu.Lock()
-	disposed := nac.disposed
-	gotErr := nac.lastBuildErr
 	_, stillThere := m.ctxs[key]
 	m.mu.Unlock()
-	if !disposed {
-		t.Fatal("nac not disposed after build fail detach")
-	}
-	if gotErr == nil {
-		t.Fatal("nac.lastBuildErr empty; creator would loop instead of returning error")
-	}
 	if stillThere {
-		t.Fatal("nac still in m.ctxs after detach (stale re-create risk)")
+		t.Fatal("failed ctx still registered in m.ctxs after build fail")
 	}
 }
 
 // TestBrowserDrainWaitersMergeOnExitChange 复核 MF-8：同登录槽非严格模式
 // 换出口，inFlight>0 时跨出口等待者登记 drainWaiters；当旧槽被
-// errExitChanged 摘除时，等待者清自身登记后汇入新槽（不返回终态错）。
-// 这里直接驱动 acquirePlanLocked 状态机：先在 inFlight>0 的旧槽上登记
-// 跨出口等待，再以 errExitChanged 摘除旧槽，断言等 drainWait 的等待者
-// 醒来后走「汇入新槽」分支而非终态返回。
+// errExitChanged 摘除时，等待者经生产 acquireWaitResult 的 waitDrain
+// 分支清自身登记后汇入新槽（retry=true，err=nil），不返回终态错。
 func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -643,6 +650,7 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	m.mu.Lock()
 	waitCh, kind, proceed, snap := m.acquirePlanLocked(ac, acct,
 		"http://proxy-new:8080", false, false, false, poolSnap, &drain)
+	stopCh := m.stopCh
 	m.mu.Unlock()
 	if snap.ac != nil || proceed {
 		t.Fatalf("acquirePlanLocked on busy slot: snap=%+v proceed=%v, want drain-wait", snap, proceed)
@@ -654,12 +662,22 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 		t.Fatal("cross-exit waiter did not register drainWaiters")
 	}
 
-	// 等待协程：等 drainWait（锁外，模拟 acquireWaitResult 的 select）。
-	woke := make(chan struct{})
-	go func() { <-waitCh; close(woke) }()
+	// 等待协程：真实调 acquireWaitResult 的 waitDrain 分支（锁外 select）。
+	type waitRet struct {
+		retry bool
+		err   error
+	}
+	retCh := make(chan waitRet, 1)
+	go func() {
+		_, _, _, _, retry, werr := m.acquireWaitResult(
+			context.Background(), ac, waitCh, stopCh, waitDrain, &drain)
+		retCh <- waitRet{retry: retry, err: werr}
+	}()
+	time.Sleep(50 * time.Millisecond) // 让等待者先阻塞在 drainWait
 
 	// 旧槽被 errExitChanged 摘除（替换 winner）：detach 关 drainWait 唤醒
-	// 等待者，等待者见 disposed+errExitChanged → 汇入新槽（清登记）。
+	// 等待者，acquireWaitResult 见 disposed+errExitChanged → 汇入新槽
+	//（清登记 + retry=true）。
 	m.mu.Lock()
 	won, _ := m.detachCtxLocked(ac, errExitChanged)
 	m.mu.Unlock()
@@ -667,22 +685,15 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 		t.Fatal("detachCtxLocked did not win for exit-change replacement")
 	}
 	select {
-	case <-woke:
+	case ret := <-retCh:
+		if !ret.retry {
+			t.Fatalf("acquireWaitResult retry=false err=%v, want retry=true (merge into new slot)", ret.err)
+		}
+		if ret.err != nil {
+			t.Fatalf("acquireWaitResult err=%v, want nil on exit-change merge", ret.err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("drain waiter did not wake on exit-change detach")
-	}
-
-	// 等待者醒来后的汇入新槽判定（acquireWaitResult 的 waitDrain 分支）：
-	// ac.disposed && errors.Is(errExitChanged) → 清登记 + continue。
-	m.mu.Lock()
-	isExitChange := ac.disposed && errors.Is(ac.lastBuildErr, errExitChanged)
-	if drain.registered && drain.target == ac {
-		drain.registered = false
-		drain.target = nil
-	}
-	m.mu.Unlock()
-	if !isExitChange {
-		t.Fatal("exit-change detach not flagged errExitChanged (waiter would wrongly return terminal err)")
+		t.Fatal("acquireWaitResult did not return after exit-change detach")
 	}
 	if drain.registered {
 		t.Fatal("drain registration not cleared after merge-to-new-slot")

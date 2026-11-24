@@ -842,8 +842,8 @@ func (m *browserManager) acquirePlanLocked(ac *accountBrowserCtx, account *Cooki
 // 返回 true 表示该槽位出口已违反绑定规则，应立即摘除重建。规则：
 //   - (a) 账号已锁直连（proxyIDDirect）但槽位不是显式直连；
 //   - (b) 池禁直连时槽位直连但账号并非锁定直连（-1 -> 0 反向防泄漏）；
-//   - (c) 严格模式下账号新绑定代理启用且其 URL 与槽位出口漂移
-//     （Reviewer #4：管理员在等待窗口内改绑新代理 P2）；
+//   - (c) 严格模式或「原绑定已变」时账号新绑定代理启用且其 URL 与槽位
+//     出口漂移（Reviewer #4 与 exitCompatCheck 同口径）；
 //   - (d) 槽位 boundProxyID 已删除/禁用或与槽位出口 URL 漂移。
 func (ac *accountBrowserCtx) readySlotExitViolation(account *CookieAccount,
 	poolBlocksDirect, strictBinding bool, poolSnap map[int64]proxySnapEntry) bool {
@@ -855,9 +855,11 @@ func (ac *accountBrowserCtx) readySlotExitViolation(account *CookieAccount,
 	if ac.proxyURL == "" && poolBlocksDirect && account.ProxyID != proxyIDDirect {
 		return true
 	}
-	// (c) 严格模式：账号当前绑定代理已启用且 URL 与槽位出口漂移 →
-	// 改绑后的旧槽必须摘除重建，绝不复用陈旧出口。
-	if strictBinding && account.ProxyID > 0 {
+	// (c) 与 exitCompatCheck 同口径：严格模式或账号绑定已变（orig 漂移）
+	// 时，当前绑定代理启用且 URL 与槽位出口漂移 → 改绑后的旧槽必须摘除
+	// 重建，绝不复用陈旧出口（非严格模式下管理员改绑同样生效）。
+	if account.ProxyID > 0 &&
+		(strictBinding || account.ProxyID != ac.origAccountProxyID) {
 		if ent, ok := poolSnap[account.ProxyID]; ok && ent.enabled &&
 			ent.url != ac.proxyURL {
 			return true
@@ -1376,28 +1378,6 @@ func (m *browserManager) syncCookieTargetsBack(ctx context.Context,
 		m.syncAccountCookiesBackCtx(cctx, client, tg.bcID, tg.accID, tg.epoch, tg.ident)
 		cancel()
 	}
-}
-
-// syncAllCookiesBackForce 是后台停机写回入口：对全部存活登录槽以
-// 共享预算（封顶 800ms）强制写回 Cookie（stopImpl 已改为同一临界区
-// 内快照+摘除，本函数保留给其它需要单独强制写回的路径）。
-func (m *browserManager) syncAllCookiesBackForce(ctx context.Context) {
-	m.mu.Lock()
-	client := m.client
-	var targets []cookieSyncTarget
-	for _, ac := range m.ctxs {
-		if ac.disposed || ac.key.accountID <= 0 || ac.browserContextID == "" {
-			continue
-		}
-		targets = append(targets, cookieSyncTarget{
-			bcID:  ac.browserContextID,
-			accID: ac.key.accountID,
-			epoch: ac.epoch,
-			ident: ac.cookieIdentity,
-		})
-	}
-	m.mu.Unlock()
-	m.syncCookieTargetsBack(ctx, client, targets)
 }
 
 // InvalidateAccount 精准失效指定账号的登录槽（deleted/disabled/proxy 变更 /

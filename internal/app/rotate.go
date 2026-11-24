@@ -184,14 +184,17 @@ func rotateAccountOpts(a CookieAccount, skipIfActive bool) (time.Duration, []str
 	}
 	// MF-6：真实写库成功后先在 acctCookieLock（L1）内 BumpAccountEpoch，
 	// 杜绝新刷 Cookie 与并发回写交错时代际漂移；再放锁，最后 Invalidate。
-	bump := written && shouldUseBrowserTransport()
+	// R2-NH-3：Bump 是纯内存 O(1) 代际标记，无条件推进（不以
+	// shouldUseBrowserTransport 门控，封死刚关开关时与在飞停机写回的窗口）；
+	// 仅 InvalidateAccount 仍按开关门控（关开关时没有槽可摘）。
+	bump := written
 	if bump {
 		browserMgr.BumpAccountEpoch(a.ID)
 	}
 	unlock()
 	if written {
 		invalidateXSRF(cur.Cookie)
-		if bump {
+		if bump && shouldUseBrowserTransport() {
 			browserMgr.InvalidateAccount(a.ID, false, "cookie rotated")
 		}
 	}
