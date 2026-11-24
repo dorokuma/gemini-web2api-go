@@ -347,7 +347,7 @@ func (m *browserManager) handleDeadLocked(expectedClient *cdpClient, expectedGen
 	gen := m.generation
 	var deadCtxs []*accountBrowserCtx
 	for _, ac := range m.ctxs {
-		if m.detachCtxLocked(ac, browserErr("browser instance died")) {
+		if ok, _ := m.detachCtxLocked(ac, browserErr("browser instance died")); ok {
 			deadCtxs = append(deadCtxs, ac)
 		}
 	}
@@ -1411,6 +1411,27 @@ func (sc *streamReadCloser) Close() error {
 		if sc.release != nil {
 			sc.release()
 		}
+		// SF-2：登录槽常规流结束后按 cookieSyncThrottle + syncingCookie
+		// 单飞节流异步写回 Cookie（新刷 SIDCC 不丢 jar）；匿名槽跳过。
+		if ac := sc.s.ac; ac != nil && ac.key.accountID > 0 {
+			m := sc.m
+			m.mu.Lock()
+			single := !ac.syncingCookie
+			if single {
+				ac.syncingCookie = true
+			}
+			m.mu.Unlock()
+			if single {
+				go func(ac *accountBrowserCtx) {
+					defer func() {
+						m.mu.Lock()
+						ac.syncingCookie = false
+						m.mu.Unlock()
+					}()
+					m.SyncAccountCookiesBack(ac.key.accountID, false)
+				}(ac)
+			}
+		}
 	})
 	return nil
 }
@@ -1598,14 +1619,6 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 	default:
 		close(m.stopCh)
 	}
-	// 全槽位统一摘除：一次性取消全部在飞 buildCancel 并幂等关闭全部
-	// readyCh/drainWait（等待者毫秒级醒来拿到终态错误退出）。
-	var deadCtxs []*accountBrowserCtx
-	for _, ac := range m.ctxs {
-		if m.detachCtxLocked(ac, browserErr("browser shut down")) {
-			deadCtxs = append(deadCtxs, ac)
-		}
-	}
 	var waitReady chan struct{}
 	if m.starting && m.readyCh != nil {
 		waitReady = m.readyCh
@@ -1619,9 +1632,22 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 		}
 	}
 
-	// 停机前强制无节流写回 Cookie（新刷 SIDCC 不能丢在 jar 里）；
-	// 透传剩余 ctx 预算（封顶 800ms）。
+	// 停机前先快照 published 登录槽并强制无节流写回 Cookie（新刷 SIDCC
+	// 不能丢在 jar 里）；必须在摘除槽位前执行——一旦 detach 标记
+	// disposed，syncAllCookiesBackForce 会全部跳过导致零写回。透传
+	// 剩余 ctx 预算（封顶 800ms）。
 	m.syncAllCookiesBackForce(ctx)
+
+	// 全槽位统一摘除：一次性取消全部在飞 buildCancel 并幂等关闭全部
+	// readyCh/drainWait（等待者毫秒级醒来拿到终态错误退出）。
+	m.mu.Lock()
+	var deadCtxs []*accountBrowserCtx
+	for _, ac := range m.ctxs {
+		if ok, _ := m.detachCtxLocked(ac, browserErr("browser shut down")); ok {
+			deadCtxs = append(deadCtxs, ac)
+		}
+	}
+	m.mu.Unlock()
 
 	m.mu.Lock()
 	proc := m.proc

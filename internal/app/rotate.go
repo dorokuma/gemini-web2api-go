@@ -182,11 +182,16 @@ func rotateAccountOpts(a CookieAccount, skipIfActive bool) (time.Duration, []str
 	if cookie != cur.Cookie {
 		written = updateAccountCookieCASLocked(a.ID, cur.Cookie, cookie)
 	}
+	// MF-6：真实写库成功后先在 acctCookieLock（L1）内 BumpAccountEpoch，
+	// 杜绝新刷 Cookie 与并发回写交错时代际漂移；再放锁，最后 Invalidate。
+	bump := written && shouldUseBrowserTransport()
+	if bump {
+		browserMgr.BumpAccountEpoch(a.ID)
+	}
 	unlock()
 	if written {
 		invalidateXSRF(cur.Cookie)
-		if shouldUseBrowserTransport() {
-			browserMgr.BumpAccountEpoch(a.ID)
+		if bump {
 			browserMgr.InvalidateAccount(a.ID, false, "cookie rotated")
 		}
 	}

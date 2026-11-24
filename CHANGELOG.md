@@ -47,6 +47,17 @@
   已开流 SSE `Fail` 与 `response.failed` 事件同一份诊断）；跳槽选备号
   无号可挑时绝不静默退回匿名（`noEligibleAccountError`），
   `conversation.go`/`gemini.go` 统一 `errors.As` 消除裸类型断言。
+- **单 Chromium 多 `BrowserContext` 物理隔离（模块一，常驻浏览器传输层）**：
+  `browser_transport` 开启后，常驻浏览器传输层升级为单 Chromium 进程
+  + 单条根 CDP WebSocket，每个登录账号与每个匿名出口各驻留独立的
+  `BrowserContext`（`disposeOnDetach: true` + 每槽独立代理 bridge）。
+  账号间 Cookie/出口 100% 物理隔离：登录槽播种账号 Cookie、绑定专属
+  代理桥，多账号并发互不串出口、零切号冷却；`rootBridge`（根 Profile）
+  恒拒 `502` 防根 Profile 偷跑本机 IP。槽位键 `{accountID, exitKey}`：
+  登录账号按 `accountID` 分槽、匿名按 `allowDirect|proxyURL` 复合键分槽，
+  同槽复用租约、`inFlight` 租约与 `drainWaiters` 排空状态机管控并发
+  换出口。`accounts.priority` 与防雪崩状态机随模块二一并落地，旧
+  `stickyResidentAccountFor` 单常驻粘性主号方案随之移除。
 
 ### 修复
 
@@ -58,16 +69,6 @@
 - **视频 `errVideoQuotaUsed` 不误清探测位**：`recordAccountReqFailureAt`
   仅在 `probeReqID` 匹配或冷却续期时清探测占位，迟到释放不再误清他号
   探测（R3-S1）。
-
-### 预告
-
-- **单 Chromium 多 `BrowserContext` 物理隔离（模块一，Stage 2 落地）**：
-  每个登录账号与匿名出口将迁入独立的 `BrowserContext`
-  （`disposeOnDetach: true` + 每槽独立代理 bridge，`rootBridge` 恒拒 `502`
-  防根 Profile 偷跑本机 IP），取代当前 M1 单常驻 Jar 粘性方案——账号间
-  Cookie/出口 100% 物理隔离，多账号并发零切号冷却。Stage 1 已先落地
-  `accounts.priority` 与防雪崩状态机，并让 `stickyResidentAccountFor` 在
-  冷却/更高优先级账号存在时让位（Stage 2 随多 Context 一起删除）。
 
 ## 6.5.0 - 2026-11-23
 

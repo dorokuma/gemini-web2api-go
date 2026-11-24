@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,6 +58,8 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	target2URL := fmt.Sprintf("https://ctx-target-2.test:%d", port2)
 
 	// rootBridge：恒拒 502 封死根 Profile；统计业务 CONNECT（必须==0）。
+	// onConnectTarget 记录每条进入 rootBridge 的 CONNECT host:port——冒烟
+	// 末尾断言 ctx-target-*.test 业务目标零命中（根 Profile 无偷跑）。
 	rootBridge, err := newBrowserProxyBridge()
 	if err != nil {
 		t.Fatalf("rootBridge: %v", err)
@@ -64,6 +67,13 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	defer rootBridge.Shutdown(context.Background())
 	if err := rootBridge.SetUpstream("", false); err != nil {
 		t.Fatalf("rootBridge lockdown: %v", err)
+	}
+	var rootTargetsMu sync.Mutex
+	rootTargets := map[string]int{}
+	rootBridge.onConnectTarget = func(target string) {
+		rootTargetsMu.Lock()
+		rootTargets[target]++
+		rootTargetsMu.Unlock()
 	}
 
 	// 两个槽位独立桥：都指各自本地 CONNECT 代理，再各转发到靶机。
@@ -156,13 +166,12 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	bcID1, sess1, _ := mkCtx(ctxBridge1, "ctx1")
 	bcID2, sess2, _ := mkCtx(ctxBridge2, "ctx2")
 
-	// Storage.setCookies 精确命中各槽 jar：__Secure-1PSID + OSID(host-only) +
-	// __Host-1PLSID(host-only url 形态) + 普通域项。
-	seed := []map[string]interface{}{
-		{"name": "__Secure-1PSID", "value": "p1", "domain": ".google.com", "path": "/", "secure": true, "httpOnly": true},
-		{"name": "SAPISID", "value": "s1", "domain": ".google.com", "path": "/", "secure": true},
-		{"name": "OSID", "value": "o1", "url": "https://gemini.google.com/", "path": "/", "secure": true, "httpOnly": true},
-		{"name": "__Host-1PLSID", "value": "h1", "url": "https://gemini.google.com/", "path": "/", "secure": true, "httpOnly": true},
+	// Storage.setCookies 用生产 cookieToCDP 播种（与 buildAccountCtx 播种
+	// 同一函数），精确命中各槽 jar：域项（.google.com __Secure-1PSID /
+	// SAPISID）+ host-only 项（OSID / __Host-1PLSID 走 url 形态）。
+	seed := cookieToCDP("__Secure-1PSID=p1; SAPISID=s1; OSID=o1; __Host-1PLSID=h1")
+	if len(seed) == 0 {
+		t.Fatal("cookieToCDP produced empty seed for ctx1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -171,10 +180,7 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("ctx1 setCookies: %v", err)
 	}
-	seed2 := []map[string]interface{}{
-		{"name": "__Secure-1PSID", "value": "p2", "domain": ".google.com", "path": "/", "secure": true, "httpOnly": true},
-		{"name": "SAPISID", "value": "s2", "domain": ".google.com", "path": "/", "secure": true},
-	}
+	seed2 := cookieToCDP("__Secure-1PSID=p2; SAPISID=s2")
 	if err := client.Call(ctx, "", "Storage.setCookies", map[string]interface{}{
 		"browserContextId": bcID2, "cookies": seed2,
 	}, nil); err != nil {
@@ -194,6 +200,17 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	}, &jar2); err != nil {
 		t.Fatalf("ctx2 getCookies: %v", err)
 	}
+	// 断言 Domain 形态：域项回读 .google.com（前导点），host-only 项回读
+	// gemini.google.com（无前导点）——验证 cookieToCDP 的 domain/url 分键
+	// 在真实 Chromium jar 里落对位置。
+	domainOf := func(jar []cdpJarCookie, name string) (string, bool) {
+		for _, c := range jar {
+			if c.Name == name {
+				return c.Domain, true
+			}
+		}
+		return "", false
+	}
 	have := map[string]bool{}
 	for _, c := range jar1.Cookies {
 		have[c.Name] = true
@@ -203,14 +220,32 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 			t.Fatalf("ctx1 jar missing %q (got %v)", want, jar1.Cookies)
 		}
 	}
-	// 跨槽隔离：ctx1 的 OSID/__Host-1PLSID 绝不漏进 ctx2。
+	for _, name := range []string{"__Secure-1PSID", "SAPISID"} {
+		if d, ok := domainOf(jar1.Cookies, name); !ok || d != ".google.com" {
+			t.Fatalf("ctx1 %q domain=%q want .google.com", name, d)
+		}
+	}
+	for _, name := range []string{"OSID", "__Host-1PLSID"} {
+		if d, ok := domainOf(jar1.Cookies, name); !ok || d != "gemini.google.com" {
+			t.Fatalf("ctx1 host-only %q domain=%q want gemini.google.com", name, d)
+		}
+	}
+	// 跨槽隔离：ctx1 的 OSID/__Host-1PLSID 绝不漏进 ctx2；ctx2 自身的
+	// __Secure-1PSID（p2）留存不被覆盖为 p1。
+	ctx2PSID := ""
 	for _, c := range jar2.Cookies {
 		if c.Name == "OSID" || c.Name == "__Host-1PLSID" {
 			t.Fatalf("ctx1 host-only cookie %q leaked into ctx2 jar", c.Name)
 		}
-		if c.Name == "__Secure-1PSID" && c.Value == "p1" {
-			t.Fatal("ctx1 __Secure-1PSID value leaked into ctx2 jar")
+		if c.Name == "__Secure-1PSID" {
+			ctx2PSID = c.Value
+			if c.Value == "p1" {
+				t.Fatal("ctx1 __Secure-1PSID value leaked into ctx2 jar")
+			}
 		}
+	}
+	if ctx2PSID != "p2" {
+		t.Fatalf("ctx2 own __Secure-1PSID=%q want p2 (seed lost)", ctx2PSID)
 	}
 
 	// 并发导航本地回环靶机：流量 100% 走各自槽位桥（gotHost 命中各自端口）。
@@ -236,7 +271,8 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	}, &nav2)
 
 	// 各自槽位桥命中各自本地 CONNECT 代理（流量物理隔离）：proxy_N.gotHost
-	// 收到的 CONNECT 目标必须是各自靶机域名：端口。
+	// 收到的 CONNECT 目标必须是各自靶机域名：端口；收到跨桥错配目标
+	//（proxy1 收 want2 / proxy2 收 want1）立即 Fatal——说明流量串桥。
 	want1 := fmt.Sprintf("ctx-target-1.test:%d", port1)
 	want2 := fmt.Sprintf("ctx-target-2.test:%d", port2)
 	got1, got2 := "", ""
@@ -244,10 +280,16 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	for time.Now().Before(deadline) && (got1 == "" || got2 == "") {
 		select {
 		case h := <-proxy1.gotHost:
+			if h == want2 {
+				t.Fatalf("cross-bridge: proxy1 received ctx2 target %q (leak)", h)
+			}
 			if h == want1 {
 				got1 = h
 			}
 		case h := <-proxy2.gotHost:
+			if h == want1 {
+				t.Fatalf("cross-bridge: proxy2 received ctx1 target %q (leak)", h)
+			}
 			if h == want2 {
 				got2 = h
 			}
@@ -261,6 +303,20 @@ func TestRealChromiumMultiContextSmoke(t *testing.T) {
 	}
 	if got2 == "" {
 		t.Fatalf("ctx2 traffic did not reach its own bridge/proxy for %q (isolation broken)", want2)
+	}
+
+	// rootBridge 业务目标零命中：Chromium 导航期间 ctx-target-*.test 绝不
+	// 经根 Profile 偷跑（onConnectTarget 在 handleConnect 入口计数，含被
+	// 恒拒 502 的项）。
+	rootTargetsMu.Lock()
+	rootBiz1 := rootTargets[want1]
+	rootBiz2 := rootTargets[want2]
+	rootSnapshot := rootTargets
+	rootTargetsMu.Unlock()
+	t.Logf("rootBridge connect targets: %v", rootSnapshot)
+	if rootBiz1 != 0 || rootBiz2 != 0 {
+		t.Fatalf("rootBridge received business targets: %q=%d %q=%d (root profile leak)",
+			want1, rootBiz1, want2, rootBiz2)
 	}
 
 	// rootBridge 恒拒 502：业务 CONNECT 必被拒（根 Profile 物理封死）。

@@ -561,6 +561,11 @@ func autoDisableIfDead(id int64) {
 	if _, err := getDB().Exec(
 		`UPDATE accounts SET status='disabled' WHERE id=? AND status='enabled'`, id); err == nil {
 		logf("[cookie] 账号 #%d 连续 %d 次鉴权失败，已自动停用", id, fails)
+		// SF-1：停用成功后精准失效其常驻 BrowserContext，避免停用槽
+		// 继续被懒建复用。
+		if shouldUseBrowserTransport() {
+			browserMgr.InvalidateAccount(id, false, "disabled")
+		}
 	}
 }
 
@@ -969,9 +974,14 @@ func updateAccountCookie(id int64, cookie string) {
 		return
 	}
 	written := updateAccountCookieCASLocked(id, cur, cookie)
-	unlock()
-	if written && cookie != cur && shouldUseBrowserTransport() {
+	// MF-6：真实写库成功后先在 acctCookieLock（L1）内 BumpAccountEpoch，
+	// 杜绝新刷 Cookie 与并发回写交错时代际漂移；再放锁，最后 Invalidate。
+	bump := written && cookie != cur && shouldUseBrowserTransport()
+	if bump {
 		browserMgr.BumpAccountEpoch(id)
+	}
+	unlock()
+	if bump {
 		browserMgr.InvalidateAccount(id, false, "cookie rotated")
 	}
 }

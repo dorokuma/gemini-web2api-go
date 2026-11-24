@@ -20,6 +20,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -450,5 +451,286 @@ func TestBrowserPerAccountProxyIsolation(t *testing.T) {
 	kAnonB := slotKeyForAccount(nil, "http://proxyB:8080", true)
 	if kAnonA.exitKey == kAnonB.exitKey {
 		t.Fatal("anonymous slot exitKey must differ by proxyURL")
+	}
+}
+
+// ─── v6.6.0 R2B 并发回归（生产路径直接命中）─────────────────────────────────
+
+// TestBrowserAcquireReadySlotStrongBinding 复核 MF-5 / Reviewer #4：既有
+// 就绪登录槽在占租约前用锁外预计算的代理快照做 R3-M1 强绑定复核——
+// 锁定直连账号（ProxyID=-1）命中一个非直连就绪槽时，acquire 不得盲目
+// 复用，必须摘除旧槽。这里用纯内存比对路径验证违规判定（槽位 proxyURL
+// 非空但账号锁直连 → readySlotExitViolation=true）。
+func TestBrowserAcquireReadySlotStrongBinding(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+		c.FallbackDirect = true // 池空：poolBlocksDirect=false，隔离 (a) 规则
+	})
+
+	// 锁定直连账号（ProxyID=-1）。
+	cookie := "SAPISID=ld; __Secure-1PSID=lp; SID=l"
+	id, err := accountInsert("lockdirect", cookie, "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	defer accountDelete(id)
+	acct := accountByID(id)
+	acct.ProxyID = proxyIDDirect // -1
+	acct.AuthUser = 0
+
+	// 预置一个「违规」就绪槽：账号锁直连但槽位走了代理出口（proxyURL 非空
+	// 且 allowDirect=false）——命中 readySlotExitViolation (a)。
+	key := slotKeyForAccount(acct, "http://proxy-x:8080", false)
+	ac := &accountBrowserCtx{
+		key:                key,
+		epoch:              1,
+		browserContextID:   "bc-violate",
+		targetID:           "t-violate",
+		sessionID:          "sess-violate",
+		proxyURL:           "http://proxy-x:8080",
+		allowDirect:        false,
+		origAccountProxyID: proxyIDDirect,
+		readyClosed:        true,
+		lastUsedAt:         time.Now(),
+	}
+	ac.readyCh = make(chan struct{})
+	close(ac.readyCh)
+	m.mu.Lock()
+	m.ctxs[key] = ac
+	m.sessionIndex["sess-violate"] = ac
+	m.targetIndex["t-violate"] = ac
+	m.mu.Unlock()
+
+	// 直接复核违规判定（生产 readySlotExitViolation，acquirePlanLocked 在
+	// 持 m.mu 时调用——这里是纯内存比对，不依赖代理池）。
+	poolSnap := snapshotProxyPool()
+	poolBlocksDirect := len(poolSnap) > 0 && !rtCfg().FallbackDirect
+	if !ac.readySlotExitViolation(acct, poolBlocksDirect, poolSnap) {
+		t.Fatal("readySlotExitViolation must flag lock-direct account on proxied slot")
+	}
+
+	// 反向：账号锁直连且槽位显式直连 → 不违规。
+	acDirect := &accountBrowserCtx{key: key, proxyURL: "", allowDirect: true}
+	if acDirect.readySlotExitViolation(acct, poolBlocksDirect, poolSnap) {
+		t.Fatal("readySlotExitViolation wrongly flagged explicit-direct slot")
+	}
+}
+
+// TestBrowserAcquireCreatorFastFailNoRebuild 复核 MF-4：创建者认领构建后
+// buildAccountCtx 快速失败摘除 nac，创建者直等 nac.readyCh 唤醒拿到
+// lastBuildErr 返回——绝不回循环顶重查 m.ctxs[key] 拿陈旧形参无限重建。
+// 这里直接对 nac 调 detachCtxLocked（模拟构建失败摘除），断言等 readyCh
+// 的创建者唤醒后看到 disposed + lastBuildErr。
+func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+	})
+
+	id, _ := accountInsert("fastfail", "SAPISID=ff; __Secure-1PSID=f2; SID=f3", "")
+	defer accountDelete(id)
+	acct := accountByID(id)
+	acct.ProxyID = proxyIDDirect
+	key := slotKeyForAccount(acct, "", true)
+
+	// 用生产 acquireClaimCreateLocked 认领一个 creating 槽（返回 waitCh=
+	// nac.readyCh）。
+	m.mu.Lock()
+	nac, _, _, _, _, _, waitCh, _, err :=
+		m.acquireClaimCreateLocked(key, acct, "", true, proxyIDDirect, 0)
+	if err != nil {
+		m.mu.Unlock()
+		t.Fatalf("acquireClaimCreateLocked: %v", err)
+	}
+	m.mu.Unlock()
+
+	// 模拟 buildAccountCtx 快速失败：detach 写 lastBuildErr + 摘 nac +
+	// closeReadyLocked 唤醒创建者。
+	buildErr := browserErr("createBrowserContext: injected fail")
+	m.mu.Lock()
+	ok, _ := m.detachCtxLocked(nac, buildErr)
+	m.mu.Unlock()
+	if !ok {
+		t.Fatal("detachCtxLocked did not win on creating slot")
+	}
+
+	// 创建者直等 nac.readyCh：唤醒后必须看到 disposed + lastBuildErr
+	//（绝不重查 m.ctxs[key]——nac 已被 delete，重查只会空槽无限重建）。
+	select {
+	case <-waitCh:
+	case <-time.After(time.Second):
+		t.Fatal("creator waitCh (nac.readyCh) did not fire on build fail")
+	}
+	m.mu.Lock()
+	disposed := nac.disposed
+	gotErr := nac.lastBuildErr
+	_, stillThere := m.ctxs[key]
+	m.mu.Unlock()
+	if !disposed {
+		t.Fatal("nac not disposed after build fail detach")
+	}
+	if gotErr == nil {
+		t.Fatal("nac.lastBuildErr empty; creator would loop instead of returning error")
+	}
+	if stillThere {
+		t.Fatal("nac still in m.ctxs after detach (stale re-create risk)")
+	}
+}
+
+// TestBrowserDrainWaitersMergeOnExitChange 复核 MF-8：同登录槽非严格模式
+// 换出口，inFlight>0 时跨出口等待者登记 drainWaiters；当旧槽被
+// errExitChanged 摘除时，等待者清自身登记后汇入新槽（不返回终态错）。
+// 这里直接驱动 acquirePlanLocked 状态机：先在 inFlight>0 的旧槽上登记
+// 跨出口等待，再以 errExitChanged 摘除旧槽，断言等 drainWait 的等待者
+// 醒来后走「汇入新槽」分支而非终态返回。
+func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+		c.StrictProxyBinding = false // 非严格模式：合法换出口走 drain 替换
+		c.FallbackDirect = true
+	})
+
+	cookie := "SAPISID=dr; __Secure-1PSID=dp; SID=d"
+	id, _ := accountInsert("drain", cookie, "")
+	defer accountDelete(id)
+	acct := accountByID(id)
+	acct.ProxyID = 0 // 未绑定，非锁直连
+
+	// 就绪登录槽：出口 proxyOld、inFlight=1（有在飞租约）。
+	key := slotKeyForAccount(acct, "http://proxy-old:8080", false)
+	ac := &accountBrowserCtx{
+		key:              key,
+		epoch:            1,
+		browserContextID: "bc-drain",
+		targetID:         "t-drain",
+		sessionID:        "sess-drain",
+		proxyURL:         "http://proxy-old:8080",
+		allowDirect:      false,
+		cookieIdentity:   cookieIdentity(cookie),
+		inFlight:         1,
+		readyClosed:      true,
+		lastUsedAt:       time.Now(),
+	}
+	ac.readyCh = make(chan struct{})
+	close(ac.readyCh)
+	m.mu.Lock()
+	m.ctxs[key] = ac
+	m.mu.Unlock()
+
+	// 跨出口等待者（换到 proxyNew）：inFlight>0 → 登记 drainWaiters + 等
+	// drainWait（生产 acquirePlanLocked drain 分支）。
+	var drain acquireDrainReg
+	poolSnap := snapshotProxyPool()
+	m.mu.Lock()
+	waitCh, kind, proceed, detached := m.acquirePlanLocked(ac, acct,
+		"http://proxy-new:8080", false, false, poolSnap, &drain)
+	m.mu.Unlock()
+	if detached != nil || proceed {
+		t.Fatalf("acquirePlanLocked on busy slot: detached=%v proceed=%v, want drain-wait", detached, proceed)
+	}
+	if kind != waitDrain || waitCh == nil {
+		t.Fatalf("acquirePlanLocked kind=%v waitCh=%v, want waitDrain non-nil", kind, waitCh)
+	}
+	if !drain.registered || drain.target != ac {
+		t.Fatal("cross-exit waiter did not register drainWaiters")
+	}
+
+	// 等待协程：等 drainWait（锁外，模拟 acquireWaitResult 的 select）。
+	woke := make(chan struct{})
+	go func() { <-waitCh; close(woke) }()
+
+	// 旧槽被 errExitChanged 摘除（替换 winner）：detach 关 drainWait 唤醒
+	// 等待者，等待者见 disposed+errExitChanged → 汇入新槽（清登记）。
+	m.mu.Lock()
+	won, _ := m.detachCtxLocked(ac, errExitChanged)
+	m.mu.Unlock()
+	if !won {
+		t.Fatal("detachCtxLocked did not win for exit-change replacement")
+	}
+	select {
+	case <-woke:
+	case <-time.After(time.Second):
+		t.Fatal("drain waiter did not wake on exit-change detach")
+	}
+
+	// 等待者醒来后的汇入新槽判定（acquireWaitResult 的 waitDrain 分支）：
+	// ac.disposed && errors.Is(errExitChanged) → 清登记 + continue。
+	m.mu.Lock()
+	isExitChange := ac.disposed && errors.Is(ac.lastBuildErr, errExitChanged)
+	if drain.registered && drain.target == ac {
+		drain.registered = false
+		drain.target = nil
+	}
+	m.mu.Unlock()
+	if !isExitChange {
+		t.Fatal("exit-change detach not flagged errExitChanged (waiter would wrongly return terminal err)")
+	}
+	if drain.registered {
+		t.Fatal("drain registration not cleared after merge-to-new-slot")
+	}
+}
+
+// TestBrowserBumpAccountEpochAdvances 复核 MF-6 / Reviewer #6：
+// BumpAccountEpoch 在 m.mu 下把 nextCtxEpoch 与 maxSeededEpoch[accountID]
+// 取同一自增值——多次轮转后新槽 epoch 严格大于此前 maxSeededEpoch，杜绝
+// 旧代际永久丢弃回写黑洞。直接断言两个计数器联动推进。
+func TestBrowserBumpAccountEpochAdvances(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+	m := browserMgr
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+	})
+
+	id, _ := accountInsert("epoch", "SAPISID=e; __Secure-1PSID=ee; SID=eee", "")
+	defer accountDelete(id)
+
+	// 连续两次 Bump：maxSeededEpoch 必须等于最新的 nextCtxEpoch（不是旧值）。
+	m.BumpAccountEpoch(id)
+	m.mu.Lock()
+	first := m.maxSeededEpoch[id]
+	m.mu.Unlock()
+	m.BumpAccountEpoch(id)
+	m.mu.Lock()
+	second := m.maxSeededEpoch[id]
+	next := m.nextCtxEpoch
+	m.mu.Unlock()
+	if second <= first {
+		t.Fatalf("maxSeededEpoch not advanced: first=%d second=%d", first, second)
+	}
+	if second != next {
+		t.Fatalf("maxSeededEpoch=%d != nextCtxEpoch=%d (epoch drift → write-back blackhole)", second, next)
+	}
+	// 新槽 epoch=second 不被 isSuperseded 拦截（合法回写）；epoch=first 被
+	// 拦截（旧代际）。
+	m.mu.Lock()
+	notSuperseded := m.isSupersededEpochLocked(id, second)
+	superseded := m.isSupersededEpochLocked(id, first)
+	m.mu.Unlock()
+	if notSuperseded {
+		t.Fatalf("fresh slot epoch=%d wrongly superseded", second)
+	}
+	if !superseded {
+		t.Fatalf("stale slot epoch=%d not superseded (would overwrite new token)", first)
 	}
 }
