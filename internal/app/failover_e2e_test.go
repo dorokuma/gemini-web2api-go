@@ -304,11 +304,13 @@ func TestWithFilesTerminalDowngradeMarksCooldown(t *testing.T) {
 		t.Fatalf("终结路径降级号必须 markDowngraded：cooling=%v (want a1+a2+a3)", cooling)
 	}
 
-	// R2-SF-2 / Reviewer R3 #2：全池已冷却后再来一条请求——终结回传的
-	// 降级错误必须回填最早解冻的 Retry-After。HEAD 上三个号都在 model
-	// 冷却，pick 直接返回 ModelDowngradedError{RetryAfter: modelSoonest≈5h}；
-	// e1c2cbe 上 a3 未登记冷却会被再次挑中降级，随后 nee 结算走 prevErr
-	// 短路不回填，RetryAfter 恒 0 必然 FAIL。
+	// R2-SF-2 / Reviewer R3 #2：全池冷却后加一条新鲜号 dg-d 再来一条请求
+	// ——try=0 挑中 dg-d 返回 RetryAfter=0 的 MDE，try=1 因 exclude={dg-d}
+	// 且 a1/a2/a3 均在 modelCooling 返回 noEligibleAccountError{modelRetryAfter
+	// ≈5h}，100% 独立命中 resolveHopPickErr 的 nee + prevErr!=nil →
+	// resolveNoEligibleFallback 回填分支：即便单独回退 R2-SF-2（nee 回填被
+	// prevErr 短路）也必然 FAIL，不耦合 R2-MF-1 的冷却登记修复。
+	_ = addTestAccount(t, "dg-d")
 	_, err2 := streamGenerateWithFilesOpts(context.Background(), "hi",
 		promptCtx{Latest: "hi"}, mc, nil, nil, nil, nil, nil)
 	var mde2 *ModelDowngradedError
