@@ -269,58 +269,16 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	if err := ctx.Err(); err != nil {
 		return &StreamResult{CanRestoreConvHead: true}, err
 	}
-	prefer := conv.proxyID
-	if conv.isLogin && conv.accountID > 0 {
-		// 会话内存快照可能陈旧：管理员改绑或并发请求已写入新绑定后，
-		// acquireSlot 必须按库里的当前值走（严格绑定的承诺按库兑现）。
-		if a := accountByID(conv.accountID); a != nil && a.ProxyID != conv.proxyID {
-			prefer = a.ProxyID
-		}
-	}
-	acctID := int64(0)
-	if conv.isLogin {
-		acctID = conv.accountID
-	}
-	pp, release, slotErr := acquireClaimedSlot(acctID, prefer)
-	if pp == nil {
-		// AccountID 带上会话绑的号：strict_proxy_binding 的 Bound 错误要靠它
-		// 把这个号并进外层 exclude 换号（见 retryOnAnotherAccount）。
-		return &StreamResult{AccountID: conv.accountID, CanRestoreConvHead: true}, slotErr
+	p, release, prefer, proxyURL, err := acquireConvExit(conv)
+	if err != nil {
+		return &StreamResult{AccountID: conv.accountID, CanRestoreConvHead: true,
+			ProxyID: p.ID, ProxyName: p.Name}, err
 	}
 	defer release()
-	p := *pp
-
-	// 绑定持久化：挑到的出口跟记的不一样就写库同步——含首次绑定（旧值 0）、
-	// 绑定出口被删/禁用后的重绑、以及管理员在面板上改绑后被本轮仲裁纠正回
-	// 胜者的场景。匿名会话（accountID==0）不写：它没有账号行可绑。
-	// 严格模式下绝不锁外写库：绑定仲裁已在 acquireClaimedSlot 的 claimMu 里完成，
-	// 这里再写会覆盖管理员并发改绑（R3-S2）；内存快照 conv.proxyID 仍就地同步。
-	// conv.proxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
-	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID && conv.proxyID != proxyIDDirect {
-		if !rtCfg().StrictProxyBinding {
-			autoBindAccountProxy(conv.accountID, p.ID)
-		}
-		conv.proxyID = p.ID
-	}
-	proxyURL := p.URL
 	pickedOK := p.ID > 0
 
-	// 首轮定出口；续接沿用会话原出口（acquireSlot 已优先，但拿不到原出口时只能换，
-	// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
-	// 账号锁定 proxyIDDirect 时不许用 p.ID（0=未绑语义的直连槽值）覆写绑定记忆——
-	// -1 是「永不走代理」的显式承诺，落了 0 下一轮就丢了这个承诺。
-	// p.ID == 0（直连槽）且库中实为锁定直连时同样核库保持 -1，不用 0 误落。
-	if conv.turn == 0 {
-		conv.proxyID = resolveFirstTurnProxyID(conv, prefer, p.ID)
-		conv.proxyURL = proxyURL
-		// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
-		if conv.cookie == "" && !conv.isLogin {
-			c, err := getAnonSession(proxyURL)
-			if err != nil {
-				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name}, fmt.Errorf("建匿名会话失败: %w", err)
-			}
-			conv.cookie = c
-		}
+	if err := convFirstTurnSetup(conv, p, prefer, proxyURL); err != nil {
+		return &StreamResult{ProxyID: p.ID, ProxyName: p.Name}, err
 	}
 
 	// 登录态每轮要带 at（XSRF）；匿名不要。
@@ -554,6 +512,67 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 	return failRes(), lastErr
 }
 
+// acquireConvExit 给本轮会话拿出口 slot：按库中实锤的当前绑定仲裁
+// （内存快照可能陈旧），挑到后同步绑定持久化（非严格模式才写库——严格
+// 模式的落库已在 claimMu 仲裁里完成）。返回 (picked, release, proxyURL, err)。
+func acquireConvExit(conv *convState) (Proxy, func(), int64, string, error) {
+	prefer := conv.proxyID
+	if conv.isLogin && conv.accountID > 0 {
+		// 会话内存快照可能陈旧：管理员改绑或并发请求已写入新绑定后，
+		// acquireSlot 必须按库里的当前值走（严格绑定的承诺按库兑现）。
+		if a := accountByID(conv.accountID); a != nil && a.ProxyID != conv.proxyID {
+			prefer = a.ProxyID
+		}
+	}
+	acctID := int64(0)
+	if conv.isLogin {
+		acctID = conv.accountID
+	}
+	pp, release, slotErr := acquireClaimedSlot(acctID, prefer)
+	if pp == nil {
+		// AccountID 带上会话绑的号：strict_proxy_binding 的 Bound 错误要靠它
+		// 把这个号并进外层 exclude 换号（见 retryOnAnotherAccount）。
+		return Proxy{}, func() {}, 0, "", slotErr
+	}
+	p := *pp
+	// 绑定持久化：挑到的出口跟记的不一样就写库同步——含首次绑定（旧值 0）、
+	// 绑定出口被删/禁用后的重绑、以及管理员在面板上改绑后被本轮仲裁纠正回
+	// 胜者的场景。匿名会话（accountID==0）不写：它没有账号行可绑。
+	// 严格模式下绝不锁外写库：绑定仲裁已在 acquireClaimedSlot 的 claimMu 里完成，
+	// 这里再写会覆盖管理员并发改绑（R3-S2）；内存快照 conv.proxyID 仍就地同步。
+	// conv.proxyID == proxyIDDirect（锁定直连）绝不覆写：直连是它的合法承诺。
+	if conv.isLogin && conv.accountID > 0 && p.ID > 0 && p.ID != conv.proxyID && conv.proxyID != proxyIDDirect {
+		if !rtCfg().StrictProxyBinding {
+			autoBindAccountProxy(conv.accountID, p.ID)
+		}
+		conv.proxyID = p.ID
+	}
+	return p, release, prefer, p.URL, nil
+}
+
+// convFirstTurnSetup 只在首轮（turn==0）定出口并给匿名会话建载体 cookie：
+// 首轮定出口；续接沿用会话原出口（acquireSlot 已优先，但拿不到原出口时只能换，
+// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
+// 账号锁定 proxyIDDirect 时不许用 p.ID（0=未绑语义的直连槽值）覆写绑定记忆——
+// -1 是「永不走代理」的显式承诺，落了 0 下一轮就丢了这个承诺。
+// p.ID == 0（直连槽）且库中实为锁定直连时同样核库保持 -1，不用 0 误落。
+func convFirstTurnSetup(conv *convState, p Proxy, prefer int64, proxyURL string) error {
+	if conv.turn != 0 {
+		return nil
+	}
+	conv.proxyID = resolveFirstTurnProxyID(conv, prefer, p.ID)
+	conv.proxyURL = proxyURL
+	// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
+	if conv.cookie == "" && !conv.isLogin {
+		c, err := getAnonSession(proxyURL)
+		if err != nil {
+			return fmt.Errorf("建匿名会话失败: %w", err)
+		}
+		conv.cookie = c
+	}
+	return nil
+}
+
 // convInnerSlots 拼一路会话一轮的 inner 槽位数组（首轮空接/续接回填三件套）。
 func convInnerSlots(conv *convState, mc ModelConfig, prompt, reqUUID string) []interface{} {
 	inner := make([]interface{}, innerSlots)
@@ -686,17 +705,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	}
 	scope := convScopeKey(mc, tools, toolChoice, opt.requestScope)
 	keys := convPrefixKeys(messages, scope, opt.normalizeToolIDs)
-	conv, prefixLen := convTake(keys)
-	// takenKey 记 convTake 消费的 head 键、savedConv 是它的初始快照：续接在发往
-	// 上游之前就本地失败（Bound 429 / ctx 取消）时按原样归还（convPutIfAbsent）。
-	takenKey := ""
-	if conv != nil && prefixLen > 0 {
-		takenKey = keys[prefixLen-1]
-	}
-	savedConv := convState{}
-	if conv != nil {
-		savedConv = *conv
-	}
+	conv, prefixLen, takenKey, savedConv := convTakeForTurn(keys)
 	fresh := conv == nil
 	if !fresh && conv.isLogin {
 		if convMustColdStart(conv) {
@@ -704,29 +713,7 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 			conv = nil
 		}
 	}
-
-	var prompt string
-	if fresh {
-		// 首轮带上 tools 指令：模型要靠它知道怎么吐 tool_call 围栏，续接轮不再重发
-		//（指令已在服务端首轮历史里）。
-		prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
-		logf("[conv] 新会话，首轮发 %d 字节（tools=%d）", len(prompt), len(tools))
-	} else {
-		// 续接一次性发 messages[prefixLen:] 全部新增消息，跟首轮同一个格式化
-		// 通道（tool 结果带 [Tool result for …] 前缀）；mc.TaskMode 必须透传——
-		// Task 模式的工具锚点不收平台「0 remaining」免疫词。
-		prompt = buildPrompt(messages[prefixLen:], nil, nil, mc.TaskMode)
-		if strings.TrimSpace(prompt) == "" {
-			// 增量拼不出正文（新增消息全空）：发 0 字节 prompt 上游只会报
-			// 一个看不懂的错，回退全量历史冷启动。
-			fresh = true
-			conv = nil
-			prompt, _ = messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
-			logf("[conv] 续接增量为空，回退新会话全量发 %d 字节", len(prompt))
-		} else {
-			logf("[conv] 续接命中 turn=%d，只发 %d 字节（新增 %d 条消息，历史留服务端）", conv.turn, len(prompt), len(messages)-prefixLen)
-		}
-	}
+	prompt, fresh := convTurnPrompt(messages, prefixLen, fresh, conv, mc, tools, toolChoice)
 
 	// strict_model 换号只对新会话做：续接的会话绑死在原来的号上，降级了只记冷却、
 	// 报错作废这路会话，客户端重试时当新会话全量重发，自然挑到别的号。
@@ -740,151 +727,75 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	exclude := map[int64]bool{}
 	var res *StreamResult
 	var err error
+	var prevRes *StreamResult
+	var prevErr error
+	var pendingHop0 *pendingHopFailure // fresh 第 0 跳 C1/C1b 的延迟暂挂（未结算）
 	var lastBoundErr *RateLimitError
 	// 两条预算独立：上游模型降级换号严格保持 maxCookieTries=3（连着 3 个号
 	// 都降级说明池子整体见底）；Bound 受阻换号只在严格绑定下放宽到账号池
 	// 大小（绑定出口不可用不是降级，第 N 个号绑在空闲出口上就该被试到）。
 	// 分开计数互不放大：Bound 次数不能用来延长降级预算，反之亦然。
-	boundBudget := maxCookieTries
-	// 严格绑定或池里存在锁定直连（-1）账号时，Bound 受阻换号放宽到全池账号数：
-	// 直连槽满时第 4+ 个锁定直连号也该被试到（与 streamGenerateOnce 扫全池一致）。
-	if strictOrLockedPool() {
-		if total, _ := accountCount(); total > boundBudget {
-			boundBudget = total
-		}
-	}
-	downgradeTries, boundTries := 0, 0
+	boundBudget := boundHopBudget()
+	boundTries := 0
 	firstAttempt := true
 	// 物理上限防死循环：Bound 换号最多走遍全池 + 降级预算；预算内的独立上限
-	// 在循环尾按本次消耗的类型判定（互不放大）。
+	// 由 fstate.tryAdvanceHop 统一判定（与单轮同一套准入不变量）。
 	hardCap := maxCookieTries + boundBudget
+	// 退出统一兜底：暂挂的 pendingHop0 按「无法双号验证」单次因果提交，
+	// 本跳代理记账照常落库（毒载荷路径 settleHop 已把暂挂作废，幂等安全）。
+	settleExit := func() {
+		settlePendingHop(pendingHop0, fstate, true)
+		commitPendingProxy(res)
+	}
 	for tries := 0; tries < hardCap; tries++ {
 		if fresh {
 			conv = &convState{}
-			// 有 cookie 池就用登录号（能力更全），否则匿名（首轮就地拿 session cookie）。
-			// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
-			// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
-			// last_used_at，调了不用等于白占一轮。
-			if !anonFirstEligible(mc, false, len(prompt)) {
-				a, perr := pickFreshConvAccount(mc, exclude, fstate)
-				if perr != nil {
-					var last *ModelDowngradedError
-					var nee *noEligibleAccountError
-					switch {
-					case !firstAttempt && errors.As(err, &last) && errors.As(perr, &nee):
-						// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
-						last.RetryAfter = nee.retryAfter()
-						break
-					case errors.As(perr, &nee):
-						if lastBoundErr != nil {
-							// 排除集里是 Bound 受阻的号而不是降级号：全池 Bound
-							// 不可用时报真实的 Bound 429，不谎报模型降级。
-							return "", nil, res, lastBoundErr
-						}
-						if nee.shortRetryAfter > 0 {
-							return "", nil, res, &AccountCooldownError{RetryAfter: nee.shortRetryAfter}
-						}
-						return "", nil, res, &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: nee.modelRetryAfter}
-					case lastBoundErr != nil && errors.As(perr, &last):
-						// 排除集里是 Bound 受阻的号而不是降级号：全池 Bound
-						// 不可用时报真实的 Bound 429，不谎报模型降级。
-						return "", nil, res, lastBoundErr
-					default:
-						return "", nil, &StreamResult{}, perr
-					}
-					if !firstAttempt && errors.As(err, &last) {
-						break
-					}
-				}
-				if a != nil {
-					conv.cookie = a.Cookie
-					conv.sapisid = extractSAPISID(a.Cookie)
-					conv.isLogin = true
-					conv.accountID = a.ID
-					conv.authuser = a.AuthUser
-					conv.proxyID = a.ProxyID
-				}
+			var perr error
+			perr, conv = prepareFreshConvHop(mc, prompt, exclude, fstate)
+			if perr != nil {
+				// 挑号失败：优先报上一跳真实错误（降级/Bound），没有才按
+				// 冷却/降级/perr 报——prevErr 不在这里被 perr 覆盖。
+				res, err = resolveConvPickErr(perr, prevRes, prevErr, lastBoundErr, firstAttempt, mc)
+				break
 			}
 		}
 		res, err = runConvWithFailover(ctx, prompt, mc, conv, onDelta, onReasoning, fstate)
 		if !fresh {
-			// 续接在发往上游之前就确定性本地失败（CanRestoreConvHead 为 true）：
-			// 被消费的 head 仍然有效，按原键归还，让客户端重试能接着 turn 续接。
-			if err != nil && res != nil && res.CanRestoreConvHead && takenKey != "" {
-				convPutIfAbsent(takenKey, &savedConv)
-			}
-			// v2.2 §3.4：!fresh 续接返回路径必须显式 commitPendingProxy——
-			// 会话绑原号不换，代理成败照常记（续接不走延迟毒载荷结算，
-			// Pin 会话由 runConvWithFailover/streamGenerateConv 自己管）。
-			commitPendingProxy(res)
-			// 续接降级：把降级登记进该号该模型的冷却（下次冷启动自动跳过它），
-			// 但绝不换号——续接绑死在原号上，换了续接就是另一条会话。
-			var mde *ModelDowngradedError
-			if errors.As(err, &mde) && mde.AccountID > 0 {
-				markDowngraded(mde.AccountID, mc)
-			}
+			settleConvContinuation(res, err, takenKey, &savedConv, fstate, mc)
 			// !fresh 不换号的红线必须守在打换号日志之前：Bound/降级续接只返回错误，
 			// 不能打「换下一个号」又把请求钉在原号上重发。
 			break
 		}
 		firstAttempt = false
-		// v2.2 §3.3(4)：fresh 首跳成功后先在循环内做 C1b 输出校验——
-		// 抽空正文（errEmptyContent）在本跳内判定，让它能触发 1 次跨号
-		// 跳槽或与上一跳 C1 构成毒载荷互认；!fresh 续接抽空在循环外
-		// 照常报 empty_content 作废会话。
-		if err == nil && res != nil && res.Emitted == "" && res.EmittedReasoning == "" {
-			if verr := validateConvTurnOutput(res, tools); verr != nil {
-				err = verr
-			}
-		}
-		// fresh 首跳失败结算：按错误分类记短冷却/降级，再判定能否换号。
-		res, err = settleConvHop(res, err, fstate, mc)
-		if err == nil {
+		var done bool
+		res, err, pendingHop0, done = settleFreshConvHop(res, err, tools, fstate, mc, exclude, &pendingHop0)
+		if done {
 			break
 		}
 		var rle *RateLimitError
 		if errors.As(err, &rle) && rle.Bound {
 			lastBoundErr = rle
 		}
-		var mde *ModelDowngradedError
-		var budgetOut bool
-		switch {
-		case errors.As(err, &rle) && rle.Bound:
-			boundTries++
-			budgetOut = boundTries >= boundBudget
-		case errors.As(err, &mde) && mde.AccountID > 0:
-			downgradeTries++
-			budgetOut = downgradeTries >= maxCookieTries || fstate.faultHops >= 1
-		default:
-			if classIsFault(classifyFailoverError(err)) {
-				budgetOut = fstate.faultHops >= maxCrossAccountHops
-			}
-		}
-		if !retryOnAnotherAccount(res, err, mc, exclude) || budgetOut {
+		// 与单轮同一套准入（advanceOuterHop）：C4b 仅未碰上游时豁免
+		//（受 boundBudget 截断），C3 走降级预算至多 3 号，故障类至多 1 跳。
+		// 多轮无 FallbackAnon 外层兜底（fresh 才走，C4a 由调用方按现有
+		// 语义结算）——anonAllowed=false。
+		adv, _, _ := advanceOuterHop(res, err, fstate, mc, exclude,
+			boundBudget, &boundTries, pendingHop0, false, nil)
+		if !adv {
 			break
 		}
+		prevRes, prevErr = res, err
 	}
+	settleExit()
 	if err != nil {
 		// 旧 head 已在生成前被 convTake 消费：失败请求上游可能已推进，
 		// 不能把旧状态放回去让重试撞同一路会话——客户端重发全历史时会冷启动。
 		return "", nil, res, err
 	}
-	text := extractResponseText(res.Raw)
-	var toolCalls []ToolCall
-	if len(tools) > 0 {
-		text, toolCalls = parseToolCalls(text)
-	}
-	if text == "" && len(toolCalls) == 0 {
-		// 跟 callGemini 同一套：有帧抽不出正文（坏围栏 / 只有思考链）是
-		// empty_content，真没帧才是 no_content_frame。
-		if hasContentFrame(res.Raw) {
-			return "", nil, res, &diagErr{
-				err:    fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
-				reason: reasonEmptyContent, res: res}
-		}
-		return "", nil, res, &diagErr{
-			err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
-			reason: reasonNoContentFrame, res: res}
+	text, toolCalls, verr := validateConvTurnText(res, tools)
+	if verr != nil {
+		return "", nil, res, verr
 	}
 	// 存续接状态：按完整逻辑回复（含 tool_calls）发布新 head——客户端下一轮把
 	// 这段回复原样带回来时，convTake 会命中它的前缀键。只发新 head，旧键已消费，
@@ -898,30 +809,239 @@ func callGeminiConv(ctx context.Context, messages []map[string]interface{}, mc M
 	return text, toolCalls, res, nil
 }
 
+// validateConvTurnText 抽成功轮的最终正文：抽空时按「有帧抽不出
+// （empty_content）/ 无帧（no_content_frame）」归一报错（同 callGemini）。
+func validateConvTurnText(res *StreamResult, tools []map[string]interface{}) (string, []ToolCall, error) {
+	text := extractResponseText(res.Raw)
+	var toolCalls []ToolCall
+	if len(tools) > 0 {
+		text, toolCalls = parseToolCalls(text)
+	}
+	if text != "" || len(toolCalls) > 0 {
+		return text, toolCalls, nil
+	}
+	if hasContentFrame(res.Raw) {
+		return "", nil, &diagErr{
+			err:    fmt.Errorf("%w (raw %d bytes)", errEmptyContent, len(res.Raw)),
+			reason: reasonEmptyContent, res: res}
+	}
+	return "", nil, &diagErr{
+		err:    fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
+		reason: reasonNoContentFrame, res: res}
+}
+
 // runConversationTurn is the upstream seam used by continuation regression tests.
 var runConversationTurn = streamGenerateConv
 
 // runConvWithFailover 包一层上游轮次：把顶层共享 fstate 挂到 conv 上供
-// streamGenerateConv 内部 markTouched，并在返回后统一结算代理记账
-// （callGeminiConv 各出口靠它保证 v2.2 §3.4「全部出口 commitPendingProxy」）。
+// streamGenerateConv 内部 markTouched，并在返回后把实际用了哪个号登记
+// 进 touched。
+//
+// MF-2（后果 D）：成功提交（commitPendingProxy + recordAccountReqSuccess）
+// 绝不在这里做——fresh 首跳须先过 validateConvTurnOutput（C1b 空输出校验）
+// 与整跳延迟结算后才记成功；!fresh 续接由调用方在合适时机显式结算。
 func runConvWithFailover(ctx context.Context, prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string), fstate *reqFailoverState) (*StreamResult, error) {
 	prev := conv.fstate
 	conv.fstate = fstate
 	defer func() { conv.fstate = prev }()
 	res, err := runConversationTurn(ctx, prompt, mc, conv, onDelta, onReasoning)
-	if res != nil && res.AccountID > 0 && fstate != nil {
+	// 只在真正碰过上游时记 touched：C4b 门前 Bound（CanRestoreConvHead=true，
+	// 本地拿 slot 就失败，没发过一个字节）不算「试过一个号」——多轮的 Bound
+	// 换号预算豁免全靠这个判定，记了会把每个 Bound 号误记成已碰上游，
+	// 让 advanceOuterHop 把它改判成故障跳槽消耗 faultHops（至多 1 跳就截断，
+	// 池里第 4+ 个绑空闲出口的号永远试不到）。
+	if res != nil && res.AccountID > 0 && !res.CanRestoreConvHead && fstate != nil {
 		fstate.markTouched(res.AccountID)
 	}
-	// 成功直接提交代理；失败留给调用方按分类结算（毒载荷/短冷却在
-	// settleConvHop 判定，!fresh 续接在调用处显式 commit）。
+	return res, err
+}
+
+// convTakeForTurn 消费一条续接 head：返回 (conv, prefixLen, takenKey, savedConv)。
+// takenKey 记 convTake 消费的 head 键、savedConv 是它的初始快照：续接在发往
+// 上游之前就本地失败（Bound 429 / ctx 取消）时按原样归还（convPutIfAbsent）。
+func convTakeForTurn(keys []string) (*convState, int, string, convState) {
+	conv, prefixLen := convTake(keys)
+	takenKey := ""
+	if conv != nil && prefixLen > 0 {
+		takenKey = keys[prefixLen-1]
+	}
+	savedConv := convState{}
+	if conv != nil {
+		savedConv = *conv
+	}
+	return conv, prefixLen, takenKey, savedConv
+}
+
+// boundHopBudget 是 Bound 受阻换号的预算：严格绑定或池里有锁定直连（-1）
+// 号时放宽到全池账号数（直连槽满时第 4+ 个锁定直连号也该被试到，与
+// streamGenerateOnce 扫全池一致），否则保持 maxCookieTries。
+func boundHopBudget() int {
+	budget := maxCookieTries
+	if strictOrLockedPool() {
+		if total, _ := accountCount(); total > budget {
+			budget = total
+		}
+	}
+	return budget
+}
+
+// prepareFreshConvHop 为 fresh 首轮挑号并初始化 convState：
+// 匿名优先（模型不需要登录态时不占号）时直接返回空 conv；挑到登录号时
+// 回填 cookie/sapisid/accountID/authuser/proxyID。
+// 返回 (pickErr, conv)：pickErr 非 nil 表示挑号失败（nee/冷却/降级），
+// 由调用方按 resolveConvPickErr 收尾。
+func prepareFreshConvHop(mc ModelConfig, prompt string, exclude map[int64]bool,
+	fstate *reqFailoverState) (error, *convState) {
+	conv := &convState{}
+	// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
+	// 恒无，所以第二个参数传 false）。必须在调用前短路：挑号会更新
+	// last_used_at，调了不用等于白占一轮。
+	if anonFirstEligible(mc, false, len(prompt)) {
+		return nil, conv
+	}
+	a, perr := pickFreshConvAccount(mc, exclude, fstate)
+	if perr != nil {
+		return perr, conv
+	}
+	if a != nil {
+		conv.cookie = a.Cookie
+		conv.sapisid = extractSAPISID(a.Cookie)
+		conv.isLogin = true
+		conv.accountID = a.ID
+		conv.authuser = a.AuthUser
+		conv.proxyID = a.ProxyID
+	}
+	return nil, conv
+}
+
+// convTurnPrompt 决定本轮发给上游的 prompt 与是否按新会话发：
+// fresh（或增量拼不出正文的续接回退）发全量历史；续接只发新增段。
+// 返回（prompt, fresh）：fresh 可能在增量为空时被改判回 true。
+func convTurnPrompt(messages []map[string]interface{}, prefixLen int, fresh bool,
+	conv *convState, mc ModelConfig, tools []map[string]interface{},
+	toolChoice interface{}) (string, bool) {
+	if fresh {
+		// 首轮带上 tools 指令：模型要靠它知道怎么吐 tool_call 围栏，续接轮不再重发
+		//（指令已在服务端首轮历史里）。
+		prompt, _ := messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
+		logf("[conv] 新会话，首轮发 %d 字节（tools=%d）", len(prompt), len(tools))
+		return prompt, true
+	}
+	// 续接一次性发 messages[prefixLen:] 全部新增消息，跟首轮同一个格式化
+	// 通道（tool 结果带 [Tool result for …] 前缀）；mc.TaskMode 必须透传——
+	// Task 模式的工具锚点不收平台「0 remaining」免疫词。
+	prompt := buildPrompt(messages[prefixLen:], nil, nil, mc.TaskMode)
+	if strings.TrimSpace(prompt) == "" {
+		// 增量拼不出正文（新增消息全空）：发 0 字节 prompt 上游只会报
+		// 一个看不懂的错，回退全量历史冷启动。
+		p, _ := messagesToPrompt(messages, tools, toolChoice, mc.TaskMode)
+		logf("[conv] 续接增量为空，回退新会话全量发 %d 字节", len(p))
+		return p, true
+	}
+	logf("[conv] 续接命中 turn=%d，只发 %d 字节（新增 %d 条消息，历史留服务端）",
+		conv.turn, len(prompt), len(messages)-prefixLen)
+	return prompt, false
+}
+
+// settleConvContinuation 是 !fresh 续接轮返回后的统一收尾（MF-2）：
+// 确定性本地失败归还被 convTake 消费的 head；代理成败显式 commit；
+// 成功记账号成功；降级记该号该模型冷却（续接绝不换号）。
+func settleConvContinuation(res *StreamResult, err error, takenKey string,
+	savedConv *convState, fstate *reqFailoverState, mc ModelConfig) {
+	// 续接在发往上游之前就确定性本地失败（CanRestoreConvHead 为 true）：
+	// 被消费的 head 仍然有效，按原键归还，让客户端重试能接着 turn 续接。
+	if err != nil && res != nil && res.CanRestoreConvHead && takenKey != "" {
+		convPutIfAbsent(takenKey, savedConv)
+	}
+	// v2.2 §3.4：!fresh 续接返回路径必须显式 commitPendingProxy——
+	// 会话绑原号不换，代理成败照常记（续接不走延迟毒载荷结算）。
+	commitPendingProxy(res)
+	// 续接成功记账号成功（半开探测成功会清零并放探测位）。
+	if err == nil && res != nil && res.AccountID > 0 {
+		recordAccountReqSuccess(res.AccountID, fstate.reqID)
+	}
+	// 续接降级：把降级登记进该号该模型的冷却（下次冷启动自动跳过它），
+	// 但绝不换号——续接绑死在原号上，换了续接就是另一条会话。
+	var mde *ModelDowngradedError
+	if errors.As(err, &mde) && mde.AccountID > 0 {
+		markDowngraded(mde.AccountID, mc)
+	}
+}
+
+// settleFreshConvHop 是 fresh 首轮每跳返回后的统一结算（MF-2 后果 D）：
+//   - err==nil 时先做 C1b 空输出校验（成功提交之前），通过后才
+//     commitPendingProxy + recordAccountReqSuccess；
+//   - 失败走与单轮同构的 settleHop 延迟结算（pendingHop0 + isPoisonPair）。
+//
+// 返回 (res, err, pendingHop0, done)：done=true 表示本跳已定局（成功、
+// 毒载荷实锤或不再跳槽前的最后状态），调用方据此 break。
+func settleFreshConvHop(res *StreamResult, err error, tools []map[string]interface{},
+	fstate *reqFailoverState, mc ModelConfig, exclude map[int64]bool,
+	pendingHop0 **pendingHopFailure) (*StreamResult, error, *pendingHopFailure, bool) {
+	// MF-2（后果 D）：C1b 空输出校验必须在成功提交**之前**——
+	// validateConvTurnOutput 检出的 errEmptyContent 参与 isPoisonPair
+	// 与跨号跳槽，通过校验、整跳落定后才调 commitPendingProxy 与
+	// recordAccountReqSuccess（先记成功再校验会把失败错记成成功）。
+	if err == nil && res != nil && res.Emitted == "" && res.EmittedReasoning == "" {
+		if verr := validateConvTurnOutput(res, tools); verr != nil {
+			err = verr
+		}
+	}
 	if err == nil {
+		// 本跳成功：第 0 跳暂挂非毒按因果提交，代理记账 + 记账号成功。
+		settlePendingHop(*pendingHop0, fstate, true)
 		commitPendingProxy(res)
 		if res != nil && res.AccountID > 0 {
 			recordAccountReqSuccess(res.AccountID, fstate.reqID)
 		}
+		return res, nil, *pendingHop0, true
 	}
-	return res, err
+	// fresh 失败：与单轮同构的延迟结算——C1/C1b 可跳槽时暂挂 pendingHop0
+	//（不写全局），落定后按 isPoisonPair 判毒载荷双端免责或单次提交。
+	var p0 *pendingHopFailure
+	res, err, p0 = settleHop(res, err, *pendingHop0, fstate, mc, exclude)
+	*pendingHop0 = p0
+	if err == nil {
+		return res, nil, p0, true
+	}
+	var ppe *poisonPayloadError
+	if errors.As(err, &ppe) {
+		return res, err, p0, true // 毒载荷实锤：双端零记账，直接定局
+	}
+	return res, err, p0, false
+}
+
+// resolveConvPickErr 决定 fresh 跳槽选号失败（perr）时的最终上报：
+// 上一跳真实错误（降级/Bound）永远优先——「没号可挑」不该覆盖现场。
+// 返回（最终 res, 最终 err）。
+func resolveConvPickErr(perr error, prevRes *StreamResult, prevErr, lastBoundErr error,
+	firstAttempt bool, mc ModelConfig) (*StreamResult, error) {
+	var last *ModelDowngradedError
+	var nee *noEligibleAccountError
+	switch {
+	case !firstAttempt && errors.As(prevErr, &last) && errors.As(perr, &nee):
+		// 换号时已经没号可挑：报上一个号真实的降级，补上解冻时间
+		last.RetryAfter = nee.retryAfter()
+		return prevRes, last
+	case errors.As(perr, &nee):
+		if lastBoundErr != nil {
+			// 排除集里是 Bound 受阻的号而不是降级号：全池 Bound 不可用时
+			// 报真实的 Bound 429，不谎报模型降级。
+			return prevRes, lastBoundErr
+		}
+		if prevErr != nil {
+			return prevRes, prevErr // 上一跳真实失败比「没号可挑」更有信息量
+		}
+		if nee.shortRetryAfter > 0 {
+			return prevRes, &AccountCooldownError{RetryAfter: nee.shortRetryAfter}
+		}
+		return prevRes, &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: nee.modelRetryAfter}
+	case lastBoundErr != nil && errors.As(perr, &last):
+		return prevRes, lastBoundErr
+	default:
+		return &StreamResult{}, perr
+	}
 }
 
 // pickFreshConvAccount 从 callGeminiConv 抽出的首轮挑号：统一走
@@ -954,33 +1074,4 @@ func validateConvTurnOutput(res *StreamResult, tools []map[string]interface{}) e
 	}
 	return &diagErr{err: fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(res.Raw)),
 		reason: reasonNoContentFrame, res: res}
-}
-
-// settleConvHop 是 fresh 首轮失败后的统一结算（conversation 版防雪崩）：
-// 按错误分类记账号短冷却 + 代理记账，并消耗 fstate 跳槽预算。
-// 返回 (res, err)：err 可能被包成 poisonPayloadError。
-func settleConvHop(res *StreamResult, err error, fstate *reqFailoverState, mc ModelConfig) (*StreamResult, error) {
-	if err == nil {
-		return res, nil
-	}
-	cls := classifyFailoverError(err)
-	acctID := int64(0)
-	emitted := false
-	if res != nil {
-		acctID = res.AccountID
-		emitted = res.Emitted != "" || res.EmittedReasoning != ""
-	}
-	// 已吐字或 C5b 本地终止：不跳槽、不记账号，代理记账照常。
-	if emitted || cls == classLocalAbort {
-		commitPendingProxy(res)
-		return res, err
-	}
-	if classAccountsBlame(cls) && acctID > 0 {
-		recordAccountReqFailureAt(acctID, fstate.reqID, cls, firstFailureAt(res))
-	}
-	commitPendingProxy(res)
-	// 消耗统一准入预算：C4b 豁免（未碰上游）；C3 走降级预算；故障类走
-	// faultHops——budgetOut 由调用方按各计数器/预算判定。
-	fstate.tryAdvanceHop(cls, emitted)
-	return res, err
 }

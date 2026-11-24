@@ -313,13 +313,19 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 	var res *StreamResult
 	var err error
 	var boundErr error
-	for tries := len(accountList()); tries > 0; tries-- {
+	// inShortFallback：已进入「全池短冷却原地回退」——回退挑出的活跃短冷却号
+	// 绝不能再过 tryClaimHalfOpenProbe（它对活跃冷却恒 false，过了等于把刚
+	// 回退的号 100% 拒杀，视频回退整体失效）；探测单飞只在半开态有意义。
+	inShortFallback := false
+	// 防死循环硬上限：正常路径每轮最多 triedVideo+1 个新号，回退至多触发 1 次，
+	// 上限放宽到 2*池+1 覆盖「回退后又被 skip 重挑」的全部组合。
+	for tries := 2*len(accountList()) + 1; tries > 0; tries-- {
 		acct, ok := pickCookieAccountExcept(skip)
 		if !ok && usedShortSkip {
 			// 全池账号恰在 45s 短冷却：原地回退把短冷却号放回候选——
-			// 异步长视频任务等得起，让它们再试一次（半开探测位仍受
-			// tryClaimHalfOpenProbe 单飞约束）。
+			// 异步长视频任务等得起，让它们再试一次。
 			usedShortSkip = false
+			inShortFallback = true
 			skip = videoCoolingAccounts()
 			for id := range triedVideo {
 				skip[id] = true
@@ -329,7 +335,7 @@ func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*S
 		if !ok {
 			break
 		}
-		if !tryClaimHalfOpenProbe(acct.ID, videoReqID) {
+		if !inShortFallback && !tryClaimHalfOpenProbe(acct.ID, videoReqID) {
 			skip[acct.ID] = true // 探测位被占：并入 skip 重挑
 			continue
 		}

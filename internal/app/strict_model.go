@@ -98,11 +98,11 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool, fstate *reqFail
 	for id := range exclude {
 		skip[id] = true
 	}
+	var modelCooling map[int64]bool
 	var modelSoonest, shortSoonest time.Duration
 	if rtCfg().StrictModel && mc.Upstream != "" {
-		var cooling map[int64]bool
-		cooling, modelSoonest = coolingAccounts(mc)
-		for id := range cooling {
+		modelCooling, modelSoonest = coolingAccounts(mc)
+		for id := range modelCooling {
 			skip[id] = true
 		}
 	}
@@ -120,19 +120,25 @@ func pickAccountForModel(mc ModelConfig, exclude map[int64]bool, fstate *reqFail
 		a, ok := pickCookieAccountExcept(skip)
 		if !ok {
 			return nil, skip, resolvePoolExhaustedErr(mc, exclude, shortCooling,
-				modelSoonest, shortSoonest)
+				modelCooling, modelSoonest, shortSoonest)
 		}
 		if reqID == 0 || tryClaimHalfOpenProbe(a.ID, reqID) {
 			return a, skip, nil
 		}
+		// 探测位被占：这个号此刻等同冷却——同步记 shortCooling + 保底 1s，
+		// 否则它是唯一剩余号时 resolvePoolExhaustedErr 会误报全池降级。
 		skip[a.ID] = true
+		shortCooling[a.ID] = true
+		if shortSoonest == 0 || shortSoonest > time.Second {
+			shortSoonest = time.Second
+		}
 	}
 }
 
 // resolvePoolExhaustedErr 决定「没挑到号」时报什么错（pickAccountForModel 抽出，
 // 控制圈复杂度）。hasCookie() 判库内有无 enabled 账号。
 func resolvePoolExhaustedErr(mc ModelConfig, exclude map[int64]bool,
-	shortCooling map[int64]bool, modelSoonest, shortSoonest time.Duration) error {
+	shortCooling, modelCooling map[int64]bool, modelSoonest, shortSoonest time.Duration) error {
 	if !hasCookie() {
 		return nil // 合法空池：调用方按匿名处理
 	}
@@ -142,12 +148,10 @@ func resolvePoolExhaustedErr(mc ModelConfig, exclude map[int64]bool,
 	}
 	// 首跳入口全池冷却：只要有一个号的拦路原因是 45s 短冷却（而非模型降级
 	// 或调用方显式 exclude），报 accounts_cooling_down 更诚实——解冻以秒计，
-	// 不是以分钟计。
-	if len(shortCooling) > 0 {
-		for _, a := range accountList() {
-			if a.Status == "enabled" && shortCooling[a.ID] && !exclude[a.ID] {
-				return &AccountCooldownError{RetryAfter: shortSoonest}
-			}
+	// 不是以分钟计。双冷却号（同时被 modelCooling 覆盖）不算：它解冻以分钟计。
+	for _, a := range accountList() {
+		if a.Status == "enabled" && shortCooling[a.ID] && !modelCooling[a.ID] && !exclude[a.ID] {
+			return &AccountCooldownError{RetryAfter: shortSoonest}
 		}
 	}
 	return &ModelDowngradedError{Requested: mc.Upstream, RetryAfter: modelSoonest}

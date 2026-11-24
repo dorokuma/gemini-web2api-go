@@ -90,6 +90,11 @@ func diagHint(reason string, err error) string {
 	if reason == reasonUpstreamTimeout && err != nil && errors.Is(err, errStreamIdle) {
 		return "开流后块间沉默超过 stream_idle_timeout_sec：可开大该值或检查代理出口（上游排队/首帧未到的长沉默才归 request_timeout_sec）"
 	}
+	var ppe *poisonPayloadError
+	if errors.As(err, &ppe) {
+		return "主备两个账号都拒绝了这条载荷（毒载荷判定）：已豁免双端账号冷却与代理扣分，" +
+			"通常是提示词/附件触发上游内容拒绝——请调整请求内容"
+	}
 	switch reason {
 	case reasonNoContentFrame:
 		return "上游没有返回正文内容：可能是该账号无此模型权限、登录已过期，或模型名/协议已变更"
@@ -248,12 +253,19 @@ func writeUpstreamError(w http.ResponseWriter, err error, res *StreamResult) {
 
 // geminiErrorJSON 是 Google 原生形状的 502 错误体：code/message/status 之外挂
 // details 诊断块（Google SDK 会原样透传 details 数组）。
+// *AccountCooldownError（已开流由 geminiStream.fail 走到这里）映射 429 /
+// RESOURCE_EXHAUSTED——跟未开流的 writeGeminiCallError 同一语义。
 func geminiErrorJSON(err error, res *StreamResult) map[string]interface{} {
+	code := 502
+	var ace *AccountCooldownError
+	if errors.As(err, &ace) {
+		code = 429
+	}
 	e := upstreamErrorJSON(err, res)
 	return map[string]interface{}{"error": map[string]interface{}{
-		"code":    502,
+		"code":    code,
 		"message": e["message"],
-		"status":  geminiStatus(502),
+		"status":  geminiStatus(code),
 		"details": []interface{}{map[string]interface{}{
 			"reason":         e["reason"],
 			"upstream_model": e["upstream_model"],

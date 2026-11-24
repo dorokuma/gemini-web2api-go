@@ -455,12 +455,19 @@ func releaseAccountProbeIfUnsettled(accountID int64, reqID uint64) {
 }
 
 // recordAccountReqSuccess 探测/正常成功：清零 failStreak、出冷却、放探测位。
+// st==nil（从未失败过的健康号）也必须建项写 lastSuccessAt——因果时序比对
+// （v2.2 §3.3(2)）全靠它拦「t1 失败暂挂 -> t2 并发成功 -> t3 补交 t1」的
+// 旧失败倒拨覆盖新成功。
 func recordAccountReqSuccess(accountID int64, reqID uint64) {
+	if accountID <= 0 {
+		return
+	}
 	accountHealthMu.Lock()
 	defer accountHealthMu.Unlock()
 	st := accountHealth[accountID]
 	if st == nil {
-		return
+		st = &accountShortHealth{}
+		accountHealth[accountID] = st
 	}
 	st.lastSuccessAt = time.Now()
 	st.failStreak = 0
@@ -497,19 +504,33 @@ func recordAccountReqFailureAt(accountID int64, reqID uint64, cls failoverClass,
 	}
 	if !st.lastSuccessAt.IsZero() && st.lastSuccessAt.After(occurredAt) {
 		st.lastFailReqID = reqID
+		// 早退（不倒拨）也照样释放本请求占着的探测位：探测已结算，
+		// 占位不释放会让半开号一直被当成「有人在探」冷却下去。
+		if st.probeInFlight && st.probeReqID == reqID {
+			st.probeInFlight, st.probeReqID = false, 0
+		}
 		return // 失败后已有更新的成功清零：不倒拨
 	}
 	if st.lastFailAt.IsZero() || occurredAt.Sub(st.lastFailAt) > accountFailureStreakWindow {
 		st.failStreak = 0
 	}
 	st.failStreak++
-	st.lastFailAt = now
+	// 取 max：延迟提交的 occurredAt 是回溯时刻，迟到提交绝不能把 lastFailAt
+	// 往更晚推（NH-3）——会把 accountFailureStreakWindow 的连续窗判窄。
+	if st.lastFailAt.Before(occurredAt) {
+		st.lastFailAt = occurredAt
+	}
 	st.lastFailReqID = reqID
 	renewedCooldown := false
 	if st.failStreak >= accountShortFailLimit {
 		st.cooldownUntil = now.Add(accountShortCooldownDur)
 		st.failStreak = accountShortFailLimit - 1 // 半开探测失败一次即续期
 		renewedCooldown = true
+	}
+	// 补丁 §5：未续期冷却时清零已过期 cooldownUntil——45s 冷却刚到期、streak
+	// 又被 streakWindow/阈值判成不复位的号不能滞留半开单飞限流态。
+	if !renewedCooldown && !st.cooldownUntil.IsZero() && !now.Before(st.cooldownUntil) {
+		st.cooldownUntil = time.Time{}
 	}
 	if st.probeInFlight && (st.probeReqID == reqID || renewedCooldown) {
 		st.probeInFlight, st.probeReqID = false, 0
@@ -539,11 +560,13 @@ func commitPendingProxy(res *StreamResult) {
 		return
 	}
 	res.proxyCommitted = true
+	// 成功优先：attempt0 失败 attempt1 成功的重试最终成功——只能记成功清零，
+	// 不能让首轮失败覆盖（v2.2 §7/MF-2）。
 	switch {
-	case res.PendingProxyFail != "":
-		recordProxyResult(res.ProxyID, false, res.PendingProxyFail)
 	case res.PendingProxyOK:
 		recordProxyResult(res.ProxyID, true, "")
+	case res.PendingProxyFail != "":
+		recordProxyResult(res.ProxyID, false, res.PendingProxyFail)
 	}
 }
 
@@ -559,11 +582,13 @@ func noteProxyResult(res *StreamResult, proxyID int64, success bool, errStr stri
 		return
 	}
 	res.ProxyID = proxyID
-	if !success && res.PendingProxyFail == "" {
-		res.PendingProxyFail = errStr
-	}
 	if success {
+		res.PendingProxyFail = "" // 成功优先：清掉首轮失败暂挂
 		res.PendingProxyOK = true
+		return
+	}
+	if res.PendingProxyFail == "" {
+		res.PendingProxyFail = errStr
 	}
 }
 
