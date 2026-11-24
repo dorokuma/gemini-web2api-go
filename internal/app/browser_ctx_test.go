@@ -20,6 +20,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -523,12 +524,24 @@ func TestBrowserAcquireReadySlotStrongBinding(t *testing.T) {
 	}
 }
 
-// TestBrowserAcquireCreatorFastFailNoRebuild 复核 MF-4：创建者认领构建后
-// buildAccountCtx 快速失败摘除 nac，创建者直等 nac.readyCh 唤醒拿到
-// lastBuildErr 返回——绝不回循环顶重查 m.ctxs[key] 拿陈旧形参无限重建。
-// 驱动真实生产路径 acquireAccountCtx -> go buildAccountCtx：fakeCDPServer
-// 的 Target.createBrowserContext 注入错误，断言 acquire 返回该错误且
-// createBrowserContext 恰好只被调 1 次（旧缺陷回环重查会无限重建）。
+// TestBrowserAcquireCreatorFastFailNoRebuild 复核 MF-4（两段断言）：
+//
+// 段 A——创建者认领 nac 后、进入 nac.readyCh 等待之前，nac 被
+// InvalidateAccount 摘除。修复后创建者直等自己认领的 nac.readyCh，唤醒
+// 见 nac.disposed 直接返回 nac.lastBuildErr（含 "invalidated"），零二次
+// 重建（Target.createBrowserContext 调用 0 次）；d251051 旧实现回循环顶
+// continue 重查 m.ctxs[key]==nil，拿陈旧形参二次认领 nac2 并发起
+// Target.createBrowserContext（注入失败）→ 返回 "injected ... failure"
+// 而非 "invalidated"，确定性红灯。
+//
+// 时序确定性：预置一个超时空闲匿名槽，认领时 evictIdleOrOverflowLocked
+// 把它摘出为 victim——holdReplies 卡住全部 CDP 回复，主测试协程在
+// gotCalls 等到 disposeBrowserContext 时，创建者 100% 阻塞在锁外
+// disposeDetachedCtx(acIdle) 内，尚未执行 continue/<-waitCh。
+//
+// 段 B——holdReplies 放行后常规 acquire：buildAccountCtx 步骤 2
+// createBrowserContext 注入失败，创建者直等 nac.readyCh 拿
+// lastBuildErr 返回，恰好 1 次调用且 m.ctxs 无残留。
 func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
 	srv := newFakeCDPServer(t)
 	defer srv.close()
@@ -540,40 +553,93 @@ func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
 		c.BrowserTransport = true
 	})
 
-	// 注入 Target.createBrowserContext 失败：buildAccountCtx 在步骤 1 即
-	// 快速失败摘除 nac。
-	srv.failMethods.Store("Target.createBrowserContext", true)
-
 	id, _ := accountInsert("fastfail", "SAPISID=ff; __Secure-1PSID=f2; SID=f3", "")
 	defer accountDelete(id)
 	acct := accountByID(id)
 	acct.ProxyID = proxyIDDirect
 	key := slotKeyForAccount(acct, "", true)
 
-	// 真实 acquire（创建者路径）：必须在构建快速失败后返回错误，而不是
-	// 回循环顶重查 m.ctxs[key] 无限重建。
+	// ── 段 A：创建者进 readyCh 等待前 nac 已被 Invalidate 摘除 ──────────
+	// 预置 1 个超时空闲匿名槽：创建者认领时必走 victims 锁外
+	// disposeDetachedCtx(acIdle)——holdReplies 卡住其 disposeBrowserContext
+	// 回复，给主测试协程一个 100% 确定性的「已认领 nac、未进 wait」窗口。
+	idleKey := browserSlotKey{accountID: 0, exitKey: "true|http://idle-victim:8080"}
+	acIdle := &accountBrowserCtx{
+		key:              idleKey,
+		epoch:            1,
+		browserContextID: "bc-idle",
+		readyClosed:      true,
+		allowDirect:      true,
+		lastUsedAt:       time.Now().Add(-31 * time.Minute),
+		readyCh:          make(chan struct{}),
+	}
+	close(acIdle.readyCh)
+	m.mu.Lock()
+	m.ctxs[idleKey] = acIdle
+	m.mu.Unlock()
+
+	// holdReplies 先于 failMethods 判定：创建者的 dispose 与 build 都被
+	// 挂起，fault 注入保留到段 B 生效。
+	srv.holdReplies.Store(true)
+	srv.failMethods.Store("Target.createBrowserContext", true)
+
 	done := make(chan error, 1)
 	go func() {
 		_, _, _, _, aerr := m.acquireAccountCtx(
 			context.Background(), acct, "", true, true)
 		done <- aerr
 	}()
+
+	// 等创建者认领 nac 后阻塞在 disposeDetachedCtx(acIdle) 的
+	// Target.disposeBrowserContext 上（此时它已释放 m.mu、尚未执行
+	// continue 或 <-waitCh）。同窗口内出现 createBrowserContext 即乱序。
+	var disposeCall cdpCall
+	waitDeadline := time.After(5 * time.Second)
+	for {
+		select {
+		case call := <-srv.gotCalls:
+			if call.method == "Target.createBrowserContext" {
+				t.Fatal("createBrowserContext fired before invalidation window (ordering bug)")
+			}
+			if call.method == "Target.disposeBrowserContext" {
+				disposeCall = call
+				goto gotDispose
+			}
+		case aerr := <-done:
+			t.Fatalf("acquireAccountCtx returned %v before invalidation window", aerr)
+		case <-waitDeadline:
+			t.Fatal("no Target.disposeBrowserContext for idle victim within 5s")
+		}
+	}
+gotDispose:
+
+	// 创建者尚卡在锁外 dispose：此刻 Invalidate 摘除刚认领的 nac
+	//（disposed=true、lastBuildErr 含 "invalidated"、readyCh 关闭、
+	// buildCancel 取消）。随后放行被 hold 的 dispose 回复。
+	m.InvalidateAccount(id, false, "invalidated before readyCh wait")
+	srv.holdReplies.Store(false)
+	_ = srv.sendText([]byte(fmt.Sprintf(`{"id":%d,"result":{}}`, disposeCall.id)))
+
+	// 修复后：创建者被 nac.readyCh 唤醒见 nac.disposed，直接返回
+	// lastBuildErr（含 "invalidated"）。d251051：唤醒重查
+	// m.ctxs[key]==nil → 二次认领 → createBrowserContext 注入失败 →
+	// 返回 "injected Target.createBrowserContext failure"（红灯）。
 	select {
 	case aerr := <-done:
 		if aerr == nil {
-			t.Fatal("acquireAccountCtx returned nil error on injected createBrowserContext failure")
+			t.Fatal("acquireAccountCtx returned nil error after nac invalidated")
 		}
-		if !strings.Contains(aerr.Error(), "createBrowserContext") &&
-			!strings.Contains(aerr.Error(), "injected") {
-			t.Fatalf("acquireAccountCtx err=%v, want createBrowserContext failure", aerr)
+		if !strings.Contains(aerr.Error(), "invalidated") {
+			t.Fatalf("acquireAccountCtx err=%v, want 'invalidated' (stale-param re-claim?)", aerr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("acquireAccountCtx did not return after build fast-fail (re-create loop?)")
+		t.Fatal("acquireAccountCtx did not return after nac invalidated")
 	}
 
-	// Target.createBrowserContext 只被调用 1 次：失败即终态返回，绝不重建。
+	// 排空 150ms：段 A 全程 Target.createBrowserContext 必须 0 次——
+	// 创建者绝不用陈旧形参二次重建（d251051 在这里记到 >=1 次）。
 	createCalls := 0
-	drainUntil := time.After(200 * time.Millisecond)
+	drainUntil := time.After(150 * time.Millisecond)
 	for {
 		select {
 		case <-srv.createBCHit:
@@ -583,10 +649,51 @@ func TestBrowserAcquireCreatorFastFailNoRebuild(t *testing.T) {
 				createCalls++
 			}
 		case <-drainUntil:
-			goto drained
+			goto drainedA
 		}
 	}
-drained:
+drainedA:
+	if createCalls != 0 {
+		t.Fatalf("Target.createBrowserContext called %d times in segment A, want 0 (no rebuild)", createCalls)
+	}
+
+	// ── 段 B：常规 buildAccountCtx 步骤 2 快速失败——仅调 1 次且摘除干净 ──
+	// failMethods 仍注入 createBrowserContext 失败，holdReplies 已放行。
+	done2 := make(chan error, 1)
+	go func() {
+		_, _, _, _, aerr2 := m.acquireAccountCtx(
+			context.Background(), acct, "", true, true)
+		done2 <- aerr2
+	}()
+	select {
+	case aerr2 := <-done2:
+		if aerr2 == nil {
+			t.Fatal("acquireAccountCtx returned nil error on injected createBrowserContext failure")
+		}
+		if !strings.Contains(aerr2.Error(), "createBrowserContext") &&
+			!strings.Contains(aerr2.Error(), "injected") {
+			t.Fatalf("acquireAccountCtx err=%v, want createBrowserContext failure", aerr2)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquireAccountCtx did not return after build fast-fail (re-create loop?)")
+	}
+
+	// Target.createBrowserContext 只被调用 1 次：失败即终态返回，绝不重建。
+	createCalls = 0
+	drainUntil = time.After(200 * time.Millisecond)
+	for {
+		select {
+		case <-srv.createBCHit:
+			createCalls++
+		case call := <-srv.gotCalls:
+			if call.method == "Target.createBrowserContext" {
+				createCalls++
+			}
+		case <-drainUntil:
+			goto drainedB
+		}
+	}
+drainedB:
 	if createCalls != 1 {
 		t.Fatalf("Target.createBrowserContext called %d times, want exactly 1 (no rebuild loop)", createCalls)
 	}
@@ -650,14 +757,15 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	// 登记 drainWaiters 并阻塞在 drainWait（确定性：等 drainWaiters==1 才
 	// 继续，不用 sleep 猜时机）。
 	type waitRet struct {
-		ac2 *accountBrowserCtx
-		err error
+		ac2     *accountBrowserCtx
+		release func()
+		err     error
 	}
 	w2 := make(chan waitRet, 1)
 	go func() {
-		_, a2, _, _, e2 := m.acquireAccountCtx(
+		_, a2, _, rel2, e2 := m.acquireAccountCtx(
 			context.Background(), acct, "http://proxy-new:8080", false, true)
-		w2 <- waitRet{ac2: a2, err: e2}
+		w2 <- waitRet{ac2: a2, release: rel2, err: e2}
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -691,9 +799,9 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	// proxyB 槽（buildAccountCtx 经 fakeCDPServer 完整走通）。
 	w1 := make(chan waitRet, 1)
 	go func() {
-		_, a1, _, _, e1 := m.acquireAccountCtx(
+		_, a1, _, rel1, e1 := m.acquireAccountCtx(
 			context.Background(), acct, "http://proxy-new:8080", false, true)
-		w1 <- waitRet{ac2: a1, err: e1}
+		w1 <- waitRet{ac2: a1, release: rel1, err: e1}
 	}()
 
 	var r1 waitRet
@@ -714,8 +822,9 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 
 	// W2 汇入 W1 新建的 proxyB 槽：旧代码在 drainWait 唤醒后见
 	// ac.disposed+errExitChanged 直接返回终态错；修复后清登记重查汇入新槽。
+	var r2 waitRet
 	select {
-	case r2 := <-w2:
+	case r2 = <-w2:
 		if r2.err != nil {
 			t.Fatalf("W2 must merge into W1's new slot, got err=%v (errExitChanged leak?)", r2.err)
 		}
@@ -725,6 +834,16 @@ func TestBrowserDrainWaitersMergeOnExitChange(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("W2 did not return after exit-change detach")
 	}
+
+	// 收尾清理（Oracle R4-NH-4）：归还两条租约的 inFlight，再摘除测试
+	// 新建的槽位——不留驻留 ctx/在飞租约污染同包后续测试。
+	if r1.release != nil {
+		r1.release()
+	}
+	if r2.release != nil {
+		r2.release()
+	}
+	m.InvalidateAccount(id, false, "test cleanup")
 }
 
 // TestBrowserBumpAccountEpochAdvances 复核 MF-6 / Reviewer #6：
