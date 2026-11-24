@@ -33,6 +33,9 @@ type CookieAccount struct {
 	// Priority 是主备优先级（v6.6.0）：数值越大越先被挑中，建议主力号 100、
 	// 备用号 10 / 5，默认 0 与旧行为一致（同级之间仍按失败数与最久未用轮转）。
 	Priority int `json:"priority"`
+	// AutoDisabled（v6.7.0）为 true 表示本行是被连续鉴权失败自动停用的，
+	// 扩展推来新 cookie 可以自动恢复 enabled；管理员手动停用/启用一律为 false。
+	AutoDisabled bool `json:"auto_disabled"`
 }
 
 // 账号优先级的合法范围：面板/API 越界直接 400 零写库。
@@ -177,7 +180,7 @@ func accountInsert(label, cookie, note string) (int64, error) {
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts ORDER BY priority DESC, id`)
 	if err != nil {
 		return nil
@@ -187,7 +190,7 @@ func accountList() []CookieAccount {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled); err != nil {
 			continue
 		}
 		out = append(out, a)
@@ -202,10 +205,10 @@ func accountList() []CookieAccount {
 func accountByID(id int64) *CookieAccount {
 	var a CookieAccount
 	err := getDB().QueryRow(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts WHERE id=?`, id).
 		Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority)
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled)
 	if err != nil {
 		return nil
 	}
@@ -219,11 +222,14 @@ func accountDelete(id int64) error {
 }
 
 // accountSetStatus 改状态（enabled / disabled）。
+// 本入口只被管理员操作（toggle / PATCH）调用：不论启用还是停用，一律清掉
+// auto_disabled——从管理员点下去这一刻起，该行的停用不再算「自动停用」，
+// 扩展再推新 cookie 也不得越过这条手动决定把它启用回来。
 func accountSetStatus(id int64, status string) error {
 	if status != "enabled" && status != "disabled" {
 		return fmt.Errorf("非法状态 %q", status)
 	}
-	_, err := getDB().Exec(`UPDATE accounts SET status=? WHERE id=?`, status, id)
+	_, err := getDB().Exec(`UPDATE accounts SET status=?, auto_disabled=0 WHERE id=?`, status, id)
 	return err
 }
 
@@ -551,7 +557,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	// 出口就按"无偏好"选了；等换号换到好号，出口已经定死 —— 于是好号的出口
 	// 粘性被坏号带偏。实测 1 好 2 坏时出口在两个代理间对半分。
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser, priority, auto_disabled
 		 FROM accounts WHERE status='enabled' ORDER BY priority DESC, fail_count ASC, last_used_at ASC, id ASC`)
 	if err != nil {
 		return nil, false
@@ -560,7 +566,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser, &a.Priority, &a.AutoDisabled); err != nil {
 			continue
 		}
 		if skip[a.ID] {
@@ -604,7 +610,7 @@ func markAccountResult(id int64, ok bool, errStr string) {
 	}
 	if ok {
 		_, _ = getDB().Exec(
-			`UPDATE accounts SET last_ok_at=?, fail_count=0, last_error='' WHERE id=?`,
+			`UPDATE accounts SET last_ok_at=?, fail_count=0, last_error='', auto_disabled=0 WHERE id=?`,
 			time.Now().Unix(), id)
 		return
 	}
@@ -638,7 +644,7 @@ func autoDisableIfDead(id int64) {
 		return
 	}
 	if _, err := getDB().Exec(
-		`UPDATE accounts SET status='disabled' WHERE id=? AND status='enabled'`, id); err == nil {
+		`UPDATE accounts SET status='disabled', auto_disabled=1 WHERE id=? AND status='enabled'`, id); err == nil {
 		logf("[cookie] 账号 #%d 连续 %d 次鉴权失败，已自动停用", id, fails)
 		// SF-1：停用成功后精准失效其常驻 BrowserContext，避免停用槽
 		// 继续被懒建复用。
@@ -1073,6 +1079,37 @@ type accountSyncResult struct {
 	Action string `json:"action"`
 }
 
+// findSyncTargetAccountID 按「同会话 + 同账号序号 → 同标签 + 同账号序号」
+// 在账号池里找 accountSync 要更新的那一行，找不到返回 0。
+// 无锁：并发首推时调用方须先拿 accountSyncCreateMu 再重查（见 accountSync）。
+func findSyncTargetAccountID(authuser int, ident, label string) int64 {
+	accts := accountList()
+	for i := range accts {
+		if accts[i].AuthUser == authuser && cookieIdentity(accts[i].Cookie) == ident {
+			return accts[i].ID
+		}
+	}
+	if label == "" {
+		return 0
+	}
+	for i := range accts {
+		if accts[i].AuthUser == authuser && strings.EqualFold(strings.TrimSpace(accts[i].Label), label) {
+			return accts[i].ID
+		}
+	}
+	return 0
+}
+
+// accountSyncCreateMu 把并发首推的「查重 → 插入」串成原子操作。
+// 不加它时两个并发同步会同时查得 hitID==0 各自 accountInsert：accounts 表
+// 三种方言都没有唯一约束兜底，同 label/authuser/会话的重复 enabled 账号
+// 就进了库，之后匹配只 break 到首行，另一行成了不可维护的额外登录号。
+// 进程内一把锁就够（同 pickMu）：本反代天生单实例，同步端点只有本进程入口。
+//
+// 锁序红线：acquireAcctCookieLock（L1）只在**释放本锁之后**才允许获取，
+// 绝不持本锁去拿 L1，防锁序反转。
+var accountSyncCreateMu sync.Mutex
+
 // accountSync 是浏览器扩展定时推 cookie 用的「有就更新、没有就新建」。
 //
 // 找哪一行，按顺序：
@@ -1102,35 +1139,31 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	label = strings.TrimSpace(label)
 	warnMissingOSID(label, c)
 
-	accts := accountList()
-	var hitID int64
 	ident := cookieIdentity(c)
-	for i := range accts {
-		if accts[i].AuthUser == authuser && cookieIdentity(accts[i].Cookie) == ident {
-			hitID = accts[i].ID
-			break
-		}
-	}
-	if hitID == 0 && label != "" {
-		for i := range accts {
-			if accts[i].AuthUser == authuser && strings.EqualFold(strings.TrimSpace(accts[i].Label), label) {
-				hitID = accts[i].ID
-				break
-			}
-		}
-	}
-
+	hitID := findSyncTargetAccountID(authuser, ident, label)
 	if hitID == 0 {
-		id, err := accountInsert(label, c, "由浏览器扩展同步")
-		if err != nil {
-			return accountSyncResult{}, err
-		}
-		if authuser != 0 {
-			if err := accountSetAuthUser(id, authuser); err != nil {
+		// 首次匹配落空：拿进程级互斥再查一次。并发胜者在锁外先插好，
+		// 败者进锁后重查必命中同一行，转走下方的 L1 更新/unchanged 路径。
+		accountSyncCreateMu.Lock()
+		hitID = findSyncTargetAccountID(authuser, ident, label)
+		if hitID == 0 {
+			id, err := accountInsert(label, c, "由浏览器扩展同步")
+			if err != nil {
+				accountSyncCreateMu.Unlock()
 				return accountSyncResult{}, err
 			}
+			if authuser != 0 {
+				if err := accountSetAuthUser(id, authuser); err != nil {
+					accountSyncCreateMu.Unlock()
+					return accountSyncResult{}, err
+				}
+			}
+			accountSyncCreateMu.Unlock()
+			return accountSyncResult{ID: id, Action: "added"}, nil
 		}
-		return accountSyncResult{ID: id, Action: "added"}, nil
+		// 锁内重查命中并发刚插入的行：立即释放 accountSyncCreateMu，
+		// 绝不持它去拿 acquireAcctCookieLock（锁序反转红线）。
+		accountSyncCreateMu.Unlock()
 	}
 
 	// L1 串行锁内做「重读快照 → 判定 → 写库 → Bump」：与懒建 Context 播种、
@@ -1145,9 +1178,10 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 		unlock()
 		return accountSyncResult{}, fmt.Errorf("账号 #%d 已删除", hitID)
 	}
-	// reenable：被**自动停用**（fail_count 到阈值）的号收到新 cookie 一并恢复——
-	// 它停用的原因就是 cookie 失效；用户手动停用（fail_count 没到阈值）绝不动。
-	reenable := cur.Status == "disabled" && cur.FailCount >= maxCookieAuthFailures
+	// reenable：只对**自动停用**（auto_disabled=1，fail_count 到阈值由
+	// autoDisableIfDead 写入）的号恢复——它停用的原因就是 cookie 失效；
+	// 管理员手动停用（auto_disabled=0，即使 fail_count>=3）绝不动。
+	reenable := cur.Status == "disabled" && cur.AutoDisabled
 	// unchanged 快路径：cookie 完全未变、无失败计数、无需恢复——零写库零 Bump
 	// 零失效，绝不空转误杀健康槽。
 	if cur.Cookie == c && cur.FailCount == 0 && !reenable {
@@ -1158,9 +1192,11 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	if reenable {
 		status = "enabled"
 	}
-	// 保留 proxy_id 与 priority：UPDATE 只写 cookie/fail_count/last_error/status。
+	// 保留 proxy_id 与 priority：UPDATE 只写
+	// cookie/fail_count/last_error/status/auto_disabled（新凭据在手，
+	// 停用来源记一律清零）。
 	if _, err := getDB().Exec(
-		`UPDATE accounts SET cookie=?, fail_count=0, last_error='', status=? WHERE id=?`,
+		`UPDATE accounts SET cookie=?, fail_count=0, last_error='', status=?, auto_disabled=0 WHERE id=?`,
 		c, status, hitID); err != nil {
 		unlock()
 		return accountSyncResult{}, err

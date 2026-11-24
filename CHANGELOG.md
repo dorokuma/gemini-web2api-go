@@ -17,8 +17,9 @@
     放锁后 `invalidateXSRF`（新旧两份）+ 清 45s 短冷却 + 按开关
     `InvalidateAccount("cookie synced")`——`unchanged` 快路径零写库零 Bump
     零失效，绝不误杀健康 BrowserContext，且绝不覆写 `proxy_id`/`priority`；
-    被**自动停用**（`fail_count` 到阈值）的号拿到新 cookie 一并恢复 `enabled`，
-    手动停用的不动。
+    被**自动停用**的号拿到新 cookie 一并恢复 `enabled`，手动停用的不动——
+    `accounts` 新增 `auto_disabled` 列区分停用来源（三方言幂等迁移，老库已有
+    `disabled` 行保守视为手动停用），并发首推由进程级互斥兜底不产生重复账号。
   - 面板「导入 Cookie」改为单框粘贴（JSON 数组 / storageState / 对象 / 裸串 /
     Linux&Windows「复制为 cURL」，含 `curl.exe` + `^"` cmd 转义），支持从文件
     读取与实时识别预览；**保留**我方的账号序号、`priority` 主备优先级与

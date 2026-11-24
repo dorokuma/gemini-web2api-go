@@ -3,6 +3,7 @@ package app
 import (
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -51,8 +52,9 @@ func TestAccountSync(t *testing.T) {
 		t.Fatalf("/u/1 应单独新建：%+v", r1)
 	}
 
-	// 自动停用的号拿到新 cookie 恢复；手动停用的不动
-	_, _ = getDB().Exec(`UPDATE accounts SET status='disabled', fail_count=3, last_error='x' WHERE id=?`, id)
+	// 自动停用（auto_disabled=1 由 autoDisableIfDead 写入）的号拿到新 cookie
+	// 恢复；手动停用的不动
+	_, _ = getDB().Exec(`UPDATE accounts SET status='disabled', fail_count=3, last_error='x', auto_disabled=1 WHERE id=?`, id)
 	if r, _ := accountSync("", 0, v1); r.Action != "added" || r.ID == id {
 		t.Fatalf("%+v", r)
 	}
@@ -167,5 +169,132 @@ func TestHandleAdminCookieSync(t *testing.T) {
 	handleAdminCookieSync(w, httptest.NewRequest("POST", "/admin/api/cookies/sync", strings.NewReader(`{"label":"x"}`)))
 	if w.Code != 400 {
 		t.Fatalf("空 cookie 应 400：%d", w.Code)
+	}
+}
+
+// 并发首推回归：N 个 goroutine 同一时刻对空池推同一账号，进程级互斥
+// （accountSyncCreateMu + 锁内重查）必须保证恰好 1 次 added、其余全部落到
+// 同一行的 unchanged，库内也只有 1 行。
+// 复现的是「无锁查重 → 插入」竞态：没有互斥时两个并发同步同时查得 hitID==0
+// 各自 accountInsert，库里就出了同 label/authuser/会话的重复 enabled 账号。
+func TestAccountSyncConcurrentFirstPush(t *testing.T) {
+	resetSeedState(t)
+	v := "SID=a; SAPISID=e; __Secure-1PSID=f; OSID=o"
+
+	const n = 16
+	results := make(chan accountSyncResult, n)
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r, err := accountSync("me@gmail.com", 0, v)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- r
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("并发同步报错：%v", err)
+	}
+	var added, unchanged, updated int
+	var id int64
+	for r := range results {
+		switch r.Action {
+		case "added":
+			added++
+		case "unchanged":
+			unchanged++
+		case "updated":
+			updated++
+		}
+		if id == 0 {
+			id = r.ID
+		} else if r.ID != id {
+			t.Fatalf("并发同步落到了不同行：%d 与 %d", id, r.ID)
+		}
+	}
+	if added != 1 || unchanged != n-1 || updated != 0 {
+		t.Fatalf("应恰好 1 次 added + %d 次 unchanged，实际 added=%d unchanged=%d updated=%d",
+			n-1, added, unchanged, updated)
+	}
+	accts := accountList()
+	if len(accts) != 1 || accts[0].ID != id {
+		t.Fatalf("库内应只有 1 行账号，实际 %+v", accts)
+	}
+}
+
+// 手动停用与自动停用区分：自动停用 → 管理员启用 → 管理员再停用后，即使
+// fail_count 仍 >=3，扩展推新 cookie 也绝不把它启用回来（v6.7.0 起靠
+// auto_disabled 列区分，不能再拿 fail_count 推断停用来源）；
+// 真自动停用的号收到新 cookie 仍照常恢复 enabled。
+func TestAccountSyncManualDisableNotReenabled(t *testing.T) {
+	resetSeedState(t)
+	v1 := "SID=a; SAPISID=m1; __Secure-1PSID=p1; OSID=o"
+	v2 := "SID=a; SAPISID=m1; __Secure-1PSID=p1; __Secure-1PSIDTS=t2; OSID=o"
+
+	r, err := accountSync("manual@gmail.com", 0, v1)
+	if err != nil || r.Action != "added" {
+		t.Fatalf("前置新建失败：%+v %v", r, err)
+	}
+	id := r.ID
+
+	// 1) 连续鉴权失败到阈值 → autoDisableIfDead 自动停用（auto_disabled=1）
+	for i := 0; i < maxCookieAuthFailures; i++ {
+		markAccountResult(id, false, "auth fail")
+	}
+	if a := accountByID(id); a.Status != "disabled" || !a.AutoDisabled {
+		t.Fatalf("连续 %d 次鉴权失败应自动停用：%+v", maxCookieAuthFailures, a)
+	}
+
+	// 2) 管理员先启用再手动停用：toggle/PATCH 共用 accountSetStatus，一律清
+	//    auto_disabled；fail_count 保持阈值以上不被清零。
+	if err := accountSetStatus(id, "enabled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := accountSetStatus(id, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if a := accountByID(id); a.Status != "disabled" || a.AutoDisabled || a.FailCount < maxCookieAuthFailures {
+		t.Fatalf("手动停用后应保留 fail_count 且 auto_disabled=0：%+v", a)
+	}
+
+	// 3) 扩展推新 cookie：手动停用的号绝不重新启用，cookie 照常写回
+	if r2, err := accountSync("", 0, v2); err != nil || r2.Action != "updated" || r2.ID != id {
+		t.Fatalf("同会话推送应仍写回 cookie：%+v %v", r2, err)
+	}
+	if a := accountByID(id); a.Status != "disabled" || a.AutoDisabled {
+		t.Fatalf("手动停用的号不该被同步重新启用：%+v", a)
+	}
+	if a := accountByID(id); a.Cookie != v2 {
+		t.Fatalf("cookie 应照常更新：%q", a.Cookie)
+	}
+
+	// 4) 对照：真自动停用的号收到新 cookie 仍自动恢复 enabled
+	r3, err := accountSync("auto@gmail.com", 0, "SID=b; SAPISID=a1; __Secure-1PSID=q1; OSID=o")
+	if err != nil || r3.Action != "added" {
+		t.Fatalf("对照号新建失败：%+v %v", r3, err)
+	}
+	for i := 0; i < maxCookieAuthFailures; i++ {
+		markAccountResult(r3.ID, false, "auth fail")
+	}
+	if a := accountByID(r3.ID); a.Status != "disabled" || !a.AutoDisabled {
+		t.Fatalf("对照号应自动停用：%+v", a)
+	}
+	if r4, err := accountSync("", 0, "SID=b; SAPISID=a1; __Secure-1PSID=q1; __Secure-1PSIDTS=t9; OSID=o"); err != nil || r4.Action != "updated" {
+		t.Fatalf("对照号同步应更新：%+v %v", r4, err)
+	}
+	if a := accountByID(r3.ID); a.Status != "enabled" || a.AutoDisabled {
+		t.Fatalf("自动停用的号收到新 cookie 应恢复 enabled：%+v", a)
 	}
 }
