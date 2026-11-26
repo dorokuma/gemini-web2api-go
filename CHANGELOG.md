@@ -5,1418 +5,412 @@
 ## 6.7.0 - 2026-11-24
 
 ### 新增
-
-- **Cookie JSON / cURL 导入与浏览器扩展自动同步**（合入上游 `c46ec6d` + `08407db` 并适配 v6.6.0）：
-  - `normalizeCookie` 新增两种输入形态：Cookie-Editor / EditThisCookie 导出的
-    JSON 数组与 Playwright `storageState`，按 RFC 6265 domain-match 过滤到
-    `gemini.google.com`，同名取 domain 更具体的那条（防止
-    `accounts.google.com` 的 `OSID` 顶掉真 `OSID`）。
-  - 新增 `POST /admin/api/cookies/sync`（`requireAuth`）供扩展定时推送 cookie：
-    按「同会话 + 同账号序号 → 同标签 + 同账号序号 → 新建」三级匹配；
-    更新走 `acquireAcctCookieLock`（L1）持锁快照→写库→`BumpAccountEpoch`、
-    放锁后 `invalidateXSRF`（新旧两份）+ 清 45s 短冷却 + 按开关
-    `InvalidateAccount("cookie synced")`——`unchanged` 快路径零写库零 Bump
-    零失效，绝不误杀健康 BrowserContext，且绝不覆写 `proxy_id`/`priority`；
-    被**自动停用**的号拿到新 cookie 一并恢复 `enabled`，手动停用的不动——
-    `accounts` 新增 `auto_disabled` 列区分停用来源（三方言幂等迁移，老库已有
-    `disabled` 行保守视为手动停用），并发首推由进程级互斥兜底不产生重复账号。
-  - 面板「导入 Cookie」改为单框粘贴（JSON 数组 / storageState / 对象 / 裸串 /
-    Linux&Windows「复制为 cURL」，含 `curl.exe` + `^"` cmd 转义），支持从文件
-    读取与实时识别预览；**保留**我方的账号序号、`priority` 主备优先级与
-    `proxy_id` 绑定出口（含 `-1` 锁定本机直连）控件。
-- **内存环形系统日志与管理面板「系统日志」页**（合入上游 `f2ce809` + `25c456a`）：
-  - 新增 `logger.go`：`LogRingBuffer`（容量 1000）随 `logf` 全量收录；
-    `parseLogMeta` 从行首 `[tag]` 归类子系统，`logTagSource` 把
-    `[agg]`/`[retention]`/`[autodel]`/`[strict_*]`/`[cdp]` 等我方 tag 映射到
-    scheduler/conv/failover/browser 等筛选桶；级别判定只认独立数字状态码
-    （`401/403/5xx`→ERROR、`429`→WARN），不再把「1500 字节」「账号 #401」
-    误判成错误；`tail` 超容量时封顶给满。
-  - 新增 `GET/DELETE /admin/api/logs`（`requireAuth`）：`tail`/`since_id`/
-    `source`/`level`/`q` 过滤，`format=text` 出纯文本。
-  - 面板新增「系统日志」标签页：来源/级别/行数/关键词过滤、2s 自动刷新、
-    复制日志与清空缓冲。
+- **Cookie JSON / cURL 导入与浏览器扩展自动同步**：
+  - 支持导入 Cookie-Editor / EditThisCookie 导出的 JSON 数组、Playwright `storageState` 及「复制为 cURL」命令，按域名精确匹配并过滤至 `gemini.google.com`。
+  - 新增 `POST /admin/api/cookies/sync` 接口供浏览器扩展定时推送 Cookie：仅在内容实际变化时更新并清理短冷却，自动停用的账号同步后自动恢复启用（手动停用账号保持不变），并完整保留账号序号、优先级与绑定出口。
+  - 管理面板「导入 Cookie」改为单框粘贴并支持文件读取与实时识别预览。
+- **内存环形系统日志与管理面板「系统日志」页**：
+  - 服务端保留最近 1000 条系统日志并按子系统与状态码分级归类。
+  - 新增 `GET/DELETE /admin/api/logs` 接口支持按来源、级别、行数与关键词过滤及纯文本导出。
+  - 管理面板新增「系统日志」标签页，支持筛选、2 秒自动刷新、复制日志与清空缓冲。
 
 ### 修复
-
-- **视频任务响应数据竞争**（上游 `015e70c`，我方 v6.5.x 已以等价的
-  `videoJobSnapshot` 锁内快照落地，本次复核确认三处响应点
-  `handleCreateVideo`/`handleExtendVideo`/`handleVideoItem` 均已走快照并
-  `-race` 通过）：`POST /v1/videos`、续写、`GET /v1/videos/{id}` 不再把
-  裸 `*videoJob` 交给 `writeJSON` 与后台 goroutine 竞争。
+- 复核并确认 `/v1/videos` 视频创建、续写与状态查询响应均采用并发快照读写，避免数据竞争。
 
 ## 6.6.0 - 2026-11-24
 
 ### 新增
-
-- **`accounts.priority` 严格主备优先级**：账号表新增 `priority` 列
-  （`-1000..10000`，默认 `0`），挑号排序改为
-  `ORDER BY priority DESC, fail_count ASC, last_used_at ASC, id ASC`——
-  主力号填 `100`、备用号填 `10`/`5` 即形成显式主备梯队，同级之间仍按
-  原有「失败数 + 最久未用」轮转（`priority=0` 与旧行为完全一致）。
-  幂等迁移 `ALTER TABLE accounts ADD COLUMN priority` 带列存在性探针，
-  老库（v6.5.0 升级）在 `ALTER` 之后才创建 `idx_accounts_priority_pick`
-  索引（兼容 SQLite/MySQL/PostgreSQL，修复索引早于列创建被静默吞掉的
-  顺序问题）；`POST/GET/PATCH /admin/api/cookies` 全量支持 `priority`
-  （越界 `400` 零写库，`PATCH` 写库前先取 `before` 快照为精准失效预留
-  钩子）；面板 Cookie 池新增「优先级」列、导入/编辑表单字段与冷却徽标
-  （45s 短冷却剩余秒数）。
-- **防雪崩（Anti-Avalanche）延迟提交状态机**：新增
-  `internal/app/account_cooldown.go`——同一账号在连续 `N>=2` 个独立请求
-  （按 `reqID` 幂等去重）真实失败后进入 `45s` 短冷却，冷却期间挑号跳过；
-  **延迟账号失败提交（Deferred Account Failure Commit）**对毒载荷敏感类
-  （`C1` `no_content_frame`/`errUpstreamFailureReply` 与循环内前移判定的
-  `C1b` `errEmptyContent`）第 0 跳只暂挂栈变量不写全局，第 1 跳落定后按
-  `isPoisonPair`（双端同落 `C1`/`C1b`）判定——毒载荷双端账号零记账、
-  零冷却、代理零扣分，非毒按首次 `occurredAt` 因果时序单次提交；
-  `PinAccountID>0` 的会话对 `C1` 豁免短冷却记账（视频/续写的内容拒单
-  不再误伤聊天主号）。
-- **混合链 `C1 <-> C3` 统一跳槽准入（`reqFailoverState`）**：单请求跨号
-  跳槽统一记账——故障/毒载荷类（`C1`/`C1b`/`C2`/`C4a`/`C5a`）最多跨号
-  跳槽 `1` 次（含故障的请求至多触碰 `2` 个账号），纯 `C3` 模型降级保留
-  `maxCookieTries=3`；一旦发生过任意故障跳槽，后续即使遇到 `C3` 也禁止
-  再跳第 3 号；`Bound` 门前错误仅在该号尚未触碰上游前豁免预算；
-  `singleAccountTry` 模式下禁止内层 `FallbackAnon` 抢跑，`xsrfExitConflict`
-  早退补填账号归属。
-- **半开单飞探测（`probeInFlight`）**：冷却到期的账号一次只放行一条探测
-  请求，其余并发仍视为冷却平滑路由至备号（杜绝瞬时并发雪崩回切打爆
-  未恢复的主号）；探测占位带 `maxHalfOpenProbeHold` 兜底租约与 `10m`
-  静默复位，封死永久黑洞；探测成功清零恢复、失败单次续期冷却，
-  毒载荷/Bound/取消不归罪主号。
-- **`accounts_cooling_down` 429 全链路接线**：新增 `*AccountCooldownError`
-  与 `noEligibleAccountError`——全池处于短冷却时各端点统一返回
-  `429` + `Retry-After` + `code="accounts_cooling_down"`（OpenAI
-  chat/responses、Gemini 原生 `generateContent`/`streamGenerateContent`、
-  已开流 SSE `Fail` 与 `response.failed` 事件同一份诊断）；跳槽选备号
-  无号可挑时绝不静默退回匿名（`noEligibleAccountError`），
-  `conversation.go`/`gemini.go` 统一 `errors.As` 消除裸类型断言。
-- **单 Chromium 多 `BrowserContext` 物理隔离（模块一，常驻浏览器传输层）**：
-  `browser_transport` 开启后，常驻浏览器传输层升级为单 Chromium 进程
-  + 单条根 CDP WebSocket，每个登录账号与每个匿名出口各驻留独立的
-  `BrowserContext`（`disposeOnDetach: true` + 每槽独立代理 bridge）。
-  账号间 Cookie/出口 100% 物理隔离：登录槽播种账号 Cookie、绑定专属
-  代理桥，多账号并发互不串出口、零切号冷却；`rootBridge`（根 Profile）
-  恒拒 `502` 防根 Profile 偷跑本机 IP。槽位键 `{accountID, exitKey}`：
-  登录账号按 `accountID` 分槽、匿名按 `allowDirect|proxyURL` 复合键分槽，
-  同槽复用租约、`inFlight` 租约与 `drainWaiters` 排空状态机管控并发
-  换出口。`accounts.priority` 与防雪崩状态机随模块二一并落地，旧
-  `stickyResidentAccountFor` 单常驻粘性主号方案随之移除。
+- **账号严格主备优先级（`priority`）**：支持为 Cookie 账号设置 `-1000..10000` 优先级（默认 `0`），按优先级降序结合失败次数与最久未用顺序选号；管理接口与面板支持配置优先级并展示 45 秒短冷却剩余秒数。
+- **防雪崩延迟记账与短冷却机制**：同一账号连续 2 个独立请求真实失败后进入 45 秒短冷却并跳过选号；对疑似毒载荷导致的双端同时失败免于扣分冷却，固定绑定账号的会话豁免短冷却记账。
+- **跨账号故障切换限制**：故障类错误每次请求最多跨号切换 1 次，纯模型降级仍保留最多 3 次尝试；备号耗尽时不再静默退回匿名。
+- **半开单飞探测**：短冷却到期后每次仅放行一条探测请求，其余并发继续路由至备用账号，防止恢复瞬间并发打爆主号。
+- **全池冷却统一 `429` 响应**：全账号处于短冷却时，OpenAI 与 Gemini 原生端点及流式错误事件统一返回 `429`、`Retry-After` 与 `accounts_cooling_down` 错误码。
+- **常驻浏览器多上下文物理隔离**：开启常驻浏览器传输后，改为单 Chromium 进程下按账号与出口隔离独立浏览器上下文及代理桥，实现多账号并发零串号、零切号冷却，并禁止根上下文直连泄漏本机 IP。
 
 ### 修复
-
-- **`callOnVideoAccount` 短冷却原地回退**：视频任务挑号先并入 45s 短
-  冷却集合，全跳完仍无号可挑时当场重建 skip 原地回退（短冷却不是视频
-  配额问题，几秒就解冻）——全池恰处短冷却时异步长视频任务不再空转
-  报错；视频任务使用独立 `videoReqID` 占探测位，每轮 `videoCall` 返回
-  后立即释放，`defer releaseReqProbes` 兜底防泄漏。
-- **视频 `errVideoQuotaUsed` 不误清探测位**：`recordAccountReqFailureAt`
-  仅在 `probeReqID` 匹配或冷却续期时清探测占位，迟到释放不再误清他号
-  探测（R3-S1）。
+- 修复视频任务在全池短冷却时直接空转报错的问题，支持跳过冷却后原地回退重试。
+- 修复视频配额耗尽错误误清其他请求探测占位的问题。
 
 ## 6.5.0 - 2026-11-23
 
 ### 新增
-
-- **账号级「锁定本机直连」出口（`proxy_id = -1`）**：账号绑定表新增哨兵
-  `proxyIDDirect = -1`（`-1` = 锁定本机直连槽 `slots[0]`，`0` = 未绑定自动，
-  `>0` = 绑定指定代理），锁定直连的账号永远只走本机直连槽、绝不进代理池、
-  也绝不因 `fallback_direct` / `strict_proxy_binding` 语义被改判——满时报
-  `Bound=true` 的 `RateLimitError` 让外层换号而不换出口。全链路封堵 7 处
-  泄漏/覆写点：`acquireSlot`/`acquireClaimedSlot`/`claimAccountProxy`/
-  `currentBoundEnabledProxy` 对 `-1` 原样透传绝不覆写，库中锁定直连的号
-  即便 prefer 误传代理 ID 也会先改判再取直连槽；XSRF 换号循环双向隔离
-  （锁定直连号绝不借代理槽，代理池非空且 `fallback_direct` 关时其它号
-  绝不借直连槽泄漏本机 IP）；后台保活 `rotateAccount` fail-closed（绑定
-  代理被删/禁用时跳过本轮绝不静默直连，未绑定号在池非空且关 fallback 时
-  挑不到可用代理同样跳过）；`viaSlot`/多轮 `conversation` 写绑守卫不覆写
-  `-1`；浏览器冷启动先开 `about:blank` → 读持久 Jar 匹配启用账号 → 按
-  绑定出口 `SetUpstream`（`-1` 显式 `("", true)`，`>0` 启用代理
-  `(url, false)`）→ 再导航 `/app`，不匹配或绑定失效先在 `about:blank`
-  清空 Jar；`syncBridgeUpstream`/`acquireBridgeExit`/`recreateTab` 改收
-  显式 `allowDirect`（仅 `-1 || 池空 || fallback_direct` 为 true），出口
-  身份含 allowDirect 参与并发分组；`bl.go` 匿名刷新在存在代理池或常驻
-  号已绑特定出口时走纯 Go HTTP；Admin 连通性测试只挑与目标出口兼容的
-  账号（测直连不挑代理号、测代理不挑锁定直连号）；`POST/PATCH
-  /admin/api/cookies` 放行 `proxy_id=-1` 并返回清晰出口名，面板「绑定出口」
-  下拉在代理池为空时也始终显示（含 `0 自动`、`-1 本机直连（锁定）`）；
-  `allSlotUsage` 在有启用账号绑定 `-1` 时保留直连槽指标。
-- **`max_context_file_bytes`（默认 150000）+ `context_overflow_mode`**：
-  附件路径自身的总量墙——history 超过 `max_context_file_bytes` 时默认
-  `error` 模式 fail-closed 返回 `400 context_length_exceeded`（不再传上去
-  让模型静默读不到尾段）；显式 `compact` 模式在结构化 `messages[]` 层裁剪：
-  带 `tool_calls` 的 assistant 与其紧随的全部 `tool` 消息绑成不可拆分
-  原子组，先对中间组单条 `>12KB` 的 tool 输出按 UTF-8 rune 安全边界
-  头尾截断（头 4KB + 尾 4KB + 省略提示），仍超再从最旧中间组整组移除
-  并插入 `[System note: omitted N earlier messages (X UTF-8 bytes) ...]`
-  说明（自身计入预算），必保集合（全部 system、首条 user 任务消息
-  ≤25% 预算、最后一组交互、`pc.Head`/`pc.Tail` 工具协议）仍超则
-  fail-closed 400。管理面板 `RT_GROUPS` 与中英文案同步收录。
-- **同号重试指数退避 + 抖动（`retryBackoffDelay`）**：空内容帧
-  （`reasonNoContentFrame`）与出错话术（`errUpstreamFailureReply`）两类
-  瞬时拒绝按 `retry_delay_sec × 2^attempt` 指数退避、乘 `[0.8,1.2]` 随机
-  抖动、封顶 15s——同号重发太密只会再撞同样的拒绝；其它错误维持固定
-  间隔；`baseSec <= 0` 恒返回 0。
+- **账号级锁定本机直连（`proxy_id = -1`）**：支持将账号永久锁定为仅走本机直连而不进入代理池或受代理回退规则影响；全链路（对话、后台保活、匿名刷新、浏览器传输与连通性测试）严格隔离直连与代理出口，管理面板在无代理时也始终展示直连锁定选项。
+- **长上下文总量限制与压缩模式（`max_context_file_bytes` / `context_overflow_mode`）**：长对话转附件时支持上限控制（默认 `150000` 字节），默认 `error` 模式超限返回 `400 context_length_exceeded`；开启 `compact` 模式后按工具调用组原子截断长输出或淘汰最早中间轮次，同时保留系统提示与核心上下文。
+- **同号重试指数退避与抖动**：空内容帧与固定出错话术的同号重试改为带随机抖动的指数退避（封顶 15 秒），降低高频重撞拒绝的概率。
 
 ### 修复
-
-- **Argon 空帧/出错话术归类**：`streamGenerateOnce` 与 `streamGenerateConv`
-  对 `200 + errArgonIdentityMissing` 统一过 `argonMissingReclassify`——
-  响应含出错话术改判 `errUpstreamFailureReply`（走话术重试不扣代理分），
-  无内容帧且无思考链且非视频受理置 nil 落入空帧分支，有正文帧但无合法
-  Argon/Neon 身份仍保留哨兵拒绝未验证模型；无内容帧分支统一包
-  `diagErr{reason: reasonNoContentFrame}`。
-- **失败路径指标回填**：`streamGenerateOnce`/`streamGenerateConv` 循环内
-  所有失败返回（耗尽、身份拒绝、取消、降级早退）统一回填
-  `TTFBMs`/`TotalMs`/`Diag`/`UpstreamModel`/`Emitted`/`EmittedReasoning`
-  ——降级用 `mde.Reported`，其余 `lastDiag.Model`，不再丢诊断现场。
-- **`/v1/responses` 流式吞 400**：`handleResponses` 在 `WriteHeader(200)`
-  之前做无副作用确定性超长预检（非 MultiTurn：无启用 cookie 且 prompt 超
-  `MaxPromptBytes`，或有登录态时按 `planContextFile` 规划后 `inline` 超
-  `MaxPromptBytes` / `history` 超 `MaxContextFileBytes`——两种模式都做
-  规划校验），命中直接回 `HTTP 400` + `code: context_length_exceeded`；
-  流式 `response.failed` 事件补齐错误分类（`PromptTooLongError` →
-  `invalid_request_error` / `context_length_exceeded`，`RateLimitError` →
-  `rate_limit_exceeded` / `ip_slot_full`）。
-- **严格绑定出口仲裁闭环**：`acquireClaimedSlot` 全环闭合锁定直连语义：
-  库中值先于陈旧 prefer 快照（`resolvePreferProxy`），拿到槽后按库中实锤
-  纠偏手上的出口（`reconcileHeldSlot`），严格模式直连槽仲裁抽成
-  `directSlotGuard`——库里查不到账号（已删）手持直连槽一律 fail-closed
-  报错，绝不直连外发；`xsrfExitConflict` 把 XSRF 换号循环（含轮转自愈
-  前后两次复核）的双向隔离判据抽成纯函数（锁定直连号撞代理槽 / 池非空关
-  fallback 时非锁定号撞直连槽 / 严格绑定下 picked 与仲裁胜者不一致均判
-  冲突）。
-- **自动写绑统一入口**：`autoBindAccountProxy` 统一非管理员自动写绑入口：
-  `claimMu` 内重查 DB，绝不覆写 `-1`、不写非正 proxyID、不打散仍有效的
-  粘性绑定；`checkAccountCookie`/`streamGenerateOnce`/`streamGenerateConv`/
-  `viaSlot` 四处锁外 `bindAccountProxy` 全部改走它。
-- **限流错误文案修正**：`RateLimitError.Error` 先判 `AllProxiesFull` 再判
-  `ProxyID==0`——全池限流（ProxyID 零值）不再误报 "direct IP slot full"；
-  锁定直连 Bound 报 "locked direct exit unavailable"；`classifyError` 收录
-  `locked direct exit unavailable`/`bound proxy` → `rate_limited_local`。
-- **Admin 连通性测试严格出口隔离**：`compatibleProbeAccount` 在池非空且
-  `fallback_direct` 关时测直连只接受锁定直连号（未绑定号借本机 IP 同样是
-  串出口）；`probeGeminiWithAccount` 新增 `allowPoolFallback` 形参，探测
-  路径绝不 `loadCookie()` 退到任意账号；无匹配号走匿名。
-- **浏览器冷启动/重建会话与桥状态一致**：`alignColdStartJar`/
-  `alignResidentAndNavigate` 全部 `Network.*` 走 page session（根连接无
-  Network 域）；Jar 读错、含陌生 Cookie、绑定失效一律先
-  `clearBrowserCookies` 再导航（清失败中止），清 Jar 成功同步复位
-  `m.seed` 与 `seed-state.json`；同 `cookieIdentity` 多 authuser 按
-  `seed.AccountID` 消歧并回写校正 seed；`recreateTab` 先 `failAllStreams`
-  再重建，`targetID`/`sessionID` 在局部会话完成 `Page.enable`、桥注入与
-  驻留对齐导航后才发布（并发请求不再切入半途的 about:blank 会话）；
-  桥出口切换走 `acquireBridgeExit` 租约，导航与就绪等待全程独占出口；
-  新增 `navigateAndWaitApp`：导航前预注册 `Page.loadEventFired`，返回前
-  核验 `location.origin` 确为 `gemini.google.com`（修掉 about:blank 上
-  `readyState=="complete"` 秒回导致的首航 CORS）。
-- **compact 裁剪精度复核**：触发条件改按 `planContextFile` 规划出的真实
-  history 长度判（不再拿 messages 渲染长度误触发）；`compactMessages`
-  改 pinned 原位标记（必保集合不挪位、不重排；首条 user 仅 ≤25% 预算才
-  锚定，超长首问装不下时可整组淘汰而非假 400）；`[System note]` 字节在
-  丢组循环内计入预算；`msgBytes`/`renderedHistoryBytes` 按
-  `formatToolResult`/tool_call 围栏真实渲染计账；多模态 `[]interface{}`
-  tool 结果只截文本 part、非文本 part 原样保留，且按整条消息全部文本
-  part 累计字节预算截断；UTF-8 边界截断改 O(1)（`utf8BoundaryUp`/
-  `utf8BoundaryDown` ≤3 字节微调）；`applyCompactIfNeeded` 的
-  inlineOverhead 按 `stripToolProtocol` 与实际 history 长度差三态计账
-  （Head+Tail 真留在 history 时才计入），`PromptTooLongError.Bytes` 改报
-  渲染总长；`responsesContextOverflowCheck` 无条件做 planContextFile
-  校验；`handleChatCompletions`/`handleResponses`/`prepareGemini` 接线
-  统一：MultiTurn 与 anonFirstEligible 跳过 compact，裁剪成功后重建
-  `messages`/`prompt`/`pc` 并只 `collectImages` 一次（被裁轮次的图不再
-  幽灵上传、远程图不再重复下载）；`prompt` 超 `MaxPromptBytes` 且有登录
-  态时绝不走匿名（超限时须靠登录态传 `message.txt` 附件）。
-- **wrb.fr 帧解析与计时修正**：`wrbPayloadsInLine` 统一单行全部 `wrb.fr`
-  条目遍历（去掉 `len(line)<200` 启发式）：`textsInLine`/`reasoningInLine`/
-  `failureReplyInLine` 共用，元信息帧与内容帧同行的行不再漏判；
-  `streamGenerateOnce` 的 `t0` 记到重试循环起点：循环前早退（如拿不到
-  出口）的失败归属保持 `TotalMs=0`，不再把挑号/XSRF/上传耗时混进循环
-  计时。
+- 优化 Argon/Neon 响应无身份标识时的失败归类，准确区分空内容帧与上游固定出错话术，并在各类失败返回路径完整记录诊断与耗时指标。
+- 修复 `/v1/responses` 在超长上下文下未在开流前拦截并返回 `400 context_length_exceeded` 的问题，补齐流式 `response.failed` 错误分类。
+- 闭合严格代理绑定与锁定直连的并发仲裁及自动写绑逻辑，防止并发请求覆盖手动绑定或越权借用不匹配的出口。
+- 修正全池代理限流报错文案误报为直连槽已满的问题，区分全池满与锁定直连不可用提示。
+- 限制后台连通性测试仅挑选与目标出口兼容的账号，避免混用直连与代理账号。
+- 修复常驻浏览器冷启动、会话重建与代理桥出口切换中的竞态，确保清理残留 Cookie 后再导航目标页面，避免首航报错。
+- 修正 `compact` 裁剪的字节预算计算、多模态工具结果文本截断、UTF-8 边界对齐及多端点接线一致性，并禁止超长请求在有登录态时回落匿名。
+- 修复单行多帧解析遗漏与循环前早退计时归属不准的问题。
 
 ## 6.4.0 - 2026-11-23
 
 ### 新增
-
-- **`/v1/responses` 多轮会话与工具调用续接**（`responses_input.go`、
-  `conversation_history.go`、`conversation.go`）：把 Responses `input` 回放
-  规范化为 Chat 消息形态——`instructions` 归位 system、`function_call` /
-  `function_call_output` 还原成 `tool_calls` / `tool` 消息（两遍扫描按
-  `call_id` 反查函数名，合成 `call_%d` 避开回放中出现过的全部 wire ID
-  防碰撞）；assistant 消息的媒体 part（`input_audio` 等）保留
-  `[]interface{}` 数组形态追加而不是拍平成字符串，保证
-  `rejectUnsupported` / `collectImages` 看得见媒体；`function_call_output`
-  的媒体 output 同样保留数组、纯文本 part 照旧拍平、普通 JSON 数据一律
-  `json.Marshal` 精确序列化不丢数据。会话状态改走 `convTake`/`convPut`
-  快照语义——`convTake` 原子消费最长匹配前缀 head，`convPutIfAbsent`
-  只在发往上游之前的确定性本地失败（Bound 429 / ctx 取消，即
-  `CanRestoreConvHead`）按原样归还；`convScopeKey` 纳入 `TaskMode` +
-  `Upstream` 等更多字段区分会话作用域；全链路 `unmarshalJSONUseNumber`
-  把数字解成 `json.Number` 保真大整数，并拒绝候选数 `n` 的溢出值（如
-  `1e309`）；
-  续接前 `ctx.Err()` 前置拦截已取消请求，续接账号已停用/删除或绑定出口
-  变更时回退冷启动重挑健康账号；非空 `cid` 才入库门控——上游没给 `cid`
-  的会话不落库，避免下一路同前缀请求撞进死会话。
-- **`stream_idle_timeout_sec` 配置与 `stallWatch` 两阶段融合**：开流吐字后
-  块间沉默窗口独立计时（默认 0 关闭，0 < 值且小于 `request_timeout_sec`
-  或总超时为 0 时生效），保持无总超时策略不变——排队阶段沉默照旧报
-  `*StallError` 走切换，首字后块间沉默报新的 `errStreamIdle`：未发正文/思考
-  增量且重试预算允许时自动重试（不受 `retry_on_timeout` 开关限制）；
-  已向客户端发出增量后则在流内报错；`webchannel.go` 同步换
-  `newStallWatchIdle`；`runtime.go`
-  校验上限 600s、`request_timeout_sec` 上限由 600 放宽到 1200；管理面板
-  `RT_GROUPS` 与 `I18N_EN` 词典同步收录新配置项与诊断文案。
-- **`strict_proxy_binding` 严格代理绑定 + 后台手动绑出口**：开启后账号绑定
-  的代理满了或在冷却就换号而不是降级裸连；管理面板账号编辑器新增绑定
-  出口下拉框，`POST/PATCH /admin/api/cookies` 写前对 `proxy_id` 做
-  `proxyExists` 400 校验；4 条出站路径统一走 `acquireClaimedSlot`
-  「拿 slot + 严格绑定首绑仲裁 + 安全所有权转移」，`claimMu` 把
-  「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作，手动改绑与请求
-  侧首绑互斥；XSRF 循环仲裁与非严格模式下的首绑持久化保留；
-  `strict_model` 冷却合并走 `coolingAccounts(mc)`，视频生成
-  `callOnVideoAccount` Bound 429 走换号重试。
-- **OSID Cookie 识别与诊断**：账号 cookie 检测 `OSID`（精确匹配，
-  `__Secure-OSID` 不算）——管理面板账号列表加 `has_osid` 徽标、
-  导入 cookie 时弹「缺 OSID」提醒（只提醒不拦）；账号检测接口
-  `POST /admin/api/cookies/{id}/check` 回执提供缺 OSID 可操作重新导出
-  提示并经 `I18N_EN` 国际化；/app 302
-  跳登录页时按 `MissingOSID` 诊断提示重新导出。
-- **`UpstreamAliases` 与 `ModelConfig.Retired` 淘汰模型框架**：`strict_model`
-  校验放行已确认的上游原位改名/升级别名（修复别名映射）；`Retired` 非空
-  的模型不进模型列表、点名请求直接报 retired 原因，`mcpWebSearch` 同步
-  过滤淘汰模型。
+- **`/v1/responses` 多轮会话与工具调用续接**：完整还原 `instructions`、`function_call` 与 `function_call_output` 历史并保留媒体内容，支持在确定性本地失败前安全恢复会话前缀、按模型与任务模式隔离会话作用域，以及在账号停用或出口变更时自动回退冷启动；大整数参数序列化保持精度不失真。
+- **流式块间沉默超时（`stream_idle_timeout_sec`）**：开流后支持独立配置块间沉默超时（默认关闭，上限 600 秒），首字前沉默继续触发切换，首字后未发增量前沉默支持自动重试；同时将 `request_timeout_sec` 上限放宽至 1200 秒。
+- **严格代理绑定（`strict_proxy_binding`）与手动绑出口**：开启后绑定代理满额或冷却时改为切换其他账号而非降级直连；管理面板账号编辑支持手动指定绑定出口并校验代理有效性。
+- **OSID Cookie 识别与诊断**：检测账号是否包含 `OSID`，在面板账号列表展示状态徽标，导入与检测缺少 `OSID` 或被跳登录页时给出重新导出提示。
+- **模型别名与淘汰模型管理**：支持已确认的上游模型别名映射，以及将已淘汰模型从模型列表隐藏并在请求时返回明确淘汰提示。
 
 ### 变更
-
-- **浏览器请求头单一来源重构**：stdlib 与 fhttp 两种请求统一经
-  `writeBrowserHeaders` 写入——UA / `Sec-CH-UA` 客户端提示
-  （`chromeClientHints`）跟 `chromeMajor()` 从实际 TLS 指纹 profile 名
-  动态读 Chrome 大版本，`Sec-Fetch-Site` 按目标主机经 `fetchSite(host)`
-  计算（同源 `same-origin`、同站 `same-site`、跨站 `cross-site`）；
-  每请求 `snapshotBrowserHeaders()` 一次读 `rtCfg()` 定版，消除分次读
-  把两版配置拼进同一请求的竞态（如 Chrome/133 UA 配 Chrome/120
-  client hints）；`appPageHeaders()` 统一 /app 抓取头；`webchannel.go`
-  直连分支同步接入同一份浏览器头；`firefox_fingerprint` 实验开关保留
-  （Firefox 指纹不发 `Sec-CH-UA` 组）。
-- **SIDCC 保活按服务端退避**：`rotateSIDCC` 命中 RotateCookies 429 时
-  解析响应体 `identity.hfcr` 退避秒数（缺失或越界时回退默认轮转间隔），
-  `noteSIDCCBackoff` 记该号退避窗口，窗口内不再
-  请求 SIDCC 端点，日志带剩余等待时间。
-- **`recordProxyResult` 纳入 `errStreamIdle`**：开流后断流/黑洞的坏代理
-  照常累计失败次数（不因瞬时抖动语义漏记）；`streamContentInLine`
-  只认清洗后的有效内容帧（生图占位链/纯代码产物占位帧不算开流）；
-  诊断 `diagHint` 给 `errStreamIdle` 归 `upstream_timeout` 并出人话提示。
+- **浏览器请求头统一重构**：各传输路径统一按当前指纹版本动态生成配套请求头与 `Sec-Fetch-Site`，并在单次请求内锁定配置快照避免头信息不一致。
+- **SIDCC 保活按服务端退避**：命中 429 时解析服务端返回的退避秒数并暂停该账号轮转。
+- **块间超时纳入代理失败统计**：开流后断流或超时的代理计入失败统计，并对无效占位帧不计入已开流。
 
 ### 修复
-
-- **`stallWatch` 两阶段竞态与 `pause()` 缺陷**：`timerIdle` 阶段标志改为
-  只走互斥锁读写（不再锁外读原子标志），杜绝「排队计时器已到期、回调
-  还没跑，中途 `markStreaming` 把 `*StallError` 错挂成 `errStreamIdle`」
-  的窗口；暂停期进入 idle 阶段只记 `timerIdle=true` 不建计时器，由
-  `resume` 按阶段补回 idle 计时器。
-- **严格绑定并发与预算正确性**：`claimAccountProxy` 首绑仲裁全部收进
-  `claimMu`，消除「核库 → 写库」之间被并发请求/手动改绑插入的竞态；
-  Bound 429 重试预算从 `maxCookieTries` 拆成独立的 `downgradeTries` /
-  `boundTries` 两本账（绑满换号不消耗降级预算）；`mc.PinAccountID > 0`
-  时 Bound 429 不并入 exclude 也不换号（会话钉住的号绝不换）；
-  `acquireClaimedSlot` 严格模式锁外绝不写库覆写绑定；`convTake` 消费的
-  head 只在 `CanRestoreConvHead` fail-closed 许可下归还，发往上游后
-  失败绝不放回让重试撞同一路会话。
-- **`/v1/responses` 回放健壮性**：`function_call` 缺 `arguments` 回退
-  `{}`、非字符串 arguments 重序列化；`call_id` 缺失时从 `id` 兜底并
-  避开已用 ID；assistant 媒体 content 不被字符串覆写丢 part；
-  `unmarshalJSONUseNumber` 防大整数经 `float64` 舍入击穿工具参数指纹。
-
-### 文档
-
-- **双语 README 重构**（`docs/readme-redesign`）：README.md / README_EN.md
-  全面重写（各精简约一半篇幅），新增 `assets/logo-dark.svg` /
-  `logo-light.svg` 主题自适应 logo。
-
-> **启用门控状态**：`internal/app/gemini.go` 中 `useWC := false` 保持锁定不变。
+- 修复沉默计时器两阶段切换及暂停恢复时的竞态问题。
+- 修复严格代理绑定并发写绑竞态，并将绑定出口重试与模型降级重试预算分离计数，避免互相消耗。
+- 修复 `/v1/responses` 回放中缺省参数、`call_id` 缺失、媒体消息被覆盖及大整数精度丢失问题。
 
 ## 6.3.1 - 2026-11-21
 
 ### 新增
-
-- **WebChannel（`useWC`）启用前置 6 项全部实现并补单测**：
-  - `doWebChannelRequest` 透传调用方 `ctx` 取消至 API key 抓取与握手/上下行请求
-    （`fetchAppPageCtx` / `webChannelAPIKeyCtx`；`wcPromptGap` 等待改走 `sleepCtx`），
-    不再忽略客户端取消。
-  - WebChannel 下行接入 `stallWatch` 沉默超时掐断与工具调用 `stopWhen` 提前停止：
-    下行 GET 改走不限整次时长的 `wcSendStream`，挂接 `stopReader{heardReader, stop}`；
-    `stallWatch` 补齐并发安全互斥与 `pause`/`resume`（客户端主动 `wcPromptGap` 节流
-    等待不再被误判为上游沉默）。
-  - `wcParseStatus` 兜底改为脱敏结构化诊断
-    `unrecognized status frame (%d bytes, kind=%s)`，不再把未识别 200 帧前缀拼进
-    `requests.error` / `last_error` / 502 响应体。
-  - 握手 400 脱敏诊断新增 `xsrf=true` 结构化标记并纳入 `isXSRFError`，WebChannel
-    路径命中 XSRF 过期可触发自愈刷新。
-  - WebChannel 下行队列排空线程安全累计：各提前返回路径均完整带回已收帧中的
-    会话 ID，保证 `phantomCleanup` 可靠删幽灵会话。
+- 完善 WebChannel 传输路径的前置能力（默认仍保持关闭）：支持请求上下文取消透传、下行流式沉默超时与工具调用提前终止、未识别状态帧脱敏诊断、XSRF 过期标记与自愈刷新，以及提前退出时的幽灵会话清理。
 
 ### 修复
-
-- **`mergeSetCookieForHost` 按目标主机过滤 `Set-Cookie` 写回**：`StreamGenerate` 与
-  多轮续接路径的响应 `Set-Cookie` 先按 RFC 6265 来源主机与目标主机
-  （`gemini.google.com`）过滤再合并进账号池——host-only cookie 仅同主机保留、
-  `Domain` 需双向 domain-match 且拒绝单段顶级域、`__Host-` 前缀禁带 `Domain` 且
-  仅限同源根路径、跨主机拒绝 `Partitioned` 并要求显式 `Path=/`；防止 WebChannel
-  端点（`geminiweb-pa.clients6.google.com`）下发的 clients6 作用域 cookie 混入
-  主账号池。
-- **`stallWatch` 并发安全**：`heard`/`done` 及新增 `pause`/`resume` 全部走互斥锁
-  保护 `timer`/`stopped`/`paused` 状态，消除下行读取 goroutine 与收尾路径的
-  计时器竞争。
-- **XSRF 自愈覆盖 WebChannel 路径**：`healXSRFRefresh` 在命中 400 + `isXSRFError`
-  时统一作废 XSRF 缓存并重取 token，`useWC` 路径同时作废缓存的 processSession
-  API key 并刷新 `wcReq.Cookie`/`wcReq.SAPISID`。
-- `conversation`/`xsrf` 辅助函数同步加固：`fetchAppPage` 新增 `fetchAppPageCtx`
-  透传 `ctx`；`isXSRFError` 兼容 WebChannel 握手 400 的 `xsrf=true` 标记。
-
-> **启用门控状态**：`internal/app/gemini.go` 中 `useWC := false` 保持锁定不变，
-> WebChannel 6 项启用前置虽已完备，正式接通 `rtCfg().WebChannel` 仍需单独验收
-> （见 `.agents/notes/webchannel-enable-prerequisites.md`）。
+- 按 RFC 6265 来源与目标主机严格过滤响应 `Set-Cookie`，防止 `clients6` 域名下的 Cookie 混入主账号池。
+- 修复流式沉默计时器在并发读取与暂停恢复时的竞争条件，并打通 WebChannel 路径的 XSRF 自愈流程。
 
 ## 6.3.0 - 2026-11-21
 
 ### 新增
-
-- **常驻真实浏览器传输层**（`browser_transport`，默认关）：对话请求改走常驻 Chromium
-  （CDP + 页内流式 `fetch`），TLS/JS 指纹与真实浏览器一致，Cookie 由浏览器 jar 接管
-  自动续期（上游刷的 `SIDCC` 直接进 jar，不再靠 `/RotateCookies` 双端抢刷）。
-  单常驻粘性主号（策略 M1）：同一份登录态下 `authuser=0..9` 共用一个 `/app` Tab，
-  驻留号失效/被停用/该模型 `strict_model` 冷却时才在 30s 最小冷却下切号。
-  默认不主动拉起 Chromium（常驻约 1.45 GB 内存），需要浏览器指纹时才开。
-- **`browser_fallback_http`**（默认关）：`browser_transport` 开着但本机找不到或
-  拉不起浏览器时，绝不静默降级回纯 Go HTTP——请求直接回 HTTP 502 + 原因码
-  `browser_unavailable` 及可操作中文提示（安装 Chromium 或配置 `browser_path`）。
-  显式开 `true` 才回退原有纯 Go HTTP 路径。
-- **`browser_path` / `browser_profile_dir`**（部署级只读配置，config.json /
-  `--browser-path` / `--browser-profile-dir` / `BROWSER_PATH` / `BROWSER_PROFILE_DIR`）：
-  显式指定 Chromium 可执行路径与 profile 目录。安全红线——**绝不进 `RuntimeConfig`**，
-  `/admin` 默认免鉴权，面板可写浏览器可执行路径等于本地任意命令执行。
-- 管理面板：`/admin/api/config` 的 `deploy` 块只读展示 `browser_path` /
-  `browser_profile_dir` / `browser_detected` / `browser_running`；运行时设置组
-  `RT_GROUPS` 同步加入 `browser_transport` 与 `browser_fallback_http` 开关
-  （防止面板保存清零），并补回 `web_channel` 占位项（#27 同类清零坑）。
-- 优雅退出：收到 SIGINT/SIGTERM 先 ≤2.5s 精确终止常驻浏览器进程组（`-pgid`）
-  再 `server.Shutdown`，不留孤儿 Chromium 进程。
-- 离线假 CDP 单元测试（`internal/app/browser_test.go`）：纯回环 RFC 6455 服务端，
-  CI 无需真实 Chromium——握手/分片重组/Ping-Pong/断开唤醒 pending、真流式 TTFB、
-  argon/strict_model 身份校验、ctx 取消与 stopWhen Abort、stallWatch 心跳与超时、
-  `browser_unavailable` 502 与 `browser_fallback_http` 回退、崩溃重连退避，以及
-  `RuntimeConfig` 全字段必须出现在 `RT_GROUPS` 的反射测试。
+- **常驻真实浏览器传输层（`browser_transport`，默认关闭）**：开启后对话请求经常驻 Chromium 与页内流式请求发送，保持真实浏览器 TLS/JS 指纹并由浏览器自动续期 Cookie，支持同登录态下多账号序号共用标签页并在异常时按冷却切换。
+- **浏览器不可用保护（`browser_fallback_http`，默认关闭）**：启用浏览器传输但无法启动浏览器时默认直接返回 HTTP 502（`browser_unavailable`）及排查提示，绝不静默退回纯 HTTP；仅在显式开启后才回退。
+- **部署级只读浏览器配置（`browser_path` / `browser_profile_dir`）**：支持通过配置文件、命令行参数或环境变量指定 Chromium 路径与数据目录；出于安全考虑不在免鉴权管理面板暴露修改入口，仅在配置接口只读展示状态。
+- **优雅退出**：收到终止信号后先清理常驻浏览器进程组再关闭 HTTP 服务，避免残留孤儿进程。
 
 ### 修复
-
-- **`browserManager.scheduleReconnect` 双重 `mu.Unlock`**：函数既有 `defer m.mu.Unlock()`
-  又在 return 前手动 `Unlock`，任何崩溃重连都会 `sync: unlock of unlocked mutex` fatal。
-- **本地代理桥（`browserProxyBridge`）SSRF 守卫**：CONNECT 目标严格校验——拒绝
-  指向本桥自身监听端口的自环连接（防 FD 耗尽）、`localhost` / `*.localhost`
-  （含 `localhost.` 等尾点 FQDN）、回环与未指定地址（`127.0.0.0/8` / `::1` /
-  `0.0.0.0` / `[::]`，含 `::ffff:127.0.0.1` 等 IPv4-mapped 形式经 `To4`
-  等价比较），以及含 `%` 的 IPv6 zone id（`[::1%lo]` 会让 `net.ParseIP`
-  返回 nil 逃逸回环判定、拨号却指向本机接口）；非 CONNECT 方法一律 405
-  （回环端口对 GET 回隧道成功等于开了零鉴权正向代理）。代理池非空且
-  `fallback_direct` 关闭时，即便本次请求分配到的出口为空串，桥也绝不
-  直连漏本机真实 IP（CONNECT 回 502）；`SetUpstream` 换出口或收紧直连
-  许可时递增出口代际并关闭全部旧代际隧道（Chromium 隧道复用很粘，
-  不关它新请求会继续走旧出口）。
-- **跨出口切换协调（`acquireBridgeExit` / `releaseBridgeExit`）**：共享代理桥
-  同一时刻只有一个「在飞出口」——同出口请求计数 +1 自由并发，跨出口请求
-  等旧在飞归零才 `SetUpstream` 切换，消除「请求 A 刚切到代理 B 还没派发
-  fetch，并发请求 B 就切到代理 C 并切断 A 的在飞隧道」的竞态。等待登记用
-  计数器不用布尔：只有真正的跨出口等待者占 `bridgeSwitchWaiters` 名额，
-  等待方被 `ctx` 取消只撤自己的登记，最后一名登记等待者离开时广播唤醒
-  被暂缓的同出口请求恢复自由并发——单人取消不会把健康同出口请求永久
-  挡死，无死锁、无计数泄漏（唤醒重查时在飞出口已变成目标出口的退化
-  路径同样先撤销登记再走自由并发）。
-- **CDP WebSocket 写帧终态断连（`sendTextCtx` / `sendPong`）**：写权经容量 1
-  信号量获取并全程绑调用方 `ctx`——持写权写入期间 `ctx` 取消，或写帧
-  超时/失败（5s 写超时、TCP 半断开），都可能已写出半帧/残帧，此时立刻
-  `Close()` 终态断连、绝不把残帧连接还给下一条消息复用（RFC 6455 下半帧
-  连接不可复用）。写 deadline 取 `min(5s, ctx 剩余)`，停机时排在阻塞写
-  后面的 Call 不再干等 5s 写锁拖穿停机预算。
-- **驻留 jar 并发混配与凭据泄漏**：请求路径的「驻留身份校验 + `Runtime.evaluate`
-  派发 fetch」统一持 `jarRW` 读锁，与 `maybeSwitchAccount` 的写锁
-  （写回旧号 Cookie → `clearBrowserCookies` → `seedAccount` 播种新号）互斥——
-  核完身份后切号写锁必须等到 fetch 已派发进当前 jar 才放行，彻底消除
-  「请求 A 带着刚切完的 B 号 Cookie 发出」的串号混配。最终身份守卫无条件
-  执行：点名账号的请求其 Cookie 身份必须与驻留 jar 一致才允许发（同
-  `cookieIdentity` 的不同 `authuser` 合法共用），且错误日志只输出账号
-  ID 整数，绝不带 `cookieIdentity` 明文凭据进日志与 API 响应。
+- 修复浏览器崩溃重连调度时的互斥锁重复解锁 panic。
+- 为本地浏览器代理桥增加 SSRF 防护：拒绝回环地址、未指定地址、IPv6 zone id 与非 CONNECT 请求，在启用代理池且禁止直连回退时禁止泄漏本机 IP，切换代理出口时关闭旧连接隧道。
+- 修复多请求并发切换浏览器代理出口时的竞争与取消阻塞问题，确保跨出口切换等待在途请求完成后再执行。
+- 修复 CDP WebSocket 写入超时或取消产生半帧后连接仍被复用的问题，遇到不完整写入立即断开连接。
+- 修复常驻浏览器 Cookie 存储与账号切换并发时的串号混配问题，并禁止在日志和错误响应中输出明文凭据。
 
 ## 6.2.2 - 2026-11-19
 
-### 修复
-
-- **Task 模式不再注入对话模式专属平台免疫词**：`buildPromptParts` / `messagesToPrompt` /
-  `buildPrompt` 新增 `taskMode` 参数（一律由该请求的 `ModelConfig.TaskMode` 传入，覆盖
-  `/v1/chat/completions`、`/v1/responses`、多轮续接 `callGeminiConv` 与
-  `/v1beta/models/*:generateContent|streamGenerateContent|countTokens` 全部路径）。末尾
-  工具锚点中的「疫苗式点破」段（`Heads-up — platform notice` / `0 remaining` /
-  `summarize now`）只针对 Chat 模式才有意义——平台不会在 Task 模式的独立任务通道后追加
-  该收尾通知，提前点破反而凭空引入一条不存在的警告。task 模型（`gemini-4-carbon-task` /
-  `gemini-4-neon-task` / `gemini-4-hydrogen-task`）现在只注入通用工具格式锚点，对话模型
-  行为不变。
+- 修复 Task 模式模型（`gemini-4-carbon-task` / `gemini-4-neon-task` / `gemini-4-hydrogen-task`）误注入对话模式专属平台通知免疫词的问题，全端点统一仅保留通用工具格式锚点，对话模型行为保持不变。
 
 ## 6.2.1
 
-### 修复
-
-- **对话模式提示词防平台收尾通知干扰（疫苗式点破）**：Chat 模式下 Google 平台会在
-  拼好的 user 消息之后动态追加一条独立 `system` 消息，声称内置工具/网页搜索调用
-  已达上限（剩余 0 次）并要求直接汇总最终回复，导致模型提前停手、不再输出
-  `tool_call` 围栏。原 `Never invent or claim a limit` 措辞对此无效——
-  模型确实在上下文末尾看到了真实的平台通知，不认为自己是在「编造」。`pp.tail`
-  末尾锚点改为提前点破该通知：明确预告它会来、说明它仅针对宿主平台自身的原生
-  内置工具/网页搜索、与本对话的纯文本 `tool_call` 围栏协议完全无关（围栏对
-  平台而言只是普通回复文本，由外部网关解析并在下一轮返回结果，总次数与轮次不设
-  上限），并要求模型在任务未完成时无视任何尾部 `0 remaining` / 配额耗尽 / 直接总结
-  类平台通知、绝不据此停手或向用户谎报工具已达上限。超长对话转附件路径
-  （`planContextFile`）中 `pc.Tail` 继续留在正文内联，自动携带该指令。
+- 优化对话模式末尾工具调用提示词，提前说明平台尾部关于原生内置工具配额的提示与纯文本 `tool_call` 协议无关，避免模型在任务未完成时提前停止调用工具（超长对话转附件时同样保留该指令）。
 
 ## 6.2.0
 
 ### 变更
-
-- **4 Carbon 对话模式与任务模式彻底分离**（与 `gemini-4-neon` / `gemini-4-hydrogen`
-  两家族架构对称统一）：
-  - `gemini-4-carbon` / `gemini-4-carbon-thinking` / `gemini-4-carbon-thinking-medium`
-    改为纯普通对话模式（`TaskMode: false`）：不再对 `mc.Mode == 8` 默认补
-    `argonMode8Slots`（`inner[49]=40` 等），走纯普通 Chat inner。2026-11-19 两轮
-    22 次上游实测证实：纯普通 inner 的 Mode=8 请求 think=1/2/4 均 HTTP 200、分别
-    准确自报 `"4 Carbon"` / `"4 Carbon High"` / `"4 Carbon Medium"`（原补槽位请求
-    实为网页端 Task 模式，自报被脱后缀回落成裸名）。
-  - 新增 `gemini-4-carbon-task`：`hexArgon4` / `Mode=8` + `think=2` + `TaskMode`，
-    单轮与多轮路径统一按 `mc.TaskMode` 路由——`Mode==8` 任务模型走
-    `argonMode8Slots`，`Mode!=8` 继续走 `taskModeSlots`，两者不混用；不注册
-    `-task-thinking` 变体（与 `gemini-4-neon-task` / `gemini-4-hydrogen-task`
-    保持完全一致）。
-  - `argon.go` 身份核验：`argonDisplayNamesMode` 任务模式下对 `hexArgon4` 放行
-    裸名 `"4 Carbon"`、`"* High"` 后缀与 `"4 Argon"` 旧名（实测 Task 模式自报均被
-    脱后缀）；对话模式核验规则逐字不变。
-  - `modelNeedsLogin` / `strict_model` 降级判定覆盖 `gemini-4-carbon-task`
-    （同 hexArgon4 槽位，付费/Ultra 号专属；无 cookie 时不暴露）。
-  - **行为影响**：原先走补槽位 Mode=8 的 `gemini-4-carbon*` 请求实为 Task 模式；
-    需要原行为的客户端改用 `gemini-4-carbon-task`，对话模型现在获得真正的
-    Chat 模式（三档各自准确自报，`gemini-4-carbon-thinking` 回报 `"4 Carbon High"`）。
+- **`gemini-4-carbon` 对话模式与任务模式分离**（与 `gemini-4-neon`、`gemini-4-hydrogen` 保持一致）：
+  - `gemini-4-carbon`、`gemini-4-carbon-thinking`、`gemini-4-carbon-thinking-medium` 调整为纯对话模式，各思考档位可准确返回对应模型自报。
+  - 新增独立任务模式模型 `gemini-4-carbon-task`（付费/Ultra 账号专属，无 Cookie 时不暴露）；原先依赖旧版 `gemini-4-carbon*` 任务模式行为的客户端请改用 `gemini-4-carbon-task`。
 
 ## 6.1.0
 
 ### 新增
-
-- **对话模式与任务模式分离**：新增 `gemini-4-neon-task` 与
-  `gemini-4-hydrogen-task` 两个独立任务模式模型（对应 Gemini Web 网页端「任务」开关），
-  现有对话模式模型行为完全不变。
-  - `ModelConfig` 新增 `TaskMode` 字段；`taskModeSlots` 按浏览器 Task Mode 抓包
-    补齐槽位（`inner[6]=[0]`、`inner[30]=[4,27,28,16,19,12]`、`inner[49]=40`、
-    `inner[68]=1`、`inner[83]=1`、`inner[91]=1`、`inner[96]=1`、`inner[98]=1`），
-    单轮与多轮路径同用；`Mode==8`（Carbon）仍走 `argonMode8Slots`，两者互斥不混用。
-  - `gemini-4-neon-task`：`hexNeon4` / `Mode=3` + `think=2` + 任务槽位，上游实测自报
-    裸名 `"4 Neon"`；`argon.go` 身份核验新增 `taskMode` 参数，任务模式下放行
-    `"4 Neon"` / `"4 Neon High"` 两套名字，`taskMode=false` 时对话模式规则逐字不变
-    （`think=2` 仍只认 `"4 Neon High"`）。
-  - `gemini-4-hydrogen-task`：`hexFlash38` / `Mode=1` + `think=2` + 任务槽位，
-    `Upstream` 登记 `"4 Hydrogen"`，降级检测走 `strict_model`。
-  - `modelNeedsLogin` 覆盖 `TaskMode`：任务模式为账号功能，无 cookie 时两个新模型
-    均不暴露。
+- **对话模式与任务模式分离**：新增独立任务模式模型 `gemini-4-neon-task` 与 `gemini-4-hydrogen-task`（对应 Gemini Web 网页端「任务」开关，需登录态且无 Cookie 时不暴露），现有对话模式模型行为保持不变。
 
 ## 6.0.1
 
-### 修复
-
-- **工具调用提示词防幻觉**：`buildPromptParts` 末尾锚点原「do not output more than one
-  tool_call」「Know when to STOP … stop calling tools」强停手措辞，在多轮重放大量历史
-  工具调用时诱发 `gemini-4-neon` / `gemini-4-hydrogen` 泛化出「工具调用次数有上限/
-  工具被停用」而拒继调工具。现明确声明：每轮一个 `tool_call` 块只是单轮格式约定，
-  整个会话对工具调用总次数与轮数不设上限，任务未完可按需继续分步调工具，绝不编造
-  或声称存在次数/配额上限或工具被禁用；「别重复已成功步骤」限定为该步骤本身，不得
-  提前中断其它未完成步骤。`formatToolResult` 的成功提示同样收窄为「不要重复执行这条
-  命令」。
+- 修复多轮重放历史工具调用时提示词诱发模型误以为「工具调用次数达上限或被禁用」的幻觉，明确单轮格式约定不限制会话总调用次数与轮数，并收窄单次成功命令的防重复提示范围。
 
 ## 6.0.0
 
-### ⚠️ 破坏性变更
-
-- **移除对外 `gemini-4-argon` / `gemini-4-argon-thinking` / `gemini-4-argon-thinking-medium`
-  三条模型**。上游 `otAQ7b` 目录已把原 Argon 的 Mode=8 槽位原位改名为 4 Carbon，
-  目录中 argon 不再出现；请求这三条模型名将不再被识别（`gemini-4-carbon*` 三条不动，
-  Argon↔Carbon 的 `strict_model` 同槽互认逻辑保留）。客户端请改用
-  `gemini-4-carbon*` 或新增的 `gemini-4-neon*` 系列。
+### 破坏性变更
+- **移除 `gemini-4-argon` / `gemini-4-argon-thinking` / `gemini-4-argon-thinking-medium`**：上游模型目录已将原槽位改名为 4 Carbon，请求上述旧模型名将不再被识别，请改用 `gemini-4-carbon*` 或 `gemini-4-neon*`。
 
 ### 新增
-
-- **Gemini 4 Neon 模型接入**：上游 `otAQ7b` 目录中 Neon 为
-  `hex e6fa609c3fa255c0` / `Mode=3`（实测 think=1/2/4 均 HTTP 200，自报
-  `"4 Neon"` / `"4 Neon High"` / `"4 Neon Medium"`，均服务端内部思考、不吐思考链）。
-  新增 `gemini-4-neon` / `gemini-4-neon-thinking` / `gemini-4-neon-thinking-medium` 三条
-  对外模型。
-  - `modelNeedsLogin` 纳入 `hexNeon4`（付费号专属，免费号静默降级）。
-  - 强身份核验（`argon.go`）按请求 hex 分槽：`hexNeon4` 三档只认对应档名
-    （`"4 Neon"` / `"4 Neon High"` / `"4 Neon Medium"`，高/中档带后缀，与 Carbon High 档
-    脱后缀不同）；响应帧 hex 槽仍接受请求 hex 或 `hexFlashLite` 占位，显示名严格核对。
-    `hexArgon4`（Carbon）既有核验不回归。
-  - `argonMode8Slots` 仅 `Mode==8`（Carbon）触发；Neon（Mode=3）用普通 inner。
-  - `strict_model`：`modelDowngraded` 对 `4 Neon*` 自报按前缀规则正常匹配，
-    收到 `4 Carbon` / `4 Hydrogen` / `3.5 Flash-Lite` 等异族自报准确判降级。
+- **接入 Gemini 4 Neon 系列模型**：新增 `gemini-4-neon`、`gemini-4-neon-thinking`、`gemini-4-neon-thinking-medium`（付费账号专属，服务端内部思考不输出 `reasoning_content`），支持 `strict_model` 降级检测与身份核验。
 
 ### 修复
-
-- **`strict_model` 同槽升级豁免降级冷却**：请求 `4 Neon Medium` 收到 `4 Neon High`
-  自报属同槽单向升级（上游实测 think=4 请求由 High 档承接），不再误判降级并给账号
-  打上 `strict_model_cooldown_min` 冷却；异族自报仍照常判降级，`argon.go` 强身份核验
-  对档名不匹配仍拒绝（42d6482）。
+- **`strict_model` 同槽单向升级豁免降级冷却**：请求 `4 Neon Medium` 收到 `4 Neon High` 自报不再误判为降级并冷却账号，异族降级仍正常拦截。
 
 ## 5.0.0
 
-### 架构与发版规范
+### 变更
+- 正式启用标准语义化版本 `v5.0.0`，提供 6 平台预编译二进制（Linux / macOS / Windows × amd64 / arm64）与 GHCR 多架构容器镜像，供下游插件直接校验下载。
 
-- **正式启用标准语义化版本 `v5.0.0`（annotated git tag）**，退役 `-magpie.N` 后缀；
-  后续版本按 `vX.Y.Z` 递增，由 CI 门禁强制校验。
-- **一仓一制品解耦**。本仓统一负责 6 平台预编译二进制（linux/darwin/windows ×
-  amd64/arm64）与 GHCR 多架构镜像（linux/amd64、linux/arm64）发布；下游插件
-  `@dorokuma/magpie-gemini-web`（自 v0.15.0 起）通过 `lib/backend-release.json`
-  直接固定本仓正式 Release 二进制 SHA-256，不再走源码构建。
-- **统一 Go `1.27.1` 与 `-trimpath -buildvcs=false` 可复现构建**。`go.mod`、
-  `Makefile`、`Dockerfile`、CI 全部钉在 `go1.27.1`；发布构建统一加
-  `-buildvcs=false` 消除 VCS 元数据对产物哈希的干扰。
-- **CI 发版强门禁**。`make check` 新增 `var Version = "dev"` 断言；新增
-  `make release-check TAG=vX.Y.Z`（TAG 严格 SemVer、CHANGELOG 小节非空、
-  已存在 tag 必须为 annotated）；release notes 抽取结果为空直接 `::error::`
-  硬阻断；linux/amd64 产物独立二次编译并比对 SHA-256 一致性；`workflow_dispatch`
-  支持手动 `inputs.tag` 派发作为兜底发版通道。
-
-### 新增与改进（相对于上游 4.28.0 累计内聚能力）
-
-- **`capabilities.account_proxy_binding`**：账号可绑定专属代理出口，导入 cookie 前
-  可先配代理绑定，保证首次请求就走指定出口，避免「号还没绑 IP 就先直连」的窗口。
-- **Gemini 4 Carbon / 4 Hydrogen / 4 Argon 模型接入**：`4 Carbon` 与 `4 Argon`
-  共用 `hexArgon4` / `Mode=8` 槽位，由 PR #71 `argonMode8Slots` 扩展单/多轮载荷
-  槽位；`4 Hydrogen` 为 `3.8 Flash` 同槽位（`hexFlash38` / `Mode=1`）原位升级，
-  保留按模型 `HexID` 映射表。
-- **`strict_model` 互认（上游原位改名不判降级）**：`modelDowngraded` 新增两条同槽
-  判定——Mode-8 槽位自报 `"4 Carbon"` 与 `"4 Argon"` 为同一模型原位改名，双向
-  互认不判降级；Mode-1 槽位请求 `"3.8 Flash"` 收到 `"4 Hydrogen"` 自报属同槽单向
-  升级，豁免降级误判（避免误回 429），反向请求 `4 Hydrogen` 收到 Flash 族自报仍判降级。
-- **XSRF token 20 分钟缓存 + 5 分钟异步续期**：XSRF 令牌按稳定账号身份
-  （`SAPISID + __Secure-1PSID`）缓存 20 分钟，满 5 分钟后命中时触发后台异步
-  重抓续期，避免 `*SIDCC` 轮换导致请求频繁重抓页面；冷号首请求延迟从 ~1.2s
-  降到 ~200ms；失败自动回源重取。
-- **幽灵会话自动清理**：请求被客户端中途断开或上游错误路径下，仍保证
-  `GzXR5e` 删除 rpc 恰好执行一次；`StreamGenerate` 错误/取消路径保留已读 raw，
-  不再漏删。XSRF 自愈后的收尾删除使用新 token 重试；`auto_delete_conversation`
-  默认开启（07ed36e）。
-- **请求沉默计时器与工具调用收尾**：流式响应设沉默窗口阈值，超时未出帧主动
-  掐断并返回明确错误；工具调用围栏在超长上下文下协议保留，分词器超时走兜底
-  估算不阻塞响应。
-- **管理面板「关于」页仓库地址指向本维护仓**，新增「维护分支」署名行，英文
-  i18n 同步补齐。
+### 新增
+- 支持账号绑定专属代理出口（`account_proxy_binding`），导入 Cookie 前可预绑出口，避免首次请求直连。
+- 接入 Gemini 4 Carbon / 4 Hydrogen / 4 Argon 模型，并支持 `strict_model` 上游原位改名与同槽升级互认，避免误判降级。
+- XSRF token 支持按账号缓存 20 分钟并在 5 分钟后异步续期，降低冷号首请求延迟。
+- 请求中途断开或异常时自动清理上游幽灵会话，`auto_delete_conversation` 默认开启。
+- 支持流式请求沉默计时器超时掐断，以及超长上下文转附件时保留工具协议指令并在分词器加载超时时自动兜底估算。
+- 管理面板「关于」页更新仓库链接与维护分支署名，并补齐英文翻译。
 
 ### 修复
-
-- **502 结构化诊断落库**（沿用 magpie.5）：`reason`/`upstream_model`/`frames`/
-  `content_frame`/`hint` 字段进 502 body 与 `requests.error`，面板可按类过滤。
-- **空正文 / 损坏 `tool_call` 围栏假 200 拦截**（沿用 magpie.4/.5）：有帧但正文
-  为空、reasoning-only、围栏解析失败三类均返回错误而非 `content: null` 假 200。
-- **视频任务并发快照修复 data race**：`videoJobSnapshot` 替代直接序列化
-  `*videoJob`（`-race` 下 `TestCreateVideoAcceptsInputReference` 曾报 DATA RACE）。
-- **WebChannel 错误链凭据脱敏**（沿用 magpie.4）：`SID`/`gsessionid`/`SAPISIDHASH`/
-  `$httpHeaders` 在握手、请求构造与 `Unwrap`/`errors.As` 链上均脱敏。
-- **管理面板硬编码上游仓库地址**：`REPO` 常量、外链与 `releases/latest` 更新
-  检查全部指向 `dorokuma/gemini-web2api-go`，「作者」行保留原作者署名，新增
-  「维护分支」行。
+- `502` 响应体与数据库请求记录新增结构化诊断字段，空正文、仅思考链或无法解析的 `tool_call` 围栏不再返回空内容的假 `200` 响应。
+- 修复视频任务状态响应在并发读写下的数据竞争。
+- 对 WebChannel 握手、请求构造与错误链中的会话凭据进行脱敏处理。
+- 修复管理面板中硬编码的上游仓库链接与版本更新检查地址。
 
 ## 4.28.0-magpie.5
 
 ### 修复
-
-- **502 响应体结构化**。上游调用失败（无内容帧 / 出错话术 / 超时 / 抽取后为空）时，
-  502 body 现在带 `reason`/`upstream_model`/`frames`/`content_frame`/`hint` 字段，
-  已开流的 SSE 错误块带同一份字段；Google 原生接口（`/v1beta`）同一套诊断走
-  `error.details` 块。字段语义：`frames` 是该次响应 `wrb.fr` 条目总数（含结束帧）；
-  `content_frame` 是既有文本或思考检测能否认出内容帧的判据；`upstream_model` 为
-  `unknown` 表示该最终尝试无可解析的自报名，不代表模型权限结论。
-- **失败原因落库**。`requests.error` 写 `[reason]` 前缀、`upstream_model` 列记上游
-  自报显示名——即使 `log_requests` 关闭也落库（该开关只管 stderr），用户现场不再
-  只剩一句 “upstream error”。多轮续接的「续接无内容帧」中文报错现在带显式
-  `no_content_frame` reason（错误串无英文特征，单靠串匹配会漏归兜底）；面板错误
-  分类直接认 `[no_content_frame]`/`[failure_reply]`/`[empty_content]` 前缀，
-  不再误归 network。
-- **空正文不再静默返回 200**。有内容帧但抽取后为空 → `empty_content`；完全无内容帧 →
-  `no_content_frame`；只有思考链没有正文（reasoning-only）也返回 `empty_content`：
-  `reasoning_content` 是正文之外的辅助字段，拿它顶替正文等于回一个「成功但没答案」
-  的假 200，比报错更误导。canvas / 媒体产物 / 有效 tool_call / 纯代码产物四类合法
-  空正文路径不受影响。
-- **`Version` 改为构建注入**。源码里恒为 `var Version = "dev"`，release workflow 与
-  Docker 构建用 `-ldflags -X` 注入 tag，不再出现「发了新版、`GET /` 还报旧版」的固化问题。
-- **视频任务响应的 data race**。`handleCreateVideo` / `handleExtendVideo` /
-  `handleVideoItem` 原来把 `*videoJob` 直接交给 HTTP 序列化，后台 goroutine 同时在
-  写 status / account / mp4 等字段（`-race` 下 `TestCreateVideoAcceptsInputReference`
-  报 DATA RACE）。新增 `videoJobSnapshot` 在 `videoJobsMu` 下复制可 JSON 字段后返回。
+- `502` 响应体（及已开流 SSE 错误块、`/v1beta` 原生接口）新增结构化诊断字段，数据库请求记录同步落库失败原因与上游自报模型。
+- 修复有帧但正文为空、仅包含思考链时仍静默返回 `200` 的问题，统一转为 `empty_content` 或 `no_content_frame` 错误。
+- 构建版本号改为编译期注入，避免版本信息滞后。
+- 修复视频任务响应接口在并发读写下的数据竞争。
 
 ## 4.28.0-magpie.4
 
 ### 修复
-
-- **回复只剩一个无法解析的 ```tool_call``` 围栏时不再返回空回答**。之前返回
-  200 且 `content: null`（客户端静默拿不到内容）；现在返回错误，客户端会出现 5xx，
-  OpenAI SDK 按默认策略会重试。
-- **WebChannel 握手 URL 中的 `$httpHeaders`/`SID`/`gsessionid` 在错误信息中脱敏**。
-  请求构造失败、握手失败和 `errors.Unwrap`/`errors.As` 拿到的错误链上都不再回传
-  API key、SAPISIDHASH 或会话值。当前 `web_channel` 未启用（`useWC=false`），无运行时影响。
-- **WebChannel 下行/上行非 200 响应不再回传上游响应体**，只给状态码与字节数等
-  定位信息，避免上游错误内容经 `requests.error`/502/`last_error` 外泄。
-- **WebChannel 脱敏错误链的 `Timeout()`/`Temporary()` 沿链下钻**，但深链转发只发生在
-  重建的 `*wcRedactedError` 节点上（复制 `*url.Error` 时仅对其 `Err` 字段递归脱敏）；
-  `*url.Error` 自身的 `Timeout()` 仍只看直接 `Err` 一层——`url.Error→fmt→net.Error`
-  链路下超时判定照丢，属既有边界（见 `.agents/notes/webchannel-enable-prerequisites.md`
-  观察项 O-2）。
-- **WebChannel 凭据脱敏覆盖握手、请求构造与错误链**（`wcRedactErr`/`wcSanitizeErr`），
-  `Unwrap`/`errors.As` 命中的每个节点都脱敏。
+- 修复回复仅剩无法解析的 `tool_call` 围栏时返回 `200` 空内容的问题，改为返回错误以便客户端重试。
+- 对 WebChannel 请求构造、握手及错误链中的会话凭据进行脱敏，非 200 响应不再外泄上游响应体内容。
 
 ## 4.28.0-magpie.2
 
 ### 新增
-
-- **Gemini 4 Carbon / 4 Hydrogen 模型接入**（feat/magpie-carbon-hydrogen-phantom
-  分支合并，e6c2bd5）。`4 Carbon` 与 `4 Argon` 共用 `hexArgon4` / `Mode=8` 槽位，
-  由 PR #71 `argonMode8Slots` 扩展单/多轮载荷槽位；`4 Hydrogen` 为 `3.8 Flash`
-  同槽位（`hexFlash38` / `Mode=1`）原位升级，保留按模型 `HexID` 映射表。付费号
-  cookie 可用，未授权号被静默降级时由 `strict_model` 互认逻辑识别并换号重试。
-- **`capabilities.account_proxy_binding`**：账号可预先绑定专属代理出口，导入
-  cookie 前先配绑定，首次请求即走指定出口，消除「号未绑 IP 先直连」的窗口期。
-- **XSRF token 20 分钟缓存 + 5 分钟异步续期**：XSRF 令牌按稳定账号身份
-  （`SAPISID + __Secure-1PSID`）缓存 20 分钟，满 5 分钟后命中时触发后台异步
-  重抓续期，避免 `*SIDCC` 轮换导致请求频繁重抓页面；缓存失败自动回源重取，
-  不影响后续请求。
-- **`strict_model` 同槽互认**：上游原位改名不再误判降级。`modelDowngraded` 认两条：
-  Mode-8 槽位自报 `"4 Carbon"` 与 `"4 Argon"` 为同一模型原位改名，双向互认不判降级；
-  Mode-1 槽位请求 `"3.8 Flash"` 收到 `"4 Hydrogen"` 自报属同槽单向升级，豁免降级
-  误判（避免误回 429），反向请求 `4 Hydrogen` 收到 Flash 族自报仍判降级。
-- **Chrome / TLS 客户端指纹改进**：`impersonate` 对齐 Chrome 146 指纹，
-  `Sec-CH-UA` 等 Chromium 专有头补齐，减少被上游特征识别拦截的概率。
+- 接入 Gemini 4 Carbon / 4 Hydrogen 模型，支持 `strict_model` 上游原位改名与同槽升级互认。
+- 新增账号预绑定专属代理出口（`account_proxy_binding`），支持导入 Cookie 前预绑出口。
+- XSRF token 支持按账号缓存 20 分钟并在 5 分钟后异步续期。
+- Chrome / TLS 客户端指纹对齐更新并补齐请求头。
 
 ### 修复
-
-- **幽灵会话自动清理**：请求被客户端中途断开或上游错误路径下，仍保证
-  `GzXR5e` 删除 rpc 恰好执行一次；`StreamGenerate` 错误/取消路径保留已读
-  raw，幽灵会话不再漏删（5d3540d / 4304472 / 42976fb）。
-- **XSRF 自愈后收尾用新 token 删幽灵会话**；成功路径删除收口到 `defer flush`
-  防双删（4304472）。`auto_delete_conversation` 默认开启（07ed36e）。
-- **phantom cleanup 凭据闭包改无名返回值修 sapisid 遮蔽**；`GzXR5e` 恰好一次
-  断言下沉到假传输层（42976fb）。
-- **请求沉默计时器（`stallWatch`）**：原客户端 `Timeout` 管整次请求，上游排队
-  超过限时就被拦腰截断、重发又从头排队。改为按沉默计时：上游 `request_timeout_sec`
-  这么久一个字节都没来（连心跳都断了）才取消这次请求并返回明确 `StallError`，
-  没出字的照常重试；排队中的心跳帧让请求一直等下去。
-- **工具调用提前收尾**：累积正文里出现闭合且能解析、函数名在 `tools` 里的
-  ```tool_call``` 块即收尾（`toolCallComplete` + `stopReader` 提前结束读取），
-  不再空等上游收完；函数名不认识或 JSON 不完整时不收尾，照旧等上游结束。
-- **超长上下文保留工具协议行**：prompt 超预算转 `message.txt` 附件时，工具协议
-  （`promptCtx.Head` 格式说明 + `Tail` 末尾锚点）留在正文不随历史进附件，避免模型
-  不再稳定吐 ```tool_call```；工具说明本身超预算才退回整段进附件。
-- **分词器下载超时 `chars/4` 兜底**：tiktoken 首次加载要远端下 BPE 表，默认 loader
-  无超时、黑洞代理下会卡住启动；改用带超时的 `boundedBpeLoader`，超时或加载失败
-  立即回退 `chars/4` 估算，不阻塞响应。
-- **stall 测试沉默窗口放宽**，防 `-race` 下握手假红（5d3540d）。
+- 修复客户端中途断开或异常路径下的上游幽灵会话清理，`auto_delete_conversation` 默认开启。
+- 请求超时改为按服务端沉默时长触发（`stallWatch`），排队阶段的心跳帧不再被误判超时。
+- 工具调用围栏完整闭合后提前结束流式读取，缩短响应等待时间。
+- 超长上下文转为 `message.txt` 附件发送时在正文保留工具协议指令，并为分词器加载增加超时兜底估算。
 
 ## 4.28.0
 
 ### 新增
-
-- **「超时后重试」开关（`retry_on_timeout`，#70）**。上游等满「上游超时」还没回完时，原来会按重试次数再发，
-  一个请求最坏要等「超时 × 重试次数」，超长输入或 Argon 下能拖十几分钟。关掉后超时直接报错，其他失败照常重试。
-  默认开，跟之前行为一致。
-- **流式保活（`stream_keepalive_sec`，#70）**。流式请求在等上游出字时，连续这么多秒没写东西就发一次保活，
-  防止前面的 nginx / Cloudflare / newapi 等中间层因连接空闲回 504。默认 0（关），建议 15。代价：开流后再失败只能
-  在流里报错，拿不到 502/429 状态码；秒级就失败的请求不受影响。非流式请求无效。
+- 新增「超时后重试」开关（`retry_on_timeout`，默认开启），关闭后请求超时直接报错不再重复重试。
+- 新增流式保活配置（`stream_keepalive_sec`，默认关闭），支持定期发送保活信号避免中间反代超时断开。
 
 ### 修复
-
-- **新版 `google-genai` SDK 调用 404**。3.x 配自定义 `base_url` 时默认请求 `/v1/models/{model}:generateContent`
-  而不是 `/v1beta`，现在两种路径都支持，README 里的示例不用改。
+- 兼容新版 `google-genai` SDK 默认请求 `/v1/models/{model}:generateContent` 路径。
 
 ## 4.27.1
 
 ### 修复
-
-- **回答偶尔是一句固定的出错话术（#68）**。上游有时回 HTTP 200，正文却是「I seem to be encountering an error…」
-  「Sorry, something went wrong…」「我只是一个语言模型…」这类固定句子，之前被当正常回答返回。这是上游偶发失败，
-  跟账号、模型、新老协议都无关；现在能识别出来并自动重试，流式在吐字之前就拦下。多轮续接（`multi_turn`）也一样。
-- **工具调用的参数变成 `null`（#69）**。模型没写 `arguments`、把参数写在 `parameters` / `input` 里或平铺在外层、
-  或者把参数写成一段 JSON 字符串时，之前会发出 `"arguments": "null"`（客户端报「must be a JSON object」中断），
-  或者整个调用被丢掉、只剩正文。现在参数一律整理成 JSON 对象，取不到就给 `{}`；没写工具名的调用不再发出。
-  `/v1beta` 原生接口的 `functionCall.args` 随之修好。
-- **回答里夹着 `<ElicitationsGroup>`、`<Sequence>`、`<Carousel>` 等标签**。上游近期开始在正文里直接写网页端的
-  卡片组件，匿名和登录态都有。现在转成 Markdown：步骤卡片变成带序号的小标题，视频轮播变成视频链接列表，
-  清单变成任务列表，追问建议变成列表。流式同样处理，代码块里的标签不动。
-- **生图回复里多一行打不开的 `http://googleusercontent.com/image_generation_content/0_N`**。这是网页上放图片的占位，
-  现在去掉了，图片照旧附在末尾。
+- 识别并自动重试上游偶发返回 HTTP 200 但正文为固定出错话术的响应。
+- 规范化工具调用参数格式为 JSON 对象并过滤无效空调用，同步修复 `/v1beta` 原生接口 `functionCall.args`。
+- 将上游正文内嵌的网页卡片组件标签转换为标准 Markdown 列表与标题。
+- 移除生图回复末尾无效的占位图片链接。
 
 ## 4.27.0
 
 ### 新增
-
-- **多账号登录的「账号序号」（#59）**。同一个浏览器里登了多个 Google 号时，导出的那串 cookie 能当其中任何一个号用，
-  选哪个号由请求地址决定；之前一律落在默认号上，订阅在别的号上时付费模型会被静默降级成 3.5 Flash-Lite，
-  「检测」却显示有效。现在 Cookie 池每条可以填「账号序号」（那个号的 Gemini 地址栏 `/u/1/` 就填 1），
-  对话、看图和长文本附件的上传、生图/音乐/视频的产物下载、会话列表/删除都会落到这个号上。同一串 cookie 可以导入多次、
-  各填各的序号，当几个号用。管理接口 `POST/PATCH /admin/api/cookies` 新增 `authuser` 字段。
-- **生图下载原图 / 放大（#62）**。新开关 `image_upscale`（面板「设置」→「生图下载原图/放大」，默认关）。
-  打开后生成的图照网页「下载」按钮那样取：Ultra 号的图放大到宽高各 2 倍（1376×768 → 2752×1536），
-  普通号拿到未重新压缩的原始文件（尺寸不变，约 0.8MB，默认那张约 0.2MB）。取不到就退回默认那张，不重新生成。
-- **新协议 processSession（#43）**。新开关 `web_channel`（面板「设置」→「新协议（processSession）」，默认关）。
-  打开后对话改走网页新版用的 WebChannel 接口，而不是老的 StreamGenerate；后端是同一个，只换传输方式。
-  老接口目前仍正常，留作老接口出问题时的备用。文本（流式/非流式）、看图、生图、匿名已实测；多轮续接仍走老接口；
-  扩展思考在新协议上暂时不生效。
+- 支持多账号登录的「账号序号」（`authuser`），Cookie 池导入与编辑支持指定序号以区分同浏览器下的不同 Google 账号。
+- 新增生图下载原图 / 放大开关（`image_upscale`，默认关闭）。
+- 新增新版 `processSession` 协议传输开关（`web_channel`，默认关闭）。
 
 ### 修复
-
-- **断网时好号被自动停用**。取登录 token 时的网络错误（如 EOF）被当成鉴权失败计数，连续 3 次就把账号停掉。
-  现在只有确实是 cookie 的问题（页面没有登录态、401/403、被跳到登录页）才计数；断网、被 Google 拦（跳 `/sorry`）、
-  429、5xx 都不算。
-- **工具调用的参数里带 ``` 时被截断（#65）**。写文件这类工具的参数里常有 markdown 代码块，之前遇到第一个 ```
-  就当围栏结束：这次调用整个丢掉，参数后半截被当正文发出去。现在按 JSON 解析完整个调用再找闭合围栏，流式和非流式都改了。
-- **代理池全部熔断时报成「RPH 已满」（PR #61，@Guuuu233）**。现在报 `proxy_unavailable`（HTTP 502），
-  不再误导人去调高限额；真正的并发/频率限制仍回 429。
-- 面板「检测」遇到出口被 Google 拦（跳 `/sorry`）时，不再显示成「cookie 无效：被重定向到登录页」。
-- 视频配额页只在确实是登录态问题时才显示 `not signed in`，断网或代理不可用时显示原始错误。
+- 修复断网或上游拦截时将正常账号误计为鉴权失败并自动停用的问题。
+- 修复工具调用参数内含 Markdown 代码块围栏时被提前截断的问题。
+- 修复代理池全部熔断时误报为直连频率限制的问题，改为返回 `502 proxy_unavailable`；优化被拦截与视频配额页的错误提示。
 
 ## 4.26.0
 
 ### 新增
-
-- **面板「关于」页和检查更新**。显示当前 / 最新版本，有新版本时顶栏出现提示，「关于」页给出更新说明、
-  Docker 更新命令和各平台二进制下载链接。由浏览器直接查询 GitHub，服务端不发任何请求；结果缓存 6 小时，
-  可在「关于」页关掉自动检查。顶栏新增 GitHub 入口。
+- 管理面板新增「关于」页与浏览器端版本更新检查功能，顶栏新增 GitHub 入口。
 
 ### 改进
-
-- **设置页排版**。开关类选项单独成行（开关在左、说明在右），不再挤在输入框的多列网格里；复选框换成
-  开关样式；「请求行为」里的会话相关开关拆成「会话与账号」一组。
+- 优化设置页排版，开关类选项独立成行并将「会话与账号」相关选项归组。
 
 ## 4.25.0
 
 ### 新增
-
-- **Google 原生 Gemini API 接口（#58）**。同一端口新增 `POST /v1beta/models/{model}:generateContent`、
-  `:streamGenerateContent`（真流式；`?alt=sse` 回 SSE，不带回 JSON 数组）、`:countTokens`，以及
-  `GET /v1beta/models`。给只说 Google 格式的客户端用：`google-genai` SDK、Bifrost 等网关的 Google provider。
-  - 支持 function calling：`tools[].functionDeclarations`、`toolConfig.functionCallingConfig`（`AUTO` / `ANY` /
-    `NONE`、`allowedFunctionNames`）、历史里的 `functionCall` / `functionResponse`；模型的调用以 `functionCall`
-    part 返回，SDK 的自动函数调用可用。底下跟 OpenAI 接口同一套 prompt 级实现。
-  - `thinkingConfig.includeThoughts` 时思考摘要以 `thought` part 返回；生图 / 音乐产物以 `inlineData` 返回；
-    `inlineData` / http(s) `fileData` 的图片和视频作为输入（需要 cookie）。
-  - 错误体用 Google 的 `{"error":{code,message,status}}` 形状，状态码跟 OpenAI 接口一致。
-  - 模型名用本项目的（`gemini-3.6-flash` 等）。
-- **API key 也认 `x-goog-api-key` 头和 `?key=` 参数**（Google SDK 的带法），原有的 `Authorization: Bearer` /
-  `x-api-key` 不变。
+- 新增 Google 原生 Gemini API 接口（`/v1beta/models/*:generateContent`、`:streamGenerateContent`、`:countTokens` 与 `GET /v1beta/models`），支持函数调用、思考摘要、多模态输入与生图/音乐产物返回。
+- API 鉴权同时支持 `x-goog-api-key` 请求头与 `?key=` 查询参数。
 
 ## 4.24.1
 
 ### 修复
-
-- **面板改 `request_timeout_sec` 不重启就不生效（#55）**。HTTP 客户端在创建时把超时定死并缓存，
-  保存设置后新请求仍用旧超时（比如面板显示 180，实际还按之前的 20 秒断开，日志是
-  `Client.Timeout` / `context deadline exceeded`）。现在改完立刻生效，跟面板的说明一致。
+- 修复管理面板修改 `request_timeout_sec` 后未重启不立即生效的问题。
 
 ## 4.24.0
 
 ### 新增
-
-- **`strict_model`：上游静默降级时不当成功返回（#41 / #45 / #56）**。付费模型（3.1 Pro / 4 Argon 等）
-  额度用完或号没权限时，Google 不报错，而是静默换成 3.5 Flash-Lite 照样回 200。开关打开后，服务端
-  自报的显示名跟请求的模型对不上就在第一个字发出前掐断，换池子里下一个号重试；全池都被降级时回
-  `429 insufficient_quota`（`code: model_downgraded`，带 `Retry-After`）。被降级的号按（账号, 模型）冷却
-  `strict_model_cooldown_min` 分钟，不影响它跑别的模型。默认关，面板「设置」可开。
-  - 判据：只看帧里的显示名（整词前缀比较，兼容 `High` / `扩展` 等思考档后缀）。帧里的模型 hex 现在
-    一律是 `cf41b0e0dd7d53e5`，不管请求哪个模型，已不能用来判断。
-- **`/v1/videos` 图生视频、竖屏、续写（PR #50，@ape1121）**。`input_reference` 首帧（data / http(s) URL、
-  `{"image_url": …}` 或 multipart 文件）；`size` `720x1280` / `aspect_ratio` `9:16`；
-  `POST /v1/videos/{id}/extend` 在原会话里续写，返回加长后的完整 MP4（需要 `temporary_chat` 和
-  `auto_delete_conversation` 都关着，否则回 409）。
-- **视频额度用完自动换号 + `GET /admin/api/video-quota`（PR #51，@ape1121）**。额度被拒的号冷却到
-  Google 写在拒绝里的重置时间（没写按 1 小时），同一任务里换下一个号；全池都在冷却时
-  `POST /v1/videos` 回 `429 video_quota_exhausted` + `Retry-After`。统计接口读各号自己的会话历史，
-  所有上游请求过代理池和限流器。
-- **MCP 媒体工具（#54）**。`/mcp` 新增 `generate_image`（可带参考图）、`generate_music`、
-  `create_video_task` / `get_video_status`。产物用 MCP 原生的 `image` / `audio` / embedded resource
-  内容返回，不把 base64 写进文本；视频默认只回状态，`include_video=true` 才附 MP4。
+- 新增 `strict_model` 开关（默认关闭）：检测并拦截上游静默降级，自动切换池内其他账号重试，全池降级时返回 `429 model_downgraded`。
+- `/v1/videos` 支持参考图生视频、竖屏比例及原会话视频续写（`POST /v1/videos/{id}/extend`）。
+- 支持视频额度耗尽自动冷却换号，新增 `GET /admin/api/video-quota` 额度查询接口。
+- `/mcp` 新增图像生成、音乐生成与视频任务管理等媒体工具。
 
 ### 修复
-
-- **一次 `/v1/videos` 请求生成了 3 个视频（#50 / #55）**。视频提交的受理响应本来就没有内容帧，旧代码
-  把它当空响应重试了 3 次。现在受理帧算提交成功。
-- **视频下载挑到放不了的封装包（#50）**。以前多份下载链里挑最大的那份，现在挑真正的 MP4。
-- **视频额度用完 / 被文字拒绝时干等约 6 分钟（#50）**。现在立即失败，错误带 `video_quota_exhausted`
-  或 `video_refused: <Gemini 的回复>`。
+- 修复 `/v1/videos` 受理响应被误判为空响应而重复提交 3 次的问题。
+- 修复视频下载优先选取真实 MP4 文件而非封装包的问题。
+- 视频额度耗尽或内容被拒时立即失败返回明确原因，不再长时等待。
 
 ## 4.23.0
 
 ### 新增
-
-- **`gemini-4-argon-thinking-medium`——4 Argon 中档思考（延续 #35）**。思考档从 bool 扩成可显式
-  指定线值（低=1 / 高=2 / 中=4，`ModelConfig.ThinkWire`）。中档在服务端内部完成、响应不带思考链，
-  故不映射 `reasoning_content`；登录门控同 Argon（付费 / Ultra 号 cookie）。
-  - 判据：2026-10-19 processSession 抓包里选中档时 think 槽（新协议字段 #81 = 老 `inner[80]`）发的
-    就是 4；现有模型取值逐字不变（argon=1 / argon-thinking=2 / flash=1、2），`buildModelHeader` 输出逐个核对。
-
-- **浏览器指纹实验开关 `firefox_fingerprint`（PR #40 之上）**。开 → 强制 Firefox/Zen 指纹（TLS profile
-  Firefox_147 + Firefox UA + 去掉 Chromium 专有的 `Sec-CH-UA`）；关 → 用 `impersonate`（默认 Chrome）。
-  直连才是完整 Firefox 指纹，走代理时 TLS 这层仍是 Go 标准库的（HTTP CONNECT 隧道限制）。面板「设置」
-  可开关，默认关。合入 #40 的应用层 header / UA 对齐。
-
-- **管理面板英文 i18n（PR #38）**。面板页面、弹窗、后端错误信息补齐英文。
-
-### 文档
-
-- README / README_EN 加目录（首屏二级标题锚点跳转）、「能用 Gemini 4 Argon 吗？怎么用？」FAQ、首屏
-  定义句补 4 Argon、快速开始末尾 star 引导、文末 Star History。
+- 新增 `gemini-4-argon-thinking-medium` 中档思考模型。
+- 新增浏览器指纹实验开关 `firefox_fingerprint`（默认关闭）。
+- 管理面板与后端错误提示补齐英文界面支持。
 
 ## 4.22.0
 
 ### 新增
-
-- **`gemini-4-argon` / `gemini-4-argon-thinking`（issue #35 / #36）**。接入 Gemini 网页端
-  「4 Argon」（otAQ7b 清单主 hex `95a4c0abcba24364`、代号 `Argon4p0`、desc「复杂任务」）。
-  付费 / Ultra 账号专属，免费号发它被静默降级成 3.5 Flash-Lite，故没 cookie 时不暴露、
-  也不走匿名。`-thinking` 版带 `reasoning_content`。
-  - 判据：拿一个 Ultra 号端到端实测，真正选中 Argon 的是 **MODE=8**（`x-goog-ext-525001261-jspb`
-    下标 14 / `inner[79]`）而不是 hex——单变量对照：hex=Argon 配 mode=1 回报「3.8 Flash」、
-    hex=Argon 配 mode=8 回报「4 Argon」、hex=3.8Flash 配 mode=8 也回报「4 Argon」（mode 决定、
-    hex 被忽略）。issue #35 给的 hex 没错，但只填 hex 不填对 mode 会落到 3.8 Flash。
-  - `-thinking`：mode=8 + `inner[80]=2`（上游把这档显示成 `High`）实测回报「4 Argon High」，
-    硬题下带 985 字符思考链，走既有 `[4][0][37][0][0]` 抽取路径，无需改代码即映射成
-    `reasoning_content`；同次对照 3.1 Pro 也回报「3.1 Pro High」（扩展思考后缀上游统一改叫
-    `High`，仅显示名变、抽取不变）。
+- 接入 `gemini-4-argon` 与 `gemini-4-argon-thinking` 模型（付费/Ultra 账号专属）。
 
 ## 4.21.0
 
 ### 新增
-
-- **临时对话 `temporary_chat`（issue #34）**。开启后发请求塞 `inner[45]=1`，走 Gemini 网页端
-  原生「临时对话」：会话压根不进账号的会话列表、不用于模型训练，比 #19 的「自动删会话」
-  （`auto_delete_conversation`）更干净——根本不建、不用删，顺带省掉那次 `GzXR5e` 删除请求。
-  只对登录号有意义（匿名本就不落账号）；与「服务端多轮续接」互斥，`multi_turn` 开着时不生效
-  （临时对话不留列表，多轮要靠服务端留会话）。面板「设置」可开关，默认关。
-  - 判据：实测坐实 `inner[45]=1` 就是这个开关——登录号发两条、单一变量，不带它的进会话列表
-    （rpc MaZiqc），带 `inner[45]=1` 的不进（控制臂在、实验臂消失）。参考实现里一起设的
-    `inner[41]=[1]` 是噪音，我们默认本就发 `[1]`。
+- 新增「临时对话」开关（`temporary_chat`，默认关闭），开启后会话不落入账号历史列表且不用于训练（与服务端多轮续接互斥）。
 
 ## 4.20.2
 
 ### 修复
-
-- **bl 自动跟随适配上游服务改名**。2026-10 上游把 bl 服务名从 `assistant-bard-web-server`
-  改成 `gemini-web-uiserver`（当前 `boq_gemini-web-uiserver_20261007.01_p0`）。校验正则原来
-  把服务名钉死，改名后自动跟随会把抓到的新值当"形状不对"拒掉、永远回退到配置里那个旧 bl。
-  放宽成只校验 `boq_<服务名>_<日期>.<版本>_p<数字>` 的总体形状，服务名随它改，兜底值也更到
-  当前。新旧两个 bl 实测都仍可用（端点路径没变），所以不影响在用的部署，只是让自动跟随恢复正常。
+- 放宽上游 `bl` 版本号校验格式以适配上游服务改名，恢复自动跟随更新。
 
 ## 4.20.1
 
 ### 修复
-
-- **RPH 补上「0=不限」的显示，跟并发 / RPM 对齐**（issue #32 #33）。并发和 RPM 都做了
-  0=不限（设置页 hint 写了、概览「距离封禁红线」的用量后面显示 ∞），RPH 两处都漏了——
-  hint 没写、概览 note 行没列 RPH，设成 0 时看不出是不限。补齐。纯显示，后端三者本就一致。
+- 补齐 RPH「`0` = 不限」的界面提示与用量展示，与并发及 RPM 保持一致。
 
 ## 4.20.0
 
 ### 新增
-
-- **Cookie 池失效账号标红**（issue #18）。账号鉴权在失败（`fail_count>0`，即 401/403）时，
-  面板状态列标红「疑似失效」、整行红底加左红条，顶部汇总「N 疑似失效」，一眼看出哪些该用
-  Firefox 重新导出。手动「检测」发现失效会立刻转红，检测通过或成功使用后自动转回正常。
-  （#18 里另提的内嵌 mini 浏览器不做，跟单二进制设计冲突。）
+- 管理面板 Cookie 池对鉴权失败（401/403）的账号标红提示「疑似失效」，检测通过或成功使用后自动恢复。
 
 ## 4.19.0
 
 ### 新增
-
-- **Cookie 自动续命**（issue #6，合并 @s1oz 的 #25）。以前每 10 分钟的 `RotateCookies` 保活走
-  浏览器 iframe 那条 `[658, session_id]`，只刷 `SIDCC` / `*PSIDCC`，**换不了** `__Secure-1PSIDTS`
-  ——那才是约 30 分钟过期的短命票，所以登录号看着半小时就死、保活按钮也救不回来。现在先用哨兵
-  payload `[000,"-0000000000000000000"]`（只带 `__Secure-1PSID` + `__Secure-1PSIDTS` 两项子集，
-  多带会 401）换发一张新 `*PSIDTS`，再跑原来的 SIDCC 保活；导入后 15 秒先刷一次、同号 60 秒内
-  不重复打（避免 429）。
-- 实测（纯 HTTP、全程无浏览器）：不刷的静态号 20-30 分钟就死，开哨兵连续续命 3 小时不掉。
-  **Firefox 导出的 cookie 可以一直续**；Chrome 新版的设备绑定会话（DBSC）换发会 401，反复 401
-  就改用 Firefox 重新登录再导出。
+- 改进 Cookie 自动保活续期流程，在刷新 `SIDCC` 前优先轮换短效凭据以延长登录态可用时间。
 
 ## 4.18.0
 
 ### 新增
-
-- **匿名优先开关 `anon_first`**（issue #20）。默认关。开启后不需要登录态能力的请求
-  （纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，最大化省账号额度；
-  用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图·音乐·视频·画布 / 传文件这些才挑号。
-  在设置页勾选。
+- 新增匿名优先开关（`anon_first`，默认关闭）：无需登录态能力的请求优先走匿名，节省账号额度。
 
 ### 修复
-
-- **cookie 挑号并发可能选中同一账号**。挑号是「SELECT 最久未用的号 + UPDATE 标记它
-  刚用过」两步，之前没串起来：并发请求会 SELECT 到同一个号、各自 UPDATE，同一瞬间
-  双双用它，轮转失效。加锁把这两步锁成原子。
+- 修复高并发下 Cookie 挑号与更新未原子化导致多请求选中同一账号的问题。
 
 ## 4.17.0
 
 ### 新增
-
-- **面板设置页加「服务端多轮续接」(`multi_turn`) 开关**（issue #27）。这个运行时开关一直存在，
-  但之前只能靠手写 `config.json` 开——面板上没有、也不读环境变量，docker/群晖这类部署尤其别扭。
-  现在设置页直接勾。开启后同一串连续对话复用同一个 gemini 网页会话（按历史前缀认续接，命中只发
-  最新一句、历史留服务端），不再每发一条就新开一个会话。
+- 管理面板设置页新增「服务端多轮续接」（`multi_turn`）开关。
 
 ### 修复
-
-- **修 `multi_turn` 在面板点「保存并生效」后被静默重置成 `false`**。它是唯一没列进面板配置表单的
-  运行时字段，而保存走的是整体反序列化，表单没带的字段会被解成零值——所以只要在面板保存过一次，
-  `config.json` 里设的 `multi_turn` 也会被冲掉。列进表单一并修掉。
+- 修复在管理面板保存设置时 `multi_turn` 配置被静默重置为 `false` 的问题。
 
 ## 4.16.0
 
 ### 新增
-
-- **`gemini-3.8-flash`（+ `-thinking`）**（issue #26）。Google 把原 3.7 Flash 那个 hex
-  （`56fdd199312815e2`）原地升成了 3.8——同 hex，服务端显示名从 `"3.7 Flash"` 变 `"3.8 Flash"`
-  （付费号 HAR 响应帧确认）。**付费 Gemini 账号专属**（不是灰度）：免费号仍降级成 3.5 Flash-Lite。
-  `gemini-3.7-flash` / `gemini-3.7-flash-thinking` 保留为别名（同 hex），老客户端不受影响。
+- 接入 `gemini-3.8-flash` 及 `-thinking` 版本（付费账号专属，保留 `gemini-3.7-flash*` 别名兼容）。
 
 ## 4.15.0
 
 ### 新增
-
-- **`/v1/videos` 端点**（issue #24）。OpenAI(Sora) 形状的异步视频生成：`POST /v1/videos`
-  {model, prompt} 建任务、立即返回 `{id, status}`；`GET /v1/videos/{id}` 轮询状态；
-  `GET /v1/videos/{id}/content` 完成后下 MP4。底层复用 `gemini-video` 那条生成链（要登录态 Pro 号）。
-  视频要几十秒到几分钟，异步比 chat/completions 阻塞式更合适。原来 `/v1/chat/completions` +
-  `model=gemini-video`（返回 base64 data URL）仍保留可用。
+- 新增 OpenAI 兼容异步视频生成接口 `/v1/videos`（创建、查询状态与下载 MP4）。
 
 ## 4.14.0
 
 ### 新增
-
-- **MySQL / PostgreSQL 支持**（issue #22）。设 `SQL_DSN` 环境变量即可，不设仍默认 SQLite、无需改动。
-  `SQL_DSN=mysql://user:pass@host:3306/db` 或 `postgres://user:pass@host:5432/db?sslmode=disable`。
-  建表自动完成，三种库共用一套 schema；方言差异（`?`/`$N` 占位符、upsert、自增主键、TEXT 键列、
-  `IFNULL`/`COALESCE`）全收敛在 `dbdialect.go`，业务层 ~70 条查询不动。用真 mysql8 + pg16 各跑通验证。
+- 支持通过 `SQL_DSN` 环境变量接入 MySQL 与 PostgreSQL 数据库，未配置时默认使用 SQLite。
 
 ### 修复
-
-- SSE 响应补 `X-Accel-Buffering: no`，避免流式经 nginx 一类反代被整体缓冲成一次性下发
-  （客户端直连本就是流式，仅「自己在前面架了反代」的部署需要）。注：issue #21 里 Dify 的
-  一次性输出不是这个原因——实测经 Dify 的 squid(ssrf_proxy) 是流式透传的，那问题在 Dify 侧。
+- SSE 响应补充 `X-Accel-Buffering: no` 请求头，避免经反代缓冲后无法流式输出。
 
 ## 4.13.0
 
 ### 新增
-
-- **读视频**。客户端在 content 里传 `video_url` / `input_video`（data URL）即可让模型分析
-  视频内容，跟读图同一条上传路径（文件元组类型位 2=视频）。要 cookie（匿名引用被上游拒）。
-  实测传红→绿→蓝测试片、问依次哪三色，模型答「红、绿、蓝」——真逐帧看了。
-- **生视频**（`gemini-video`）。`inner[49]=11` 提交异步任务，轮询 hNvQHb 拿
-  `contribution.usercontent.google.com` 下载链，取回 MP4（base64 data URL）。实测「日落
-  海浪」出真 10 秒 720p H.264+AAC 视频。**要 Pro/付费号**（自报 3.7 Flash）；免费号被
-  Google 视频内容政策拒时会明确报错。生成要几十秒到几分钟，客户端记得配长超时。
-- **自动删会话**（issue #19，配置 `auto_delete_conversation`，默认关）。出完结果自动删掉
-  gemini.google.com 上留下的这条会话（rpc GzXR5e），免得账号里堆一堆。只登录态生效，
-  异步 best-effort 不影响响应。
+- 支持多模态视频输入（`video_url` / `input_video`）与 `gemini-video` 视频生成（需登录态）。
+- 新增「自动删会话」开关（`auto_delete_conversation`，默认关闭），请求完成后异步清理账号会话记录。
 
 ## 4.12.0
 
 ### 修复
-
-- **agentic 客户端的工具循环收敛**（承接 #15）。Codex 这类客户端的命令成功结果是一段
-  带「Process exited with code 0 / Output:（空）」的包装文本；写文件、设值这类命令没有
-  stdout，弱模型（尤其匿名 3.6 Flash）把「无输出」当成「没干成」，于是换个写法一遍遍重试
-  ——实测「写 hello 到 a.txt」一个任务试了 26 种命令、90 秒不收敛（文件其实第一次就写对了）。
-  现在把工具结果压成一行清爽的成功/失败信号（✅ exit 0 并说明无输出是正常的、别重跑；
-  ❌ exit N），并在指令里加终止条款（看到成功就停、别重试同一件事）。实测同一任务从
-  26-27 轮降到 2-4 轮、且正常给出最终答复。只加终止条款不配清爽信号无效，两者要一起。
+- 精简工具执行成功/失败的返回格式与终止提示，避免 agentic 客户端在无输出命令上反复重试。
 
 ## 4.11.0
 
 ### 修复
-
-- **带 tools 的请求「已读乱回」**（issue #15）。agentic 客户端（Codex 等）发来的请求，中间
-  夹着几十 KB 客户端自带的开发者提示，里面写着「emit function calls to run terminal
-  commands」这类原生工具框架措辞，把我们放在最顶部的 ```tool_call``` 格式指令冲没——模型
-  于是答「我没有工具 / 无法访问文件系统」或答非所问。现在 `buildPrompt` 在所有消息之后
-  （紧挨用户问题）再锚一次工具格式（含一个行为化示例，明确唯一执行通道是 ```tool_call```、
-  不许写 ```powershell 代码块给用户看、一次只发一个），并放宽围栏正则以容错模型吐的 inline
-  变体（无换行）。实测 Codex 真实客户端下工具正常调用；有 tools 时普通对话不误触发。
-- **纯代码产物响应不再返空导致 502**。问数学 / 算式时模型直接跑代码、整条回复只有代码执行
-  产物，清洗掉 `?code_reference/stdout` 标记后为空，会被当「无内容帧」报 502。现在清洗后为空
-  时保留代码和结果、当普通代码块返回。
+- 在消息末尾重申工具调用格式指令，避免长开发者提示覆盖格式要求导致工具无法触发。
+- 修复纯代码执行产物响应在清洗后被误判为空内容而返回 502 的问题。
 
 ## 4.10.0
 
 ### 新增
-
-- **`gemini-canvas`（画布）**。生成 immersive 交互 HTML 文档。跟生图/音乐不同，产物是
-  HTML、**内联在响应里**（一个 ```html 代码块），不用另外下载。要 cookie，没配时不暴露。
-  实测返回完整的 `<!DOCTYPE html>…</html>` 交互网页（含脚本），客户端拿到后可提取渲染。
+- 新增 `gemini-canvas` 模型（需登录态），支持生成内联交互式 HTML 文档。
 
 ## 4.9.0
 
 ### 新增
-
-- **管理面板中英切换**（issue #13）。顶栏加了个语言按钮，默认中文，点一下切英文
-  （记在 localStorage）。约 190 条词条覆盖导航、KPI、表头、按钮、下拉、状态徽章、
-  运行时配置字段与提示、错误分类、连通性诊断、弹窗、部署表。带数字变量的插值句
-  （如"还能再打约 N 次"）保持中文。
+- 管理面板新增中英文界面切换。
 
 ## 4.8.0
 
 ### 修复
-
-- **生图取原图**（issue #14）。plain gg-dl 链默认下来是 ~500px（512×279）的缩略图；
-  在链尾加 `=s0` 取原始尺寸后拿到全分辨率（实测 1408×768）。格式仍是 PNG。
-- **媒体模型不再被多轮路径吞掉产物**。4.5.0 起把多轮 gate 放宽到带 tools 的请求时，
-  把媒体模型（生图/音乐）也放进了多轮路径，而多轮只处理文本——于是开了 `multi_turn`
-  再打 `gemini-image` / `gemini-music` 只回一句占位文本、没有图/乐。现在媒体模型始终
-  走带产物取回的那条路，跟 `multi_turn` 开关无关。
+- 生图下载链接追加原图尺寸参数以获取全分辨率图像。
+- 修复开启 `multi_turn` 时媒体模型请求被路由至纯文本多轮路径导致丢失图像/音频产物的问题。
 
 ## 4.7.0
 
 ### 新增
-
-- **`gemini-3.7-flash`（含 `-thinking` 版）**。Gemini 网页端按账号灰度放出 3.7 Flash，
-  接进来。要配 cookie，且**账号得已灰度到 3.7**，否则降级成 3.5 Flash-Lite（跟 3.1 Pro
-  一样，没 cookie / 没灰度就不给假成功）。
-
-  hex 用 3.7 条目的主 hex `56fdd199312815e2`（两个独立已灰度账号的 otAQ7b 清单里都是它、
-  有 3.7 号的用户实测发它回报 "3.7 Flash"）。没用 compat 列表里的 `797f3d0293f288ad`——
-  那是「当前 Flash」泛指针，老批次号发它拿到的是 3.6，会拿 3.6 冒充 3.7。
+- 接入 `gemini-3.7-flash` 及 `-thinking` 版本（需已灰度账号 Cookie）。
 
 ## 4.6.0
 
 ### 修复
-
-- **流式 `tool_calls` 补 `index` 字段**（issue #10）。流式 delta 里的每个 tool_call 少了
-  `index`，OpenAI 流式规范要求客户端靠它把分片的 tool_call 拼起来；漏了导致部分客户端
-  拼不起来。现在按顺序给每个补上。
+- 流式工具调用 `tool_calls` 增量补齐 `index` 字段，兼容 OpenAI 流式客户端拼接。
 
 ## 4.5.0
 
-### 修复
-
-- **`/v1/responses` 流式补全 item 生命周期事件**。以前只发 `response.created` 就直接推
-  `output_text.delta`，漏了先用 `response.output_item.added` + `content_part.added` 声明
-  item。严格的 Responses 客户端（Codex、zcode 等）收到不合规的事件序列会中途报错
-  （"OutputTextDelta without active item" / "Turn execution failed"），而 HTTP 请求本身
-  返回 200、chat 模式不受影响，所以面板看着正常、很难定位。现在补齐了 message 和
-  function_call 两种 item 的 added → content_part → done 完整生命周期。
-
 ### 新增
+- 新增可选「服务端多轮续接」（`multi_turn`，默认关闭），长对话仅增量发送最新消息以绕开单请求字节上限。
 
-- **可选多轮（`multi_turn`，默认关）**。开启后走 Gemini 原生 conversation_id 服务端续接：
-  客户端每轮重发全历史，服务端按"除最后一条外的历史"做指纹识别续接，命中就只发最后一句
-  新消息、历史留 Google 服务端，绕开单请求约 13 万字节的墙。登录 / 匿名都可用（匿名首轮
-  就地 GET /app 拿 session cookie 当会话载体，不需要账号）。带 tools 的 agentic 客户端
-  也走这条。
-
-  实测：两轮各 110KB、全量重发会撞字节墙报 400 的场景，续接只发新消息 → 200，长会话
-  不再撞墙。注意多轮**不放大模型的上下文窗口**——超出窗口的早期内容仍会被挤出（滑动窗口
-  留最近），它解决的是"长对话不撞单请求墙 + 保住最近上下文"，不是"喂超长文档"。
+### 修复
+- 补齐 `/v1/responses` 流式输出中 `message` 与 `function_call` 的完整 item 生命周期事件。
 
 ## 4.4.0
 
 ### 新增
-
-- **生图 / 音乐**。两个新模型 `gemini-image`（Nano Banana）和 `gemini-music`
-  （Lyria，约 30 秒），走 `/v1/chat/completions`。产物字节以 **base64 data URL** 直接
-  塞进返回的 `content`（图片 `![]`、音频 `[]`），不转外链——外链要 cookie 才下得到，
-  客户端拿不到。都要登录态，没配 cookie 时不进 `/v1/models`。
-
-  产物取回卡了很久的下载 403，根因三条（抓包 + 实测确认）：下载 host 只认 `.google.com`
-  域那 18 项 cookie（整串塞过去连 accounts 主机专属那几项一起发就 403）；图片链跨域
-  302，客户端默认不把 Cookie 带到新域（手动跟随、每跳重发解决）；图片响应给的是
-  `gg-dl` plain 链、GET 只回 text/plain 指针，真图要改成 `rd-gg-dl` 前缀。
-
-  base64 不计进 output token——一张图上百万字符，按它计费等于让用户为二进制买单。
-
-  实测：`gemini-image` → 512×279 PNG（106KB，可解码）；`gemini-music` → 744KB 合法 MP3。
+- 新增 `gemini-image` 生图与 `gemini-music` 音乐生成模型（需登录态，以 base64 data URL 返回且不计入输出 token）。
 
 ## 4.3.0
 
 ### 新增
-
-- **MCP server（web_search）**。除了 OpenAI 接口，同一个进程、同一个端口现在还挂了一个
-  MCP server 在 `/mcp` 上，把 Gemini 网页端的联网搜索暴露成一个 `web_search` 工具，
-  让 Claude Desktop / Claude Code / Cursor 这类 MCP 客户端「用 Gemini 去搜网」，
-  返回合成答案 + 来源链接。
-
-  传输走 HTTP（Streamable HTTP），部署成服务器后远程客户端连 URL 就能用，复用后端的
-  账号池 / 代理池 / 限流；匿名即可搜，不必挂 cookie。用同一把 API key 鉴权
-  （`Authorization: Bearer <key>`）。手写 JSON-RPC 2.0，不引第三方 SDK。
-
-  客户端配置见 README 的「MCP」一节。`web_search(query)` 返回答案，末尾附 `Sources:`
-  来源清单。
-
-- **解析联网搜索的来源**。以前只返回答案文本，把 grounding 来源丢了；现在从响应帧里
-  抠出每条来源的 url / 标题 / 摘要，去掉 URL 尾部的 `#:~:text=` 片段锚。当前用在 MCP
-  的 `web_search` 上，OpenAI 接口的响应不受影响。
+- 新增 `/mcp` Streamable HTTP 服务，提供基于 Gemini 联网搜索的 `web_search` 工具并附带来源链接清单。
 
 ## 4.2.0
 
 ### 新增
-
-- **扩展思考：三个模型都能开**。新增 `gemini-3.6-flash-thinking` /
-  `gemini-3.5-flash-lite-thinking` / `gemini-3.1-pro-thinking`，服务端回报的模型名
-  带 `Extended`，思考链实测 2467 / 1059 / 583 字符（对应普通版 0 / 0 / 268）。
-  跟 3.1 Pro 一样只在挂了 cookie 时暴露 —— 匿名请求带上这个开关会被服务端静默忽略
-  （用完整 header 复测过，不是我们发漏了）。
-
-  它是网页 UI 上「扩展思考」那个开关，跟模型正交，不是三个额外的模型。
-
-  **开关在模型 header 里，不在 payload。** 我们原来只发 5 个元素的最小形式
-  `[1,null,null,null,"<hex>"]`，浏览器发的是 18 个元素，下标 14 = 模型 MODE、
-  下标 15 = 思考位。只填 payload 里的 `inner[80]=2` 实测三个模型思考链全是 0 字符，
-  补上 header 才生效 —— 跟模型选择本身「header 压过 inner[79]」是同一个规律。
-
-  配套：`inner` 从 80 槽扩到 97 槽（浏览器就是 97-98 槽，`inner[80]` 在 80 长度的
-  数组里连位置都没有）；补发 `x-goog-ext-525005358-jspb` 以及固定值的
-  `x-goog-ext-73010989-jspb` / `-73010990-jspb`；补 `inner[91]` / `inner[96]`。
-  补完之后跟浏览器逐槽比对只差 `[3,4]` —— botguard token 和它配对的 nonce，
-  那两个服务端不认我们算的，是故意不发的。
-
-### 修复
-
-- **死号自动停用**：连续 3 次鉴权失败（只有 401/403 算）自动改成 disabled。以前
-  `fail_count` 只累加不处理，而挑号是 `ORDER BY fail_count ASC` —— 坏号排在最后，
-  但池子里只剩坏号时照样会被选中，于是每个请求都要先为它付一次 XSRF 往返才轮到
-  报错。停用不删除：cookie 是用户导入的数据，判断可能出错，留着让用户自己决定。
-- **刷新 cookie 前校验身份**：合并 Set-Cookie 后如果 `SAPISID` 或 `__Secure-1PSID`
-  变了就整个丢弃不写。不校验的话，上游若在响应里换掉整套会话，A 号的凭据会被静默
-  写进 B 号那一行 —— 面板上显示的还是原标签，实际发出去的是别人的会话。
-- **cookie 失效前先救一次**：取不到 XSRF token 时先强制轮转一次再重取，救不回来才
-  换下一个账号。以前直接换号，等于放弃一个可能只是 cookie 陈旧的号。
+- 新增 `gemini-3.6-flash-thinking`、`gemini-3.5-flash-lite-thinking` 与 `gemini-3.1-pro-thinking` 扩展思考模型（需登录态）。
 
 ## 4.1.1
 
 ### 修复
-
-- **面板反代到子路径下打不开**（比如 `example.com/gemini/admin`）。`index.html` 里
-  30 处地址都是绝对的，浏览器按站点根解析，全落到 `example.com/admin/api/…`，前缀
-  丢了。现在改成相对地址。
-
-  顺带说清一个坑：**光改成相对地址不够**。相对地址是按文档 URL 的**目录**解析的，
-  而 `/admin` 和 `/admin/` 的目录差一层——`api/stats` 在 `/gemini/admin/` 下解析成
-  `/gemini/admin/api/stats`（对），在 `/gemini/admin` 下解析成 `/gemini/api/stats`
-  （错）。所以服务端会把 `/admin` 301 到 `admin/`，把文档 URL 统一到带斜杠的形式。
-  Location 用的是**相对值**——写成 `/admin/` 的话浏览器会跳到站点根，前缀又丢了。
-
-  反代不需要任何额外配置，把 `/前缀/` 转发到本服务的 `/` 即可。
+- 管理面板静态资源与接口路径改为相对路径，支持反代挂载至子路径下访问。
 
 ## 4.1.0
 
-### ⚠️ 破坏性变更
-
-- **代理和 cookie 各自只剩一个入口**：代理只认「代理池」页面，cookie 只认
-  「Cookie 池」页面。「设置」页的「静态代理」输入框、cookie 卡片的单 cookie 输入
-  和 `/admin/api/cookie` 端点都已移除。
-
-  为什么不是"多一个简单选项"而是必须删：这两条单例路径走的都是"ID=0"那条分支，
-  于是跟直连共用同一个限流 slot、健康度回写函数开头就 `id<=0 return` 直接跳过。
-  结果是 fail_count 恒为 0、last_ok_at 恒为空、没有轮转、没有熔断冷却，面板上还
-  看不出流量到底走了代理还是直连（实测：迁移前走静态代理的请求在 requests 表里
-  记的是 `proxy_id=0`，跟真直连无法区分）。池子里放一个，处处严格更好。
-
-  **升级时自动迁移，且不动你原来的值**：kv 里存的静态代理和单 cookie 会在首次
-  启动时搬进对应的池子，原值原样留着（所以回滚到 4.0.0 依然可用）。迁移只在
-  **入池成功后**才记"已迁移"，失败就留到下次启动重试 —— 4.0.0 对静态代理字段
-  零校验，存的可能是缺 scheme 的 `1.2.3.4:8080`，先清值再入池会让它凭空消失。
-
-- **`--proxy` / `--cookie-file` 改成声明式跟随**：值变了替换池子里对应的那一条，
-  而不是再加一条。值没变时完全不碰池子，你在面板上的增删改停用都以面板为准。
-  轮换 `cookie.txt` 的部署尤其要注意这个变化 —— 按值去重的话会一次次往池子里堆
-  死 cookie，而它们仍然 enabled、仍然参与轮转。
-
-- **`--proxy` / `--cookie-file` / `config.json` 降级成播种参数**。它们不再是"第二套
-  配置"，只在启动时把值导入池子（按 URL / cookie 内容去重），之后一律以池子为准。
-  改了重启即生效。原来 `--proxy` 的语义是"代理池为空时的兜底"，而且**一旦你在面板
-  保存过一次设置，kv 里就有了完整记录，`--proxy` 就永远不再生效**——改 compose 会
-  发现没用。现在没有这个坑了。
+### 破坏性变更
+- 统一代理与 Cookie 配置入口至各自管理池，移除旧版单例代理/Cookie 输入框及 `/admin/api/cookie` 接口（升级时自动迁移）。
+- `--proxy` / `--cookie-file` / `config.json` 调整为启动播种参数，变更时声明式更新池内对应条目。
 
 ### 新增
-
-- **超长请求不再让上游吃掉你刚问的那句**。上游单请求约 **13 万 UTF-8 字节**封顶，
-  超了**从尾部静默截断**且不报错；而我们按顺序拼 prompt、最新消息在末尾 ——
-  被截掉的正好是用户刚问的话，模型只看到前面的系统前言，回一句通用开场白，
-  既不答题也不调工具。表现看着像"模型变笨"或"工具支持不好"。
-
-  现在分两种情况：
-
-  - **挂了 cookie**：超长的对话自动转成 `message.txt` 附件发上去，请求体里只剩
-    一句短指令，那堵墙就绕过去了。**但附件也有上限**——模型能看到的内容合计
-    约 16 万字节，超出部分传上去了但读不到。所以这条路把可用长度从 13 万提到
-    约 16 万，是有限的改善，真正的长对话仍需客户端自己压缩。
-    （上传失败时**不静默退回内联**：那样上游会截掉最新提问，客户端拿到一个
-    答非所问的 200 却看不出问题，宁可明确报错。）
-  - **没挂 cookie**：直接返回 400 + `context_length_exceeded`，错误信息里提示
-    导入 cookie 可以拿到更长的上限。匿名态能把文件传上去，但在对话里引用会被
-    服务端拒绝，所以匿名没有别的办法。
-
-  **不自己丢历史**：那还是静默丢数据，只是换了个地方丢，客户端以为整段都发出去了、
-  模型却忘了东西。`context_length_exceeded` 是 OpenAI 兼容客户端认得的信号，
-  agentic 客户端收到会自己压缩上下文再试，比我们盲丢几段聪明得多。
-
-  上限 `max_prompt_bytes` 默认 128000，可在面板改，0 = 关掉检查。
-  **单位是 UTF-8 字节不是 token**：实测上游的墙按字节走，跟语言无关 —— 中英文
-  对齐到同一字节数各打 3 次，约 129,950 字节各 3/3 通过、135,990 字节各 1/3，
-  而同一批请求的 token 数差 1.9 倍。按 token 设阈值的话，同一个数字对英文偏松、
-  对中文会卡在真实容量的三分之一左右。
-
-- **读图（挂 cookie 时）**：`/v1/chat/completions` 的 `image_url` 和 `/v1/responses`
-  的 `input_image` 现在会真的传给模型。支持 `data:` URL 和 http(s) 链接（后者下载
-  下来再传——直接把链接给上游是不行的，它只认自己存储里的附件），单张 12MB 封顶。
-  远程图走跟对话同一个出口，不然等于多暴露一个 IP。匿名态不支持，理由同上。
-
-- **Cookie 自动续期**。上游几乎每个响应都会用 `Set-Cookie` 刷新 `SIDCC` /
-  `__Secure-1PSIDCC` / `__Secure-3PSIDCC`，浏览器收下就一直是活的；我们以前只发不收，
-  我们以前只发不收，存的那份就一直是导入时的旧值。现在每次请求都把刷新的项合并
-  回账号，跟浏览器行为一致。
-
-  **但这没能延长账号寿命**：同一来源的 cookie，带续期+保活的活了 86 分钟，两者都
-  没有的活了 114 分钟（n=3，且都是跟真实浏览器共用同一个会话，很可能是两边各自
-  轮转 SIDCC 撞在一起）。所以这条只声明"跟浏览器行为一致"，不声明"号能活更久"
-  —— 账号到底为什么一两小时就死，还没查清。
-
-- **会话保活**。浏览器每 10 分钟往 `accounts.google.com/RotateCookies` 打一次，
-  间隔由服务端在页面里指定（响应体 `[["identity.hfcr",600],…]` 的 600 秒）。
-  这个调用**也会**返回 Set-Cookie，刷的是跟上一条同一组三项（两份抓包 12 次里 9
-  次、15 次里 14 次），所以同样要合并回账号。整份抓包里没有任何响应重设过
-  `__Secure-1PSIDTS`。失败**不计入 cookie 健康度**：打的是
-  `accounts.google.com`，跟对话能不能用是两码事，网络抖一下就把号标坏会让它在
-  挑号时沉底，反而伤可用性。
-
-- **Cookie 池加「检测」按钮**，点一下就知道这个号还能不能用，不用发一次真实对话去试。
-  区分"登录态有效"和"过期/无效"——后者上游并不拒绝，只是把你当匿名，光看请求成功
-  是分不出来的。
-
-- **导入 Cookie 弹窗改成两种填法**，默认「整串粘贴」：直接把浏览器复制的
-  `name=value; name=value; …` 贴进来即可，这也最接近真实浏览器发出去的形态。
-  想逐项填的切到另一个 tab。
-
-- **cookie 失效时换下一个账号**，不再让整个请求陪葬。以前挑中的号一坏，这次请求
-  就直接失败，池子里其它好号完全没机会——池子越大反而越容易踩雷。
-
-- **每个 cookie 账号粘住自己的出口**。以前 cookie 池和代理池各自独立轮转，同一个
-  Google 账号会从几十个不同 IP 发出请求，这在 Google 眼里是账号共享的典型特征。
-  现在账号首次用到哪个出口就绑定下来，之后一直走它，出口不可用了才换。
-
-- **请求记录带上用了哪个 cookie 账号**（失败的记录也带），面板上直接看得到是哪个号
-  在出问题，不用再靠时间去猜。没挂 cookie 的显示「匿名」。
-
-- **真流式补齐最后两条路**：`/v1/responses` 现在推 `response.output_text.delta`，
-  带 `tools` 的 `/v1/chat/completions` 也边出边发。以前这两条都是收完再发，因为
-  ```` ```tool_call ```` 围栏要完整文本才能解析。现在正文过一道增量闸门，只放行
-  **确定不在围栏里**的部分——尾巴上压着半个开围栏（`` `` `` 或 `` ```tool_c ``）
-  也要扣住等下一帧，先发出去再发现是围栏就晚了。实测流式与非流式结果逐字相同。
-- **代理熔断改冷却制**：连续失败 5 次熔断后默认歇 120 分钟自动放回池子，时长可在
-  「设置」页改，0 = 退回旧的永久除名。120 这个数照实测来的——被 Google 拦掉的出口
-  106-121 分钟自动恢复。以前熔断即永久除名，也就永远等不到一次成功把计数清零，
-  只能手动重置。
-- **两个降级开关，默认都关**（保持旧行为，打开是明确选择）：
-  - `fallback_direct`：代理池一个出口都用不上时退回直连。关着返回 429，本机 IP
-    不会暴露给上游；开了会写日志说明这次走了直连。
-  - `fallback_anon`：cookie 失效时降级匿名继续跑。关着直接报错——cookie 失效后
-    上游并不拒绝，只是把你当匿名用户，`3.1 Pro` 被静默降级成 `3.5 Flash-Lite`、
-    思考链消失，客户端完全看不出来，所以默认宁可明确失败。
-- **`bl` 版本号自动跟随上游**：每 6 小时从 `/app` 页面抓一次，形状对不上或抓不到
-  就继续用配置里钉的值。可在「设置」页关掉。
+- 超长对话在登录态下自动转为 `message.txt` 附件发送，未登录时明确返回 `400 context_length_exceeded`（可通过 `max_prompt_bytes` 配置上限）。
+- 登录态下支持图片输入（`image_url` / `input_image`，单张上限 12MB）。
+- 支持请求与保活响应中刷新 `SIDCC` 等 Cookie 写回账号池，新增账号检测按钮、整串 Cookie 粘贴导入、失败自动换号及账号粘性绑定代理出口。
+- 补齐 `/v1/responses` 与带 `tools` 请求的真流式输出。
+- 代理熔断改为冷却机制（连续失败 5 次默认冷却 120 分钟后恢复），新增 `fallback_direct` 与 `fallback_anon` 降级开关（默认关闭）。
+- 支持定时自动跟随上游 `bl` 版本号。
 
 ### 修复
-
-- **容器起不来，报 `unable to open database file (14)`**。镜像以 nonroot(uid 65532)
-  运行，而 bind mount 会用宿主目录的属主盖掉镜像里 `/data` 的属主；宿主上目录不
-  存在时 Docker 自动建、属主是 root，于是写不进去。compose 默认改成具名卷，
-  bind mount 保留为注释并写明要先 `sudo chown -R 65532:65532 ./data`。报错信息也
-  改成把当前 uid、目录和两种解法一起打出来 —— 14 是 SQLITE_CANTOPEN，光看字面
-  没人会想到是权限。
-
-- **设了 `HTTP_PROXY` / `ALL_PROXY` 却没生效且毫无提示**。本程序有意不读这些环境
-  变量（宿主机上随手一个 export 会悄悄改变出口 IP，而面板仍显示直连），但"不读"
-  和"不吭声"是两回事。现在启动时检测到它们、且代理池为空，会打一行说明。
-
-- **偶发绕过代理走直连**。`loadProxies` 的 `Scan` 出错走 `continue`、`rows.Err()`
-  根本不查，遍历中断被当成正常读完，于是代理列表被半截结果甚至空列表覆盖；而
-  「有没有配代理池」正是拿这个列表长度判断的，一空就退回直连，把部署者的真实 IP
-  暴露给上游，日志上只是几条普通请求。触发条件是每个请求结束都全表重读一次代理表，
-  和自己刚发出的 UPDATE 在 WAL 上撞 SQLITE_BUSY。现在读失败保留上一次的池子，
-  且结果回写只改内存里那一条，不再整表重读。
-- **空响应不重试**。上游偶尔返回 HTTP 200 但一个内容帧都没有（瞬时拒绝），旧代码
-  只在非 200 或网络错误时重试，于是一次可自愈的抖动直接变成客户端可见的 502。
-  判据是**有没有内容帧**，不能用 `BardErrorInfo`——正常响应的结束帧里也带错误码。
-- **`inner[41]` 跟浏览器不一致**：我们发 `[2]`，浏览器三种场景抓包全是 `[1]`。
-  这个值是早期抄来的，协议层已被证伪。
-
-### 文档更正
-
-- **「放慢节奏没用」是错的**。旧判据是住宅出口上突发档 103-177 与慢速档 81-166
-  几乎完全重叠。观察没错，归因错了——住宅出口跑久了自己退化（8 个预筛干净的出口
-  跑慢节奏，6 个中途失败率超 40%），退化的方差盖过了节奏。换静态 IP 排除这个混淆项
-  后：同一个 IP 突发打在 **188 次**被拦，改成 **10 次/分钟连打 800 次、跨 110 分钟
-  一次没被拦**。所以 `per_ip_rph=80` 是突发档的保守下沿，按低速率跑可以调高很多。
-- **被拦后的恢复时长**从「未测」补成实测 **106-121 分钟**。
-- 面板和代码注释里残留的「约 85 次」全部换成实测区间。
+- 优化非 root 容器数据库目录权限错误提示。
+- 启动时检测到未生效的环境变量代理且代理池为空时输出提示日志。
+- 修复代理列表读取异常时可能误覆盖为空列表导致绕过代理直连的问题。
+- 修复上游偶发返回 HTTP 200 但无内容帧时未自动重试的问题，并修正请求载荷协议字段。
 
 ## 4.0.0
 
-### ⚠️ 破坏性变更
-
-- **移除 5 个旧模型别名**：`gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
-  `gemini-3.5-flash-thinking-lite`、`gemini-auto`、`gemini-flash-lite` 传了会返回
-  **400**。它们在服务端没有对应条目，实际全都落到同一个后端，留着只会让人以为有
-  五种模型可选。现在只暴露服务端清单里真实存在的三个：`gemini-3.6-flash`、
-  `gemini-3.5-flash-lite`、`gemini-3.1-pro`。
-  **升级前请检查客户端配的模型名。**
-
-数据库无需迁移，建表语句都是 `IF NOT EXISTS`，老库直接可用。
+### 破坏性变更
+- 移除 5 个旧模型别名（`gemini-3.5-flash`、`gemini-3.5-flash-thinking`、`gemini-3.5-flash-thinking-lite`、`gemini-auto`、`gemini-flash-lite`），仅保留真实存在的模型，请求旧别名将返回 `400`。
 
 ### 新增
-
-- **Cookie 池**：可导入多个 Google 登录态账号，请求按最久未用优先自动轮转，池空
-  才回落到「设置」页的单 cookie。列表只显示脱敏摘要（cookie 数量 / 关键项是否齐全 /
-  SAPISID 末 4 位 / 失败次数），完整 cookie 不出网。
-- **思考链（`reasoning_content`）**：`gemini-3.1-pro` 每次回答前的推理过程现在会
-  暴露出来。非流式放 `message.reasoning_content`，流式按 `delta.reasoning_content`
-  推，且思考块全部推完才开始推正文（跟上游顺序一致）。token 单列在
-  `usage.reasoning_tokens`，**不计入 `completion_tokens`**——客户端默认折叠不展示，
-  算进去等于让用户为看不见的输出买单。
-- **管理面板改版**：改用 Gemini 设计语言的亮色主题，列表定高撑满视口 + 分页，
-  错误按「该怎么办」分类，首屏主角换成「距离封禁红线」。
-- **多架构容器镜像**：push 到 main 或打 tag 时自动构建并推送到 ghcr。
+- 新增多账号 Cookie 池与最久未用轮转机制。
+- `gemini-3.1-pro` 支持输出 `reasoning_content` 思考链与独立 `reasoning_tokens` 统计。
+- 管理面板视觉改版并新增多架构容器镜像构建。
 
 ### 修复
-
-- **配了有效 cookie 会导致所有请求 400**。带 cookie 的请求必须额外携带 XSRF token
-  （表单字段 `at`），我们只发了 `f.req`。匿名请求不要求这个字段，所以这个缺陷长期
-  没暴露——只要挂上**有效** cookie，cookie 功能就是 100% 不可用；而挂一个**过期**
-  cookie 反而"正常"（被当匿名处理），正好把问题盖住了。现在会自动从 Gemini 页面取
-  token、按 cookie 缓存、过期自动重取。
-- **Cookie 池的健康度从来没被回写过**。`markAccountResult` 是死代码，`fail_count`
-  恒为 0、`last_ok_at` 恒为空，而面板把这两列显示出来了——等于给运维看一份「永远
-  全部健康」的假报表。现在请求结束会回写，且**只把 401/403 算作 cookie 的错**：
-  网络错误、代理失败、被 Google 拦（302）一律不计，否则住宅代理的高失败率会让
-  这个数字变成代理噪音，好 cookie 反而被记成失败最多的那个。
-- 管理面板若干显示缺陷：趋势图无限变高、登录卡被拉满高、按钮溢出卡片、点击当前
-  页会整页重渲染。
-- 设置页从 2234px 压到 1075px：12 个配置项按语义分成四组、组内自适应多列。
-
-### 文档更正（都是被实测推翻的旧结论）
-
-- **`gemini-3.1-pro` 配了有效 cookie 是真能用的**。旧文档写「免费号即使登录也只
-  拿到 3.6 Flash」——那个观察是在缺 XSRF token 的条件下得到的，当时带 cookie 的
-  请求根本发不出去。补齐后连打 6 次全部回报 `3.1 Pro`，且每次都带思考链。
-- **单 IP 上限**从「约 85 次」改成实测区间 **80–180 次**，并写清它主要由**连接
-  策略和出口质量**决定，不由请求快慢决定：同样并发 10，复用连接池能打到 172/177，
-  每次新建连接只有 106/109。
-- **走代理时 Google 看到的是我们自己的 TLS 指纹**，不是出口节点的（JA3 实测：
-  stdlib 直连与过代理同指纹，同一代理下换 tls-client 则不同）。代码注释原来写反了。
-  但实测这不影响封禁阈值，所以没有因此改实现。
+- 自动抓取并缓存 XSRF token，修复带有效 Cookie 请求返回 400 的问题。
+- 修复 Cookie 池健康度未回写的问题，仅将 401/403 计入账号失败次数。
+- 修复管理面板若干布局与重渲染问题。
 
 ## 3.0.0
 
-单二进制 OpenAI 兼容反代 + 中文管理面板。
+- 单二进制 OpenAI 兼容反代与中文管理面板。
