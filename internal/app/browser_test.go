@@ -66,7 +66,19 @@ type fakeCDPServer struct {
 	done     chan struct{}
 
 	holdReplies atomic.Bool
-	muteFetch   atomic.Bool
+	// holdSetCookies 只扣住 Storage.setCookies 的自动回复（R5-6）：
+	// 其余方法（含 Target.disposeBrowserContext）照常即时应答——
+	// 测试据此精确撑开「热注入在飞」窗口而不阻塞摘除清理路径。
+	holdSetCookies atomic.Bool
+	// createBCDelay>0 时 Target.createBrowserContext 延迟这么久才回复
+	//（R5-4：模拟成功回复晚于构建截止的迟到 BrowserContext 泄漏场景）。
+	createBCDelay atomic.Int64 // 纳秒
+	// holdCreateBC 扣住 Target.createBrowserContext 的自动回复（R6-3）：
+	// bcID 照常分配、bcStore/createBCHit 照常登记——测试拿到调用记录与
+	// 分配 ID 后自行决定何时手工放行确定回复（可控回复屏障，不再依赖
+	// 固定延迟与 10s 收割窗竞争）。
+	holdCreateBC atomic.Bool
+	muteFetch    atomic.Bool
 	// cookiesJSON 非 nil 时 Network.getCookies 返回它（测试注入持久 Jar）。
 	cookiesJSON atomic.Value // json.RawMessage
 
@@ -80,6 +92,18 @@ type fakeCDPServer struct {
 	pageReady    atomic.Value // string
 	pageNavDelay atomic.Int64 // 纳秒
 	navErrorText atomic.Value // string
+	// navChromeError 非零时：Page.navigate 返回 RPC 成功且**无 errorText**，
+	// 但活动文档停在 chrome-error://chromewebdata/（opaque origin "null"、
+	// readyState 恒为 complete）——模拟真实 Chromium 的另一种导航失败
+	// 表现（Oracle OBS-1）：不切回目标源、不推 loadEventFired。
+	navChromeError atomic.Bool
+	// navRedirectURL 非空时：Page.navigate 后（延迟 pageNavDelay）活动文档
+	// 落地该 URL 而不是 gemini.google.com——模拟跨源 302 重定向终态
+	//（accounts.google.com 登录页 / www.google.com/sorry 风控页），
+	// pageOrigin 取该 URL 的 origin、pageHref 带完整 URL。
+	navRedirectURL atomic.Value // string
+	// pageHref 非空时：navigateAndWaitApp 探针追加 "\n"+href（location.href）。
+	pageHref atomic.Value // string
 
 	// 多 BrowserContext / 多 session 支持（v6.6.0）：
 	// bcSeq/sessSeq 生成唯一 ID；bcStore 按 browserContextId 存各自的
@@ -97,11 +121,18 @@ type fakeCDPServer struct {
 	failMethods sync.Map // map[string]bool
 }
 
-// createBCCall 记录一次 Target.createBrowserContext 的参数（测试断言用）。
+// createBCCall 记录一次 Target.createBrowserContext 的参数与分配到的
+// bcID（测试断言用；R5-4 靠 bcID 核对迟到收割发出的 dispose 目标）。
+// seq 是本 fake 服务端内单调递增的创建序号（R9-6）：跨子例共享的缓冲
+// createBCHit 可能残留上一个账号正常创建的未消费 hit——拿 hit 的子例
+// 必须按 seq 关联本次自己的创建（记下扣留前的基线，只认 seq 更大的
+// hit），绝不能误取上一账号的 ID。
 type createBCCall struct {
 	id              int64
+	bcID            string
 	proxyServer     string
 	disposeOnDetach bool
+	seq             int64
 }
 
 type cdpCall struct {
@@ -256,6 +287,11 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	if s.holdReplies.Load() || m.Method == "Never.Returns" {
 		return
 	}
+	if s.holdSetCookies.Load() && m.Method == "Storage.setCookies" {
+		// 只扣住热注入/播种写回的自动回复（R5-6）：disposes 与其余方法
+		// 不受影响，测试经 gotCalls 拿到调用后手工决定何时回复。
+		return
+	}
 	if _, bad := s.failMethods.Load(m.Method); bad {
 		go s.sendText([]byte(fmt.Sprintf(
 			`{"id":%d,"error":{"code":-32000,"message":"injected %s failure"}}`,
@@ -266,7 +302,8 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 	result := json.RawMessage(`{}`)
 	switch m.Method {
 	case "Target.createBrowserContext":
-		bcID := fmt.Sprintf("bc-%d", s.bcSeq.Add(1))
+		bcSeq := s.bcSeq.Add(1)
+		bcID := fmt.Sprintf("bc-%d", bcSeq)
 		var p struct {
 			ProxyServer     string `json:"proxyServer"`
 			DisposeOnDetach bool   `json:"disposeOnDetach"`
@@ -275,9 +312,33 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 		s.bcMu.Lock()
 		s.bcStore[bcID] = map[string]string{}
 		s.bcMu.Unlock()
+		// R8-7（Reviewer MF-7）：先读取并固定本次是否扣留，再公布
+		// createBCHit——测试在拿到 hit 后做的第一件事常是 Store(false)
+		// 或依赖「hit 之前的 Store(true) 一定生效」。若先公布 hit 再读
+		// hold 标志，hit 送达与标志读之间存在竞态窗口：测试协程先收到
+		// hit、认为本次必扣留，而本处理协程随后读到的是已被改回 false
+		// 的新值而自动回复（或相反顺序），扣留决策与测试看到的 hit
+		// 公布次序不一致，用例随机 flakes。hold 是本次调用的局部决策，
+		// 一经固定绝不随后续 Store 翻转。
+		hold := s.holdCreateBC.Load()
 		select {
-		case s.createBCHit <- createBCCall{id: m.ID, proxyServer: p.ProxyServer, disposeOnDetach: p.DisposeOnDetach}:
+		case s.createBCHit <- createBCCall{id: m.ID, bcID: bcID, proxyServer: p.ProxyServer, disposeOnDetach: p.DisposeOnDetach, seq: bcSeq}:
 		default:
+		}
+		if hold {
+			// R6-3：可控回复屏障——扣住自动回复，测试经 createBCHit 拿到
+			// (id, bcID) 后决定何时手工放行成功回复。
+			return
+		}
+		if d := time.Duration(s.createBCDelay.Load()); d > 0 {
+			// R5-4：延迟回复模拟「成功回复晚于构建截止」——回复经独立
+			// 协程在延迟后发出，不阻塞 readLoop 处理其它方法。
+			go func(id int64, bcID string) {
+				time.Sleep(d)
+				_ = s.sendText([]byte(fmt.Sprintf(
+					`{"id":%d,"result":{"browserContextId":%q}}`, id, bcID)))
+			}(m.ID, bcID)
+			return
 		}
 		result = json.RawMessage(fmt.Sprintf(`{"browserContextId":%q}`, bcID))
 	case "Target.disposeBrowserContext":
@@ -333,6 +394,16 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 				`{"frameId":"frame-1","errorText":%q}`, et.(string)))
 			break
 		}
+		if s.navChromeError.Load() {
+			// chrome-error:// 导航失败变体：RPC 成功、无 errorText，但活动
+			// 文档停在 chrome-error://chromewebdata/（opaque origin）——
+			// 不切目标源、不推 loadEventFired。
+			s.pageOrigin.Store("null")
+			s.pageReady.Store("complete")
+			s.pageHref.Store("chrome-error://chromewebdata/")
+			result = json.RawMessage(`{"frameId":"frame-1","loaderId":"loader-1"}`)
+			break
+		}
 		// 模拟真实导航：返回响应时活动文档仍是旧文档；延迟 navDelay 后
 		// 切 origin 并推 Page.loadEventFired（sessionId 与请求一致）。
 		delay := time.Duration(s.pageNavDelay.Load())
@@ -340,8 +411,22 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 			if delay > 0 {
 				time.Sleep(delay)
 			}
-			s.pageOrigin.Store("https://gemini.google.com")
-			s.pageReady.Store("complete")
+			if rv := s.navRedirectURL.Load(); rv != nil && rv.(string) != "" {
+				// 跨源重定向终态：落地 navRedirectURL（登录页/风控页），
+				// 绝不切回 gemini.google.com。
+				target := rv.(string)
+				org := "null"
+				if u, err := url.Parse(target); err == nil && u.Host != "" {
+					org = u.Scheme + "://" + u.Host
+				}
+				s.pageOrigin.Store(org)
+				s.pageReady.Store("complete")
+				s.pageHref.Store(target)
+			} else {
+				s.pageOrigin.Store("https://gemini.google.com")
+				s.pageReady.Store("complete")
+				s.pageHref.Store("")
+			}
 			s.pushEvent(sessionID, "Page.loadEventFired",
 				map[string]interface{}{"timestamp": 1})
 		}(m.SessionID)
@@ -350,6 +435,7 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 		// 模拟真实浏览器：新 attach 的 page 起于 about:blank。
 		s.pageOrigin.Store("null")
 		s.pageReady.Store("complete")
+		s.pageHref.Store("")
 		result = json.RawMessage(`{}`)
 	case "Runtime.evaluate":
 		switch {
@@ -359,7 +445,11 @@ func (s *fakeCDPServer) handleClientMessage(msg []byte) {
 			// navigateAndWaitApp 的终核：按当前模拟 origin 回
 			// "origin/readyState"——about:blank 的 origin 是 "null"，
 			// 导航 /app 后应切到 https://gemini.google.com。
+			// pageHref 非空时追加 "\n"+href（跨源重定向单测精确注入完整 URL）。
 			val := s.pageOrigin.Load().(string) + "/" + s.pageReady.Load().(string)
+			if hv := s.pageHref.Load(); hv != nil && hv.(string) != "" {
+				val += "\n" + hv.(string)
+			}
 			result = json.RawMessage(fmt.Sprintf(
 				`{"result":{"type":"string","value":%q}}`, val))
 		case strings.Contains(string(m.Params), "document.readyState"):
@@ -1132,6 +1222,127 @@ func TestBrowserPreHeaderErrorFastWake(t *testing.T) {
 	if !strings.Contains(err.Error(), "Failed to fetch") {
 		t.Fatalf("pre-header error should carry page fetch message, got: %v", err)
 	}
+}
+
+// TestBrowserNavProbeFastFailAndWaitWhitelist 复核 R3-8（Oracle OBS-1）与
+// R4-4（Reviewer MF-4）的合并行为级回归（R3-8 精简：about:blank 对照并入
+// 本条导航用例，不再单开同分支冗余用例）：
+//   - chrome-error 快速失败：Page.navigate 返回 RPC 成功且无 errorText、
+//     但页面停在 chrome-error://chromewebdata/ 时必须毫秒级快速失败
+//     （页内上游错误），绝不落地后白等 browserAppNavTimeout 导航超时；
+//   - 未识别页面继续等待直至超时：探针诊断只留 origin/readyState 白名单
+//     （R4-4）——href 的 path/query/fragment 标记绝不进超时报错；
+//   - about:blank 对照继续等待不误杀（evalNavProbeResult 直接断言）。
+func TestBrowserNavProbeFastFailAndWaitWhitelist(t *testing.T) {
+	t.Run("chrome-error 快速失败", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		cleanup := wireTestBrowser(t, srv)
+		defer cleanup()
+		m := browserMgr
+
+		setRuntimeCfg(t, func(c *RuntimeConfig) {
+			c.BrowserTransport = true
+			c.FallbackDirect = true
+		})
+
+		srv.navChromeError.Store(true)
+		id, err := accountInsert("chromeerr", "SAPISID=ce1; __Secure-1PSID=cp1; SID=cs1", "")
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		defer accountDelete(id)
+		acct := accountByID(id)
+		acct.ProxyID = proxyIDDirect
+
+		t0 := time.Now()
+		_, _, _, _, aerr := m.acquireAccountCtx(context.Background(), acct, "", true, true)
+		dt := time.Since(t0)
+		if aerr == nil {
+			t.Fatal("chrome-error 落地页的建槽必须失败")
+		}
+		if dt > 8*time.Second {
+			t.Fatalf("chrome-error 落地耗时 %v——必须快速失败而不是白等 18s 导航超时", dt)
+		}
+		if !strings.Contains(aerr.Error(), "chrome-error") {
+			t.Fatalf("错误必须点名 chrome-error，得到: %v", aerr)
+		}
+		if isBrowserLocalError(aerr) {
+			t.Fatalf("chrome-error 是页内上游故障，绝不能归 browserLocalError: %v", aerr)
+		}
+		if got := classifyFailoverError(aerr); got != classNetFail {
+			t.Fatalf("chrome-error 应归 classNetFail，得到 %v", got)
+		}
+	})
+
+	t.Run("未识别页面等待至超时且诊断白名单", func(t *testing.T) {
+		srv := newFakeCDPServer(t)
+		defer srv.close()
+		cleanup := wireTestBrowser(t, srv)
+		defer cleanup()
+		m := browserMgr
+
+		setRuntimeCfg(t, func(c *RuntimeConfig) {
+			c.BrowserTransport = true
+			c.FallbackDirect = true
+		})
+		// 缩短导航预算让「继续等待」在测试时间内走完超时分支。
+		oldNavTimeout := browserAppNavTimeout
+		browserAppNavTimeout = 1200 * time.Millisecond
+		defer func() { browserAppNavTimeout = oldNavTimeout }()
+
+		// 导航落地一个未识别页面（既非目标源也非登录页/sorry）：带敏感
+		// path/query/fragment 标记——必须继续等待至超时，且错误串绝不泄露
+		// 这些标记（R4-4：observed/lastObserved 只留 origin/readyState）。
+		srv.navRedirectURL.Store("https://unrecognized.example.com/secret-path?token=xyz#frag")
+		id, err := accountInsert("navwait", "SAPISID=nw1; __Secure-1PSID=np1; SID=ns1", "")
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		defer accountDelete(id)
+		acct := accountByID(id)
+		acct.ProxyID = proxyIDDirect
+
+		t0 := time.Now()
+		_, _, _, _, aerr := m.acquireAccountCtx(context.Background(), acct, "", true, true)
+		dt := time.Since(t0)
+		if aerr == nil {
+			t.Fatal("未识别页面的建槽必须超时失败")
+		}
+		// 必须真的等到了导航超时（未识别页面继续等待，绝不快速失败）。
+		if dt < 1000*time.Millisecond {
+			t.Fatalf("未识别页面耗时 %v——必须继续等待至导航超时而不是快速失败", dt)
+		}
+		if dt > 8*time.Second {
+			t.Fatalf("导航超时未按缩短预算返回，耗时 %v", dt)
+		}
+		if !errors.Is(aerr, context.DeadlineExceeded) {
+			t.Fatalf("导航超时必须保留 DeadlineExceeded 链: %v", aerr)
+		}
+		if got := classifyFailoverError(aerr); got != classNetFail {
+			t.Fatalf("真导航超时应归 classNetFail，得到 %v", got)
+		}
+		// R4-4 白名单断言：href 的 path/query/fragment 标记绝不进错误串。
+		for _, leak := range []string{"secret-path", "token=xyz", "#frag", "xyz"} {
+			if strings.Contains(aerr.Error(), leak) {
+				t.Fatalf("导航诊断泄露 href 敏感标记 %q: %v", leak, aerr)
+			}
+		}
+		// observed 白名单必须留 origin/readyState（诊断方向仍可读）。
+		if !strings.Contains(aerr.Error(), "unrecognized.example.com/complete") {
+			t.Fatalf("导航诊断必须保留 origin/readyState 白名单: %v", aerr)
+		}
+	})
+
+	t.Run("about:blank 对照继续等待不误杀", func(t *testing.T) {
+		if done, _, err := evalNavProbeResult("null/complete\nabout:blank", ""); done || err != nil {
+			t.Fatalf("about:blank 必须继续等待，得到 done=%v err=%v", done, err)
+		}
+		// 正常成功就绪不受影响。
+		if done, _, err := evalNavProbeResult("https://gemini.google.com/complete\nhttps://gemini.google.com/app", ""); !done || err != nil {
+			t.Fatalf("目标源就绪必须照常成功，得到 done=%v err=%v", done, err)
+		}
+	})
 }
 
 // TestBrowserStopWhenAbort：stopReader 置位后下一次 Read 立刻 EOF；
@@ -3149,6 +3360,292 @@ func TestNavigateAndWaitAppWaitsForOrigin(t *testing.T) {
 done:
 	if !sawNav {
 		t.Fatal("未发出 Page.navigate")
+	}
+}
+
+// TestNavigateAndWaitAppFastFailsOnCrossOriginRedirect 验证首航跨源重定向
+// 快速失败：落地 accounts.google.com / (www.)google.com/sorry 时毫秒级返回
+// *appPageStatusError（含 Location 与正确的 MissingOSID 判定），绝不死等
+// 18s 导航超时后才混报笼统错误。
+func TestNavigateAndWaitAppFastFailsOnCrossOriginRedirect(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		redirect     string
+		cookie       string
+		wantOSID     bool
+		wantBlames   bool
+		wantLocation string
+	}{
+		{
+			name:         "登录页缺 OSID",
+			redirect:     "https://accounts.google.com/ServiceLogin?osid=1&continue=x",
+			cookie:       "SID=a; SAPISID=b",
+			wantOSID:     true,
+			wantBlames:   true,
+			wantLocation: "accounts.google.com/ServiceLogin",
+		},
+		{
+			name:         "登录页带 OSID",
+			redirect:     "https://accounts.google.com/ServiceLogin?osid=1",
+			cookie:       "SID=a; SAPISID=b; OSID=c",
+			wantOSID:     false,
+			wantBlames:   true,
+			wantLocation: "accounts.google.com/ServiceLogin",
+		},
+		{
+			name:         "sorry 风控页",
+			redirect:     "https://www.google.com/sorry/index?continue=x",
+			cookie:       "SID=a; SAPISID=b",
+			wantOSID:     false,
+			wantBlames:   false,
+			wantLocation: "www.google.com/sorry/index",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeCDPServer(t)
+			defer srv.close()
+			client, _ := newTestClientAndBridge(t, srv)
+			srv.navRedirectURL.Store(tc.redirect)
+			m := &browserManager{}
+			t0 := time.Now()
+			err := m.navigateAndWaitAppCookie(context.Background(), client, "fake-session-1", tc.cookie)
+			dt := time.Since(t0)
+			if err == nil {
+				t.Fatal("跨源落地应返回非 nil 错误")
+			}
+			if dt > 3*time.Second {
+				t.Fatalf("跨源快速失败耗时 %v（应毫秒级，绝不死等导航超时）", dt)
+			}
+			var ape *appPageStatusError
+			if !errors.As(err, &ape) {
+				t.Fatalf("错误应为 *appPageStatusError，得到 %T: %v", err, err)
+			}
+			if ape.Location != tc.wantLocation {
+				t.Fatalf("Location=%q, want %q", ape.Location, tc.wantLocation)
+			}
+			if ape.MissingOSID != tc.wantOSID {
+				t.Fatalf("MissingOSID=%v, want %v", ape.MissingOSID, tc.wantOSID)
+			}
+			if got := xsrfErrBlamesCookie(err); got != tc.wantBlames {
+				t.Fatalf("xsrfErrBlamesCookie=%v, want %v", got, tc.wantBlames)
+			}
+			if isBrowserLocalError(err) {
+				t.Fatalf("跨源拦截页绝不能归 browserLocalError: %v", err)
+			}
+		})
+	}
+}
+
+// TestNavigateAndWaitAppTimeoutNoExtraProbeDelay 验证首航真超时：卡死页面
+// 在 navCtx 到期后 0ms 返回、绝不再发 5s probe 拖尾；错误非
+// browserLocalError 且 %w 包裹 context.DeadlineExceeded（isUpstreamTimeout
+// 判真、classifyFailoverError 归 classNetFail）。浏览器三层超时严格递增。
+func TestNavigateAndWaitAppTimeoutNoExtraProbeDelay(t *testing.T) {
+	if !(browserAppNavTimeout < browserCtxBuildTimeout && browserCtxBuildTimeout < browserFetchTokensTimeout) {
+		t.Fatalf("超时层级倒挂：nav=%v build=%v tokens=%v",
+			browserAppNavTimeout, browserCtxBuildTimeout, browserFetchTokensTimeout)
+	}
+	// 换短内层导航预算才能离线断言超时行为（变量而非常量正是为此）。
+	oldNav := browserAppNavTimeout
+	browserAppNavTimeout = 300 * time.Millisecond
+	defer func() { browserAppNavTimeout = oldNav }()
+
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, _ := newTestClientAndBridge(t, srv)
+	// 导航永不完成（origin 停在 null），模拟代理黑洞挂死。
+	srv.pageNavDelay.Store(int64(10 * time.Second))
+	m := &browserManager{}
+	t0 := time.Now()
+	err := m.navigateAndWaitApp(context.Background(), client, "fake-session-1")
+	dt := time.Since(t0)
+	if err == nil {
+		t.Fatal("导航卡死必须返回非 nil 错误")
+	}
+	// 300ms 到期后必须 0ms 返回：旧实现的 5s probe 拖尾会让 dt 拖到数秒。
+	if dt > 1500*time.Millisecond {
+		t.Fatalf("导航超时退出耗时 %v（probe 拖尾未消除）", dt)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("超时错误必须 %%w 包裹 context.DeadlineExceeded: %v (%T)", err, err)
+	}
+	if isBrowserLocalError(err) {
+		t.Fatalf("真导航超时绝不能归 browserLocalError: %v", err)
+	}
+	if !isUpstreamTimeout(err) {
+		t.Fatalf("真导航超时必须被 isUpstreamTimeout 识别: %v", err)
+	}
+	if got := classifyFailoverError(err); got != classNetFail {
+		t.Fatalf("真导航超时应归 classNetFail，得到 %v", got)
+	}
+	if xsrfErrBlamesCookie(err) {
+		t.Fatalf("真导航超时绝不能记账号账: %v", err)
+	}
+	// 到期之后绝不再发任何 Runtime.evaluate 探测 RPC：排干 gotCalls，
+	// 从函数返回后再空等 600ms（超过一个 ticker 周期），断言零新增探测。
+	countProbe := func() int {
+		n := 0
+		for {
+			select {
+			case c := <-srv.gotCalls:
+				if c.method == "Runtime.evaluate" && strings.Contains(string(c.params), "location.origin") {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	before := countProbe()
+	time.Sleep(600 * time.Millisecond)
+	after := countProbe()
+	if after != 0 {
+		t.Fatalf("navCtx 到期后又发了 %d 次 Runtime.evaluate 探测（返回前共 %d 次）", after, before)
+	}
+}
+
+// TestNavigateAndWaitAppRPCTimeoutPreservesDeadlineExceeded 验证 fix #5：
+// Page.navigate RPC **自身**超时（未及时返回）时，连接仍存活且非主动取消——
+// 错误必须非 browserLocalError（不带 "browser:" 前缀）、%w 保留
+// context.DeadlineExceeded 链（isUpstreamTimeout 判真）；classifyNavBuildErr
+// 剥离被 browserErr 包装的 RPC 超时错误时同样保留链且不残留前缀。
+func TestNavigateAndWaitAppRPCTimeoutPreservesDeadlineExceeded(t *testing.T) {
+	// 换短内层导航预算才能离线触发 RPC 超时（变量而非常量正是为此）。
+	oldNav := browserAppNavTimeout
+	browserAppNavTimeout = 200 * time.Millisecond
+	defer func() { browserAppNavTimeout = oldNav }()
+
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	client, _ := newTestClientAndBridge(t, srv)
+	// 卡住全部 RPC 回复：Page.navigate 的响应永不到达，Call 在 navCtx 到期时
+	// 以 context.DeadlineExceeded 返回。
+	srv.holdReplies.Store(true)
+
+	m := &browserManager{}
+	t0 := time.Now()
+	err := m.navigateAndWaitApp(context.Background(), client, "fake-session-1")
+	dt := time.Since(t0)
+	if err == nil {
+		t.Fatal("RPC 超时必须返回非 nil 错误")
+	}
+	if dt > 2*time.Second {
+		t.Fatalf("RPC 超时退出耗时 %v（应立即到期返回）", dt)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RPC 超时错误必须 %%w 保留 context.DeadlineExceeded 链: %v (%T)", err, err)
+	}
+	if isBrowserLocalError(err) {
+		t.Fatalf("连接存活的 RPC 超时绝不能归 browserLocalError: %v", err)
+	}
+	if strings.Contains(err.Error(), "browser:") {
+		t.Fatalf("错误串绝不能残留 browser: 前缀: %v", err)
+	}
+	if !isUpstreamTimeout(err) {
+		t.Fatalf("RPC 超时必须被 isUpstreamTimeout 识别: %v", err)
+	}
+	if got := classifyFailoverError(err); got != classNetFail {
+		t.Fatalf("RPC 超时应归 classNetFail，得到 %v", got)
+	}
+	if got := upstreamReason(err); got != reasonUpstreamTimeout {
+		t.Fatalf("upstreamReason=%q, want %q", got, reasonUpstreamTimeout)
+	}
+
+	// classifyNavBuildErr：同样形式的错误被 browserErr 包装时，剥离本地类型
+	// 且保留 DeadlineExceeded 链、不残留 browser: 前缀（真断连对照仍原样）。
+	wrapped := browserErr("navigate /app: %w", context.DeadlineExceeded)
+	classified := classifyNavBuildErr(context.Background(), client, "navigate /app", wrapped)
+	if !errors.Is(classified, context.DeadlineExceeded) {
+		t.Fatalf("classifyNavBuildErr 剥离后 DeadlineExceeded 链丢失: %v", classified)
+	}
+	if isBrowserLocalError(classified) {
+		t.Fatalf("classifyNavBuildErr 必须剥离 browserLocalError: %v", classified)
+	}
+	if strings.Contains(classified.Error(), "browser:") {
+		t.Fatalf("classifyNavBuildErr 输出绝不能残留 browser: 前缀: %v", classified)
+	}
+	if !isUpstreamTimeout(classified) {
+		t.Fatalf("classifyNavBuildErr 输出必须被 isUpstreamTimeout 识别: %v", classified)
+	}
+	// 对照：主动取消的导航保持原 browserLocalError / Canceled 语义（不扣代理分）。
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	cancelled := browserErr("navigate /app: %w", context.Canceled)
+	if out := classifyNavBuildErr(cctx, client, "navigate /app", cancelled); !isBrowserLocalError(out) {
+		t.Fatalf("主动取消必须保留原 browserLocalError 语义: %v (%T)", out, out)
+	}
+}
+
+// TestBrowserRedirectMissingOSIDAndFetchTokensStatus 验证跨源流与抓 token
+// 的结构化错误：doBrowserStreamRequestCtx 跨源跳转带正确 MissingOSID；
+// fetchAppTokensViaBrowserCtx 非 200 状态透传 Location 与 MissingOSID。
+func TestBrowserRedirectMissingOSIDAndFetchTokensStatus(t *testing.T) {
+	srv := newFakeCDPServer(t)
+	defer srv.close()
+	cleanup := wireTestBrowser(t, srv)
+	defer cleanup()
+
+	setRuntimeCfg(t, func(c *RuntimeConfig) {
+		c.BrowserTransport = true
+	})
+
+	// 用例 1：登录账号跨源跳转 accounts.google.com——cookie 缺 OSID 时
+	// MissingOSID 必须为 true（doBrowserStreamRequestCtx 的 appPageError 路径）。
+	acctID, err := accountInsert("redirosid", "SAPISID=ro; __Secure-1PSID=rp; SID=rs", "")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	defer accountDelete(acctID)
+	acct := accountByID(acctID)
+	go func() {
+		spec := <-srv.fetchHit
+		srv.setFetchScript(spec.reqID, fetchScript{
+			status:     200,
+			url:        "https://accounts.google.com/ServiceLogin?osid=1",
+			redirected: true,
+		})
+	}()
+	_, _, err = browserMgr.doBrowserStreamRequestCtx(context.Background(), "", acct,
+		"https://gemini.google.com/app", "GET", nil, nil, true, nil)
+	var ape *appPageStatusError
+	if !errors.As(err, &ape) {
+		t.Fatalf("跨源跳转 err 应为 *appPageStatusError，得到 %T: %v", err, err)
+	}
+	if !ape.MissingOSID {
+		t.Fatalf("缺 OSID 的账号跨源跳登录页，MissingOSID 必须为 true: %+v", ape)
+	}
+	if !xsrfErrBlamesCookie(err) {
+		t.Fatalf("跨源跳登录页必须归 cookie 类错误: %v", err)
+	}
+
+	// 用例 2：fetchAppTokensViaBrowserCtx 非 200（403）透传状态与
+	// MissingOSID=false（账号 cookie 里有 OSID）。
+	acct2ID, err := accountInsert("tokstatus", "SAPISID=to; __Secure-1PSID=tp; SID=ts; OSID=ok", "")
+	if err != nil {
+		t.Fatalf("insert2: %v", err)
+	}
+	defer accountDelete(acct2ID)
+	acct2 := accountByID(acct2ID)
+	go func() {
+		spec := <-srv.fetchHit
+		srv.setFetchScript(spec.reqID, fetchScript{
+			status: 403,
+			url:    "https://gemini.google.com/app",
+		})
+	}()
+	_, err = browserMgr.fetchAppTokensViaBrowserCtx(context.Background(), "", acct2, true, nil)
+	var ape2 *appPageStatusError
+	if !errors.As(err, &ape2) {
+		t.Fatalf("非 200 取 token err 应为 *appPageStatusError，得到 %T: %v", err, err)
+	}
+	if ape2.Status != 403 {
+		t.Fatalf("Status=%d, want 403", ape2.Status)
+	}
+	if ape2.MissingOSID {
+		t.Fatalf("带 OSID 的账号绝不能误报缺 OSID: %+v", ape2)
+	}
+	if got := upstreamReason(err); got != reasonUpstreamHTTP {
+		t.Fatalf("upstreamReason=%q, want %q", got, reasonUpstreamHTTP)
 	}
 }
 

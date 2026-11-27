@@ -105,6 +105,11 @@ func diagHint(reason string, err error) string {
 	case reasonEmptyContent:
 		return "上游返回了内容帧但抽不出正文：可能是回复被清洗规则剥空或协议字段已变更"
 	case reasonUpstreamHTTP:
+		// 鉴权类跨源拦截（accounts.google.com / 缺 OSID）直接向客户端透出
+		// 具体的登录态诊断指引；/sorry、429 等出口侧问题保持原风控提示。
+		if err != nil && xsrfErrBlamesCookie(err) {
+			return explainCookieFailure(err)
+		}
 		return "上游返回了非 200 状态码：可能是出口被风控（302/sorry）、限流（429）或上游临时故障"
 	case reasonAccountsCoolingDown:
 		return "所有登录账号刚连续被上游拒绝，正处 45s 防雪崩短冷却：按 Retry-After 稍等再试，" +
@@ -128,6 +133,7 @@ func upstreamReason(err error) string {
 	var se *StallError
 	var ace *AccountCooldownError
 	var ppe *poisonPayloadError
+	var ape *appPageStatusError
 	switch {
 	case errors.As(err, &ace):
 		return reasonAccountsCoolingDown
@@ -146,7 +152,9 @@ func upstreamReason(err error) string {
 		return reasonUpstreamTimeout
 	case strings.Contains(err.Error(), "no content frame"):
 		return reasonNoContentFrame
-	case strings.Contains(err.Error(), "upstream HTTP"):
+	case errors.As(err, &ape), strings.Contains(err.Error(), "upstream HTTP"):
+		// *appPageStatusError（"fetch /app: HTTP 302 -> accounts.google.com/..."）
+		// 错误串不含 "upstream HTTP"——按类型识别归 upstream_http，不落入兜底。
 		return reasonUpstreamHTTP
 	default:
 		return reasonUpstreamError

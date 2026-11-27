@@ -20,13 +20,21 @@ func TestClientCacheFollowsTimeout(t *testing.T) {
 	defer func() { rtMu.Lock(); rtVal = saved; rtMu.Unlock() }()
 
 	const proxy = "http://127.0.0.1:1"
-	if got := getStdlibClient(proxy).Timeout; got != 20*time.Second {
+	c1, err1 := getStdlibClient(proxy)
+	if err1 != nil {
+		t.Fatalf("getStdlibClient: %v", err1)
+	}
+	if got := c1.Timeout; got != 20*time.Second {
 		t.Fatalf("timeout = %v, want 20s", got)
 	}
 	rtMu.Lock()
 	rtVal.RequestTimeout = 180
 	rtMu.Unlock()
-	if got := getStdlibClient(proxy).Timeout; got != 180*time.Second {
+	c2, err2 := getStdlibClient(proxy)
+	if err2 != nil {
+		t.Fatalf("getStdlibClient: %v", err2)
+	}
+	if got := c2.Timeout; got != 180*time.Second {
 		t.Fatalf("after change timeout = %v, want 180s", got)
 	}
 	if getTLSClient() == nil {

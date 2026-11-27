@@ -632,7 +632,16 @@ func arbitrateHeldExit(accountID int64, p Proxy, release func()) (int64, bool, e
 		}
 		return cur, false, nil, nil
 	}
-	winner := claimAccountProxy(accountID, p.ID)
+	winner, claimOK := claimAccountProxy(accountID, p.ID)
+	if !claimOK {
+		// R8-5（Reviewer MF-5）：写库未真实命中目标行（0 行：账号在核库
+		// 与 UPDATE 之间被并发删除等；或 RowsAffected 出错的不明行数）——
+		// 候选出口绝不视为赢得仲裁：释放手上 slot，fail-closed 拒绝外发，
+		// 绝不落到匿名/直连（也不按候选出口外发）。
+		release()
+		return 0, false, fmt.Errorf(
+			"account #%d is not available (deleted or disabled)", accountID), nil
+	}
 	if winner == p.ID {
 		return 0, true, nil, nil
 	}
@@ -768,7 +777,10 @@ func xsrfExitConflict(accountID, pickedID int64) (conflictID int64, conflict boo
 		// 查不到绑定（号刚被删）也按冲突跳过，fail-closed。
 		return curBound, true, curBound
 	case rtCfg().StrictProxyBinding && pickedID > 0:
-		if w := claimAccountProxy(accountID, pickedID); w != pickedID {
+		// R8-5（Reviewer MF-5）：写库 0 行/行数不明时候选出口绝不视为
+		// 赢得仲裁——按冲突 fail-closed 跳过（绝不借未真实落库的候选出口
+		// 外发），与「胜者不是手上出口」同路径处理。
+		if w, ok := claimAccountProxy(accountID, pickedID); !ok || w != pickedID {
 			return w, true, curBound
 		}
 	case rtCfg().StrictProxyBinding:
@@ -1468,7 +1480,9 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 		}
 		nImg, nVid := 0, 0
 		for _, u := range pending {
-			ref, uerr := uploadBytesCtx(ctx, cookieStr, authUser, proxyURL, u.Data, u.Name)
+			// R7-1：附件上传已知挑号后的 cookieID——上传 token 抓取 miss 时的
+			// Set-Cookie 回收只校验该行，绝不反查同身份同序号启用兄弟行。
+			ref, uerr := uploadBytesCtxForAccount(ctx, cookieStr, authUser, proxyURL, u.Data, u.Name, cookieID)
 			if err := ctx.Err(); err != nil {
 				return attrib(err)
 			}
@@ -1488,7 +1502,8 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
 	// 而且必须走跟正式请求同一个出口。
 	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(ctx, prompt, pc, budget, cookieStr, authUser, proxyURL); ferr != nil {
+	// R7-1：历史附件（超长 prompt 转文件）同样透传挑号后的 cookieID。
+	if p, f, used, ferr := prepareContextFileForAccount(ctx, prompt, pc, budget, cookieStr, authUser, proxyURL, cookieID); ferr != nil {
 		if err := ctx.Err(); err != nil {
 			return attrib(err)
 		}
@@ -1703,9 +1718,16 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 		// 本轮生成请求是账号对上游的真实使用：记在 touched（XSRF 已记的幂等）。
 		fstate.markTouched(cookieID)
 		if len(setCookie) > 0 && cookieID > 0 {
+			// 请求身份快照：发请求当时的身份。长流期间账号被 accountSync 换绑到
+			// 另一会话时，mergeAccountSetCookie 在 L1 内按它拦截跨身份回写。
+			expectedIdent := cookieIdentity(cookieStr)
 			if merged := mergeSetCookieForHost(cookieStr, setCookie, reqEndpoint, geminiCookieTargetHost); merged != cookieStr {
 				cookieStr = merged
-				updateAccountCookie(cookieID, merged)
+				// 增量安全落库：锁内重读 DB 最新值合并，杜绝长流期间的旧快照
+				// 倒退覆盖后台保活刚刷新的 1PSIDTS。
+				// R6-2：单轮会话按 /u/authUser 发出——序号一并传入，长流期间
+				// 管理员 PATCH 只改序号时旧序号票据绝不写进新序号行。
+				mergeAccountSetCookie(cookieID, setCookie, reqEndpoint, expectedIdent, authUser)
 			}
 		}
 		// 每次拿到一段 raw 就喂给 phantomCleanup：流式/非流式/提前 EOF 都覆盖。
@@ -1778,7 +1800,8 @@ func streamGenerateOnceOpts(ctx context.Context, prompt string, pc promptCtx, mc
 				// 浏览器模式下不要再先 reloadResidentPage 又 getXSRF——两者都
 				// 会页内 fetch /app 一次，连续抓两遍纯粹浪费一次上游往返。
 				// getXSRF 的浏览器路径本身就会重抓页面拿新 token。
-				if tok, e := healXSRFRefresh(cookieStr, authUser, proxyURL, useWC); e == nil {
+				// R7-1：400 自愈已知 cookieID 必须透传到底（回收写回只校验该行）。
+				if tok, e := healXSRFRefresh(cookieStr, authUser, proxyURL, useWC, cookieID); e == nil {
 					xsrfToken = tok // 同步给收尾：phantomCleanup 按闭包取当前值
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
@@ -2080,7 +2103,10 @@ func acquireXSRFToken(ctx context.Context, xs *xsrfTokenCtx,
 		// 统一准入登记：getXSRF 是本号对上游的第一发，记入 touched——
 		// 之后的 Bound 门前豁免与故障/降级预算都按它判「碰没碰过上游」。
 		fstate.markTouched(acct.ID)
-		tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
+		// R6-1：主请求挑号后账号 ID 已知——透传到底，回收写回只校验
+		// 该行；该行在上游 I/O 期间被并发失败自动停用时绝不反查写进
+		// 同身份同序号的启用兄弟行。
+		tok, err := getXSRFSwitchForAccount(acct.Cookie, acct.AuthUser, proxyURL, true, acct.ID)
 		if err == nil {
 			xs.cookieStr, xs.sapisid, xs.xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
 			xs.authUser = acct.AuthUser
@@ -2180,7 +2206,10 @@ func xsrfHealOrAdvance(xs *xsrfTokenCtx, acct *CookieAccount, err error,
 	// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
 	// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
 	// 只试一次，且只在这一轮。
-	if !rotatedOnce[acct.ID] {
+	// 仅对 Cookie 类错误触发轮转救号：超时、代理断连、302 -> /sorry、
+	// 429/5xx、browserLocalError 都不是 Cookie 的问题，轮转了也救不回来，
+	// 只会白打一次 accounts.google.com（DBSC 401 告警刷屏）。
+	if xsrfErrBlamesCookie(err) && !rotatedOnce[acct.ID] {
 		rotatedOnce[acct.ID] = true
 		out := healXSRFByRotation(mc, acct, picked, proxyURL, skip, tried)
 		skip = out.skip
@@ -2342,25 +2371,35 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 		// 直连轮转误发给刚绑上代理的号）。
 		curBound = bound
 	}
-	// 轮转必须走本次选定的出口：rotateAccount 按 a.ProxyID 取出口 URL，
-	// 而 acct.ProxyID 保留的是库里旧绑定（不再原地覆写，见 picked 处注释）——
-	// 直接传 *acct 会让轮转打向旧绑定（可能已禁用）甚至退回直连。发副本。
-	rotAcct := *acct
-	// picked.ID==0（fallback_direct 直连兜底或锁定直连）时也必须清掉旧绑定：
-	// 直连就是本轮出口，不能让轮转打向可能已禁用/熔断的旧 acct.ProxyID。
-	// 判定必须按**刚核库的实时绑定**：acct.ProxyID 是挑号时的陈旧快照，
-	// 管理员此刻可能已把它锁成 -1——拿陈旧值判会把锁定直连号的 Cookie
-	// 按 picked.ID=0 交给 rotateProxyURL 挑代理外发。
-	if curBound == proxyIDDirect {
-		rotAcct.ProxyID = proxyIDDirect
-	} else {
-		rotAcct.ProxyID = picked.ID
+	// 轮转必须走本次选定的 picked 出口（R10-3，Reviewer M4）：不再靠
+	// 覆写 acct.ProxyID 传递 picked——「管理/后台旧 DB 绑定」与「自愈
+	// 实际挑中的出口」分开携带。hasPickedProxy=true 时 rotate 按
+	// pickedProxyID 解析出口（原子快照），先核对 DB 绑定是否仍等于
+	// expectedDBProxyID（刚经冲突复核的实时绑定 curBound），再复核
+	// picked 出口对当前 cur 的合法性——非严格 + FallbackDirect + 绑定
+	// 代理启用但槽满的合法直连自愈（picked=0）不再被误当改绑拒发。
+	// picked.ID==0 的 fallback_direct 直连兜底/锁定直连语义不变：
+	// pickedProxyID=0 即显式直连，绝不让轮转打向旧绑定。
+	// expectedDBProxyID 必须反映「挑号冲突复核后」的绑定事实：严格模式
+	// picked>0 无冲突意味着 claimAccountProxy 仲裁已收束到 picked（含
+	// 首绑落库）——此时 DB 绑定就是 picked，而 curBound 是仲裁前的
+	// 预读值（可能是 0），拿它核对会把合法首绑误当改绑拒发。
+	expectedDB := curBound
+	if rtCfg().StrictProxyBinding && picked.ID > 0 {
+		expectedDB = picked.ID
 	}
-	if _, _, rerr := rotateAccount(rotAcct); rerr != nil {
+	rotAcct := *acct
+	_, names, rerr := rotateAccountWithOpts(rotAcct, rotateOpts{
+		hasPickedProxy:    true,
+		pickedProxyID:     picked.ID,
+		expectedDBProxyID: expectedDB,
+		pickedProxyURL:    picked.URL,
+	})
+	if rerr != nil || len(names) == 0 {
 		return out
 	}
 	fresh := accountByID(acct.ID)
-	if fresh == nil {
+	if fresh == nil || fresh.Cookie == acct.Cookie {
 		return out
 	}
 	// 轮转成功后拿新 cookie 重取 XSRF 前再核一次出口冲突：
@@ -2379,7 +2418,32 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 		}
 		return out
 	}
-	tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL)
+	// R11-3（Oracle A4）：重取 /app 前复核同一代理 ID 的当前原子快照
+	// URL 是否仍是挑中时刻的 picked.URL——面板在轮转 I/O 期间把同一
+	// 代理的 URL 从 U1 改为 U2 时，保活已走 U2，此处入口快照 proxyURL
+	// 仍是 U1：用旧 U1 取新 XSRF 会把刚更新的 Cookie 发往已撤换的旧
+	// 出口。不一致立即停止自愈（healed=false，后续逻辑按未救回走换
+	// 号/报错路径），绝不向已撤换旧 URL 发出带会话请求。
+	// R12-3（Oracle M3）：重取 /app 是自愈链路上又一次独立外发，必须
+	// 用同一 picked 契约复核——快照必须**同时**满足存在、enabled 且
+	// URL 与挑中时刻一致（此前丢弃 enabled：非严格模式下仅禁用同 URL
+	// 时 xsrfExitConflict 不拦，旧 U1 的 /app 仍可命中）；picked.ID==0
+	// 时核对当前直连对最新行仍合法。任一不满足立即放弃，绝不向已撤换
+	// 或已禁用的旧出口发出带会话请求。
+	if picked.ID > 0 && picked.URL != "" {
+		found, enabled, curURL := proxyAtomicSnapshot(picked.ID)
+		if !found || !enabled || curURL != picked.URL {
+			logf("[cookie] 账号 #%d 自愈放弃：出口 #%d 已删除/禁用或 URL 已变更（挑中时 %q，当前 %q），绝不向旧出口重取 XSRF",
+				acct.ID, picked.ID, redactProxyURL(picked.URL), redactProxyURL(curURL))
+			return out
+		}
+	}
+	if picked.ID == 0 && !pickedExitValidForCur("", fresh) {
+		logf("[cookie] 账号 #%d 自愈放弃：直连出口对当前绑定 #%d 不再合法，绝不重取 XSRF",
+			acct.ID, fresh.ProxyID)
+		return out
+	}
+	tok2, err2 := getXSRFSwitchForAccount(fresh.Cookie, fresh.AuthUser, proxyURL, true, fresh.ID)
 	if err2 != nil {
 		return out
 	}
@@ -2392,12 +2456,14 @@ func healXSRFByRotation(mc ModelConfig, acct *CookieAccount, picked Proxy, proxy
 
 // healXSRFRefresh 在上游返回 400 + isXSRFError 时作废本地 XSRF 缓存并重取 token；
 // 若当前走 WebChannel 路径，同时作废缓存的 processSession API key，确保重试拿到最新凭证。
-func healXSRFRefresh(cookieStr string, authUser int, proxyURL string, useWC bool) (string, error) {
+// R7-1：targetAccountID 是入口已知的账号 ID——纯 Go /app 回收写回只校验该行
+// （停用/删除不写），绝不反查同身份同序号启用兄弟行。
+func healXSRFRefresh(cookieStr string, authUser int, proxyURL string, useWC bool, targetAccountID int64) (string, error) {
 	invalidateXSRF(cookieStr)
 	if useWC {
 		invalidateWebChannelAPIKey()
 	}
-	return getXSRF(cookieStr, authUser, proxyURL)
+	return getXSRFForAccount(cookieStr, authUser, proxyURL, targetAccountID)
 }
 
 // webChannelIgnoredLogged 记下「web_channel 开着但被忽略」是否已经提示过；开关关掉时清零，
@@ -2903,7 +2969,10 @@ func doGeminiRequestStopInner(ctx context.Context, endpoint, body string, header
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibStreamClient(proxyURL)
+		client, cerr := getStdlibStreamClient(proxyURL)
+		if cerr != nil {
+			return 0, nil, 0, nil, watch.explain(cerr)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, 0, nil, watch.explain(err)
@@ -3363,7 +3432,13 @@ func probeGeminiWithAccount(prompt, proxyURL string, acct *CookieAccount, allowP
 	} else if allowPoolFallback {
 		cookieStr, sapisid = loadCookie()
 	} // 否则严格匿名：cookieStr 恒为 ""，绝不从池里随机抽号。
-	if tok, e := getXSRFSwitch(cookieStr, probeAuthUser, proxyURL, false); e == nil && tok != "" {
+	// R7-1：面板连通性探测已点名 probeAcct（admin.go）——透传具体 ID，
+	// 纯 Go 回收写回只校验该行；acct==nil 的匿名/自由 cookie 探测保持 0（兼容读）。
+	var probeAcctID int64
+	if acct != nil {
+		probeAcctID = acct.ID
+	}
+	if tok, e := getXSRFSwitchForAccount(cookieStr, probeAuthUser, proxyURL, false, probeAcctID); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()
 	}
@@ -3418,7 +3493,12 @@ func probeGeminiWithAccount(prompt, proxyURL string, acct *CookieAccount, allowP
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
+		client, cerr := getStdlibClient(proxyURL)
+		if cerr != nil {
+			res.Status = "network_error"
+			res.Diagnostic = "网络层错误（DNS/TCP/TLS 失败）: " + cerr.Error()
+			return res
+		}
 		resp, e := client.Do(req)
 		if e != nil {
 			res.Status = "network_error"

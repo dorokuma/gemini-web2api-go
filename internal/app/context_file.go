@@ -83,6 +83,14 @@ func contextFilePrompt(latest string, budget int) string {
 // 就不再稳定地吐 ```tool_call```。工具说明本身就超预算时才退回整段进附件。
 func prepareContextFile(ctx context.Context, prompt string, pc promptCtx, budget int, cookie string, authuser int, proxyURL string) (
 	string, []fileRef, bool, error) {
+	return prepareContextFileForAccount(ctx, prompt, pc, budget, cookie, authuser, proxyURL, 0)
+}
+
+// prepareContextFileForAccount 是 prepareContextFile 的账号透传版（R7-1）：
+// targetAccountID > 0 时附件上传 token 抓取的 Set-Cookie 回收只校验该行
+// （停用/删除不写），绝不反查同身份同序号启用兄弟行；== 0 保持唯一反查。
+func prepareContextFileForAccount(ctx context.Context, prompt string, pc promptCtx, budget int, cookie string, authuser int, proxyURL string, targetAccountID int64) (
+	string, []fileRef, bool, error) {
 	if budget <= 0 || len(prompt) <= budget {
 		return prompt, nil, false, nil
 	}
@@ -100,7 +108,7 @@ func prepareContextFile(ctx context.Context, prompt string, pc promptCtx, budget
 		return prompt, nil, false, &PromptTooLongError{
 			Bytes: len(history), Budget: maxFile, HasCookie: true}
 	}
-	ref, err := uploadBytesCtx(ctx, cookie, authuser, proxyURL, []byte(history), contextFileName)
+	ref, err := uploadBytesCtxForAccount(ctx, cookie, authuser, proxyURL, []byte(history), contextFileName, targetAccountID)
 	if err != nil {
 		return prompt, nil, false, fmt.Errorf("超长对话转附件失败: %w", err)
 	}

@@ -750,7 +750,11 @@ func mediaGetOnce(rawURL string, headers map[string]string, proxyURL string) (in
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		resp, err := getStdlibClient(proxyURL).Do(req)
+		sc, cerr := getStdlibClient(proxyURL)
+		if cerr != nil {
+			return 0, nil, nil, cerr
+		}
+		resp, err := sc.Do(req)
 		if err != nil {
 			return 0, nil, nil, err
 		}

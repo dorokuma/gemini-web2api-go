@@ -906,7 +906,7 @@ func TestWCHandshake400XSRFSelfHeal(t *testing.T) {
 			t.Fatalf("握手 400 诊断泄露原文探针: %q", string(raw1))
 		}
 		// 走 gemini.go 同款自愈刷新：作废 XSRF + wcKey 缓存并重抓 /app
-		tok, herr := healXSRFRefresh(cookie, 0, fakeProxy, true)
+		tok, herr := healXSRFRefresh(cookie, 0, fakeProxy, true, 0)
 		if herr != nil || tok != newXSRF {
 			t.Fatalf("healXSRFRefresh 失败: tok=%q err=%v", tok, herr)
 		}

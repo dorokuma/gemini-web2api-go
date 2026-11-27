@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -319,5 +320,53 @@ func mustKV(t *testing.T, k, v string) {
 	t.Helper()
 	if err := kvSet(k, v); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSeededProxyInvalidNeverDropsOldSeed 复核 R12-1-②（Oracle M4/Reviewer #1）：
+// 非空但非法的 --proxy 重播种绝不能先把旧播种行删掉导致池空退化直连——
+// 修复前顺序是先 dropSeededProxy 再入池，新值非法时旧行已删、入池失败仅记
+// 日志：显式要求代理的部署静默退化为池空直连（len(pool)==0 时 acquireSlot(0)
+// 拿到 ID=0 的直连槽，携 Cookie 直出本机 IP）。修复后：先校验合法性，非法
+// 直接返回配置错误（fail-closed），旧播种行原样保留。
+func TestSeededProxyInvalidNeverDropsOldSeed(t *testing.T) {
+	resetSeedState(t)
+	cfg.Proxy = "http://oldseed:1080"
+	if err := seedProxiesFromConfig(); err != nil {
+		t.Fatalf("合法首次播种不该报错: %v", err)
+	}
+	if list := listProxies(); len(list) != 1 || list[0].URL != "http://oldseed:1080" {
+		t.Fatalf("首次播种不对: %+v", list)
+	}
+
+	// 重播种为非法值（仅端口无主机名）——必须返回配置错误且旧行原样保留。
+	cfg.Proxy = "http://:8080"
+	err := seedProxiesFromConfig()
+	if err == nil {
+		t.Fatal("非空非法 --proxy 必须返回配置错误（fail-closed，绝不静默退化直连）")
+	}
+	list := listProxies()
+	if len(list) != 1 || list[0].URL != "http://oldseed:1080" {
+		t.Fatalf("非法重播种绝不能先删旧播种行（池空退化直连防线）: %+v", list)
+	}
+	// 解析失败形态（非法转义）同样拒绝且不动旧行。
+	cfg.Proxy = "http://proxy.invalid/AUDIT-MARK/%zz"
+	if err := seedProxiesFromConfig(); err == nil {
+		t.Fatal("解析失败的 --proxy 必须返回配置错误")
+	} else if strings.Contains(err.Error(), "AUDIT-MARK") {
+		t.Fatalf("配置错误绝不能回显原始 URL 片段: %q", err.Error())
+	}
+	if list := listProxies(); len(list) != 1 || list[0].URL != "http://oldseed:1080" {
+		t.Fatalf("非法重播种绝不能动旧播种行: %+v", list)
+	}
+
+	// 合法变更仍照常替换（声明式语义不变）。
+	cfg.Proxy = "http://newseed:1080"
+	if err := seedProxiesFromConfig(); err != nil {
+		t.Fatalf("合法重播种不该报错: %v", err)
+	}
+	list = listProxies()
+	if len(list) != 1 || list[0].URL != "http://newseed:1080" {
+		t.Fatalf("合法重播种必须正常替换: %+v", list)
 	}
 }

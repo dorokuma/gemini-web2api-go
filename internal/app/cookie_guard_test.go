@@ -1,9 +1,13 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -132,6 +136,35 @@ func TestAppPageStatusErrorText(t *testing.T) {
 	if s := newAppPageStatusError(429, "").Error(); s != "fetch /app: HTTP 429" {
 		t.Errorf("got %q", s)
 	}
+
+	// R5-5（Reviewer MF-5）：Location 解析失败（非法转义）时绝不把整个
+	// 原始头赋进错误——原始串的 query/fragment 可能携带私有参数，随 502
+	// 错误文本与请求表外泄。只留固定占位，secret/frag 绝不出现。
+	badLoc := "https://gemini.google.com/%zz?token=secret#frag"
+	e := newAppPageStatusError(401, badLoc)
+	if strings.Contains(e.Error(), "secret") || strings.Contains(e.Error(), "frag") ||
+		strings.Contains(e.Error(), "%zz") {
+		t.Errorf("解析失败的 Location 绝不能泄露原始 query/fragment: %q", e.Error())
+	}
+	if e.Location != "<invalid-location>" {
+		t.Errorf("解析失败的 Location 必须落固定占位，得到 %q", e.Location)
+	}
+	if !strings.HasPrefix(e.Error(), "fetch /app: HTTP 401") {
+		t.Errorf("状态码分类前缀必须保留: %q", e.Error())
+	}
+	// 有效登录跳转不受影响：合法 URL 仍只留 host+path（query 本就剥离），
+	// 登录页归类不变。
+	login := newAppPageStatusError(302, "https://accounts.google.com/ServiceLogin?osid=1&continue=https%3A%2F%2Fgemini.google.com")
+	if login.Location != "accounts.google.com/ServiceLogin" {
+		t.Errorf("合法登录跳转必须保留 host+path: %q", login.Location)
+	}
+	if !xsrfErrBlamesCookie(login) {
+		t.Error("合法登录跳转的 cookie 归类绝不能被 R5-5 影响")
+	}
+	// 401 + 非法 Location 仍是 cookie 账（状态码分类不受影响）。
+	if !xsrfErrBlamesCookie(e) {
+		t.Error("401 的状态码分类绝不能被 Location 占位影响")
+	}
 }
 
 // 跳 /sorry 也是 302，文案不能说成「重定向到登录页」。
@@ -170,6 +203,66 @@ func TestAppPageErrorMissingOSID(t *testing.T) {
 	}
 }
 
+// TestNavRedirectErrorClassificationChain 验证导航跨源重定向产物的三方联合
+// 分类：xsrfErrBlamesCookie（记不记账号账）、classifyFailoverError（跳槽准入）、
+// upstreamReason（502 诊断码）对登录页 / /sorry / 真超时三条链全部精确命中，
+// 互不混淆。
+func TestNavRedirectErrorClassificationChain(t *testing.T) {
+	loginErr := fmt.Errorf("navigate /app: %w",
+		appPageError(302, "https://accounts.google.com/ServiceLogin?osid=1", "SID=a; SAPISID=b"))
+	if !xsrfErrBlamesCookie(loginErr) {
+		t.Errorf("登录页重定向必须记账号账: %v", loginErr)
+	}
+	if got := classifyFailoverError(loginErr); got != classAuthFail {
+		t.Errorf("登录页重定向应归 classAuthFail，得到 %v", got)
+	}
+	if got := upstreamReason(loginErr); got != reasonUpstreamHTTP {
+		t.Errorf("upstreamReason=%q, want %q", got, reasonUpstreamHTTP)
+	}
+	// 缺 OSID 的诊断必须透出到人话提示。
+	if hint := diagHint(reasonUpstreamHTTP, loginErr); !strings.Contains(hint, "OSID") {
+		t.Errorf("缺 OSID 的诊断提示必须点名 OSID: %q", hint)
+	}
+
+	sorryErr := fmt.Errorf("navigate /app: %w",
+		appPageError(302, "https://www.google.com/sorry/index?continue=x", "SID=a; SAPISID=b"))
+	if xsrfErrBlamesCookie(sorryErr) {
+		t.Errorf("/sorry 是出口风控，绝不能记账号账: %v", sorryErr)
+	}
+	if got := classifyFailoverError(sorryErr); got != classUpstreamLimit {
+		t.Errorf("/sorry 应归 classUpstreamLimit，得到 %v", got)
+	}
+	if got := upstreamReason(sorryErr); got != reasonUpstreamHTTP {
+		t.Errorf("upstreamReason=%q, want %q", got, reasonUpstreamHTTP)
+	}
+	// /sorry 不走 cookie 失效指引（保持原风控/限流提示）。
+	if hint := diagHint(reasonUpstreamHTTP, sorryErr); strings.Contains(hint, "OSID") || strings.Contains(hint, "cookie 无效") {
+		t.Errorf("/sorry 绝不能误报 cookie 失效指引: %q", hint)
+	}
+
+	// 真超时：非 browserLocalError、%w DeadlineExceeded 链完整。
+	timeoutErr := fmt.Errorf("navigate /app: %w", fmt.Errorf(
+		"page fetch error: navigate /app did not reach gemini.google.com origin (got %q): %w",
+		"null/complete", context.DeadlineExceeded))
+	if xsrfErrBlamesCookie(timeoutErr) {
+		t.Errorf("真超时绝不能记账号账: %v", timeoutErr)
+	}
+	if got := classifyFailoverError(timeoutErr); got != classNetFail {
+		t.Errorf("真超时应归 classNetFail，得到 %v", got)
+	}
+	if got := upstreamReason(timeoutErr); got != reasonUpstreamTimeout {
+		t.Errorf("upstreamReason=%q, want %q", got, reasonUpstreamTimeout)
+	}
+	if isBrowserLocalError(timeoutErr) {
+		t.Errorf("真超时绝不能归 browserLocalError: %v", timeoutErr)
+	}
+	// 停机/拆槽取消：browserLocalError 归本地终止，禁止跳槽。
+	abortErr := browserErr("navigate /app: %w", context.Canceled)
+	if got := classifyFailoverError(abortErr); got != classLocalAbort {
+		t.Errorf("本地取消应归 classLocalAbort，得到 %v", got)
+	}
+}
+
 // 账号序号要能存能读，越界要拒。
 func TestAccountAuthUser(t *testing.T) {
 	id, err := accountAdd("multi", "SAPISID=ggg; __Secure-1PSID=hhh", "")
@@ -195,4 +288,84 @@ func TestAccountAuthUser(t *testing.T) {
 	if a := accountByID(id); a == nil || a.AuthUser != 1 {
 		t.Errorf("被拒后应保持 1, got %+v", a)
 	}
+}
+
+// TestRebindAccountProxyAtomicStrictCommit 复核 R11-6（Oracle A7-2/Reviewer #5）：
+// 管理员手工 PATCH 改绑必须严格按 UPDATE 真实命中目标行裁决——行不存在
+// （并发 DELETE 抢先删行）或写库失败时返回错误、不清自动来源、绝不向
+// 面板谎报 ok:true 并按「已改绑」拆槽中断在途流；真实提交成功才返回
+// updated=true 与实际旧值，同值 PATCH（old == new）依旧不拆槽。
+func TestRebindAccountProxyAtomicStrictCommit(t *testing.T) {
+	a, b := withTwoProxies(t, false)
+
+	t.Run("不存在的账号行改绑必须报错且标记未提交", func(t *testing.T) {
+		// Oracle A7-2 无需注入故障的对照：对不存在的正 ID 申请绑定，
+		// UPDATE 命中 0 行——修复前忽略 false 并提前清来源，handler 按
+		// 「旧值不同」拆掉健康槽还回 200 ok:true（DB 实际从未改绑）。
+		missing := addTestAccount(t, "rebindMissing")
+		bindAccountProxy(missing, a)
+		if err := accountDelete(missing); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		old, updated, err := rebindAccountProxyAtomic(missing, b)
+		if err == nil {
+			t.Fatal("对不存在行的改绑必须返回错误（绝不谎报成功）")
+		}
+		if updated {
+			t.Fatal("0 行命中的改绑绝不能标记为已提交")
+		}
+		_ = old
+	})
+
+	t.Run("真实提交返回实际旧值且同值PATCH判定不拆槽", func(t *testing.T) {
+		id := addTestAccount(t, "rebindOK")
+		bindAccountProxy(id, a)
+		// 登记一条自动来源：真实手工改绑必须清除它（步骤6对齐不再命中）。
+		claimMu.Lock()
+		noteAutoBoundProxyLocked(id, a, proxyURLByID(a))
+		claimMu.Unlock()
+		old, updated, err := rebindAccountProxyAtomic(id, b)
+		if err != nil || !updated {
+			t.Fatalf("存在的行改绑必须真实提交: updated=%v err=%v", updated, err)
+		}
+		if old != a {
+			t.Fatalf("必须返回串行点上的实际旧绑定 %d，得到 %d", a, old)
+		}
+		if acc := accountByID(id); acc == nil || acc.ProxyID != b {
+			t.Fatalf("DB 绑定必须落库为新值 %d：%+v", b, acc)
+		}
+		if isAutoBoundProxyForURL(id, a, proxyURLByID(a)) {
+			t.Fatal("真实手工改绑必须清除自动来源记录")
+		}
+		// 同值 PATCH（old == new）：old 也是 b——调用方据此判定不拆槽。
+		old2, updated2, err2 := rebindAccountProxyAtomic(id, b)
+		if err2 != nil || !updated2 || old2 != b {
+			t.Fatalf("同值改绑必须成功提交且旧值=新值: old=%d updated=%v err=%v", old2, updated2, err2)
+		}
+		if acc := accountByID(id); acc == nil || acc.ProxyID != b {
+			t.Fatalf("同值改绑后绑定必须保持 %d：%+v", b, acc)
+		}
+	})
+
+	t.Run("PATCH对不存在账号回400绝不拆槽", func(t *testing.T) {
+		// handler 层端到端：对不存在的账号 PATCH 绑定——校验通过（代理
+		// 存在），但绑定 UPDATE 0 行命中，必须如实回错误且状态码非 200。
+		missing := addTestAccount(t, "patchMissing")
+		if err := accountDelete(missing); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		r := httptest.NewRequest("PATCH", fmt.Sprintf("/admin/api/cookies/%d", missing),
+			strings.NewReader(fmt.Sprintf(`{"proxy_id": %d}`, a)))
+		w := httptest.NewRecorder()
+		handleAdminCookieItem(w, r)
+		if w.Code == 200 {
+			var body map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err == nil {
+				if ok, _ := body["ok"].(bool); ok {
+					t.Fatalf("对不存在行的 PATCH 绝不能回 200 ok:true: %v", body)
+				}
+			}
+			t.Fatalf("对不存在行的 PATCH 绝不能回 200: %s", w.Body)
+		}
+	})
 }

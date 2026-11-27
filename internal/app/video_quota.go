@@ -115,7 +115,8 @@ func videoQuotaFor(a CookieAccount, now time.Time, lookback time.Duration) accou
 	sapisid := extractSAPISID(a.Cookie)
 	var xsrf string
 	err := viaSlot(&a, func(proxyURL string) (err error) {
-		xsrf, err = getXSRFSwitch(a.Cookie, a.AuthUser, proxyURL, false)
+		// R6-1：配额探测的账号 ID 已知——透传到底，回收写回只校验该行。
+		xsrf, err = getXSRFSwitchForAccount(a.Cookie, a.AuthUser, proxyURL, false, a.ID)
 		return err
 	})
 	if err != nil {

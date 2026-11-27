@@ -404,9 +404,12 @@ func wcSendWith(ctx context.Context, method, u, body, cookie, proxyURL string, s
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
-		if stream {
-			client = getStdlibStreamClient(proxyURL)
+		client, cerr := getStdlibClient(proxyURL)
+		if cerr == nil && stream {
+			client, cerr = getStdlibStreamClient(proxyURL)
+		}
+		if cerr != nil {
+			return nil, wcRedactErr(cerr)
 		}
 		resp, err := client.Do(req)
 		if err != nil {

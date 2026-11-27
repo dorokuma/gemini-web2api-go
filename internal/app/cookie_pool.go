@@ -78,9 +78,54 @@ func cookieValue(cookie, name string) string {
 	return ""
 }
 
+// cookieValuesForName 从一整串 cookie 里按出现顺序取指定名字的**全部**
+// 值（R11-8，Oracle B2）：重名多项保序返回；缺失返回 nil。与
+// cookieValuesEqual 同口径——同名多项的存在性与逐项值都是净变化判定的
+// 一部分，只认首项会把 `SIDCC=n; SIDCC=y` 被上游统一成 `SIDCC=n` 的
+// 真实尾项更新误判为净零（旧票 y 残留 DB 永不更新）。
+func cookieValuesForName(cookie, name string) []string {
+	var out []string
+	for _, kv := range splitCookiePairs(cookie) {
+		if kv[0] == name {
+			out = append(out, kv[1])
+		}
+	}
+	return out
+}
+
+// cookieNameValuesEqual 判定两份 cookie 串中指定名字的完整有序值列表
+// 是否逐项相等（R11-8）：缺失与空值严格区分、重名多项逐项比对。
+func cookieNameValuesEqual(a, b, name string) bool {
+	va, vb := cookieValuesForName(a, name), cookieValuesForName(b, name)
+	if len(va) != len(vb) {
+		return false
+	}
+	for i := range va {
+		if va[i] != vb[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // extractSAPISID 从一整串 cookie 里取 SAPISID 的值，取不到返回空串。
 func extractSAPISID(cookie string) string {
 	return cookieValue(cookie, "SAPISID")
+}
+
+// cookieFirstNonEmptyValue 按「首个非空值」口径取指定名字的值（R12-6，
+// Oracle S2/B4）：与 cookieIdentity / cookieSubset / cookieToCDP 的身份
+// 主键口径严格一致——重名多项时跳过空值项取第一个非空值；全部为空或
+// 缺失返回空串。缺票预检（换发 `__Secure-1PSID` 存在性判定）必须用本
+// 口径：首空后有效的票据与换发请求实际带出的子集是同一项，绝不能按
+// 只取首项的 cookieValue 误判缺失而整轮静默跳过。
+func cookieFirstNonEmptyValue(cookie, name string) string {
+	for _, kv := range splitCookiePairs(cookie) {
+		if kv[0] == name && kv[1] != "" {
+			return kv[1]
+		}
+	}
+	return ""
 }
 
 // cookieSubset 只留下指定名字的项，顺序跟原串一致。刷新 1PSIDTS 时不能把整串
@@ -232,8 +277,10 @@ func accountByID(id int64) *CookieAccount {
 }
 
 // accountDelete 删除一条。
+// R8-3：连带清除可核自动绑定来源记录（行已不存在，来源事实一并失效）。
 func accountDelete(id int64) error {
 	_, err := getDB().Exec(`DELETE FROM accounts WHERE id=?`, id)
+	clearAutoBoundProxy(id)
 	return err
 }
 
@@ -709,8 +756,11 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了。
 	// 管理面板的 Cookie 检测是辅助入口：allowSwitch=false，浏览器路径
 	// 驻留号坏了直接回错回退纯 Go HTTP，不偷换驻留 jar。
+	// R6-1：面板按 ID 检测（允许停用号）——已知的 a.ID 透传到底，纯 Go
+	// 回收写回只校验该行；A 停用而 B 同身份同序号启用时绝不把 A 的
+	// 响应反查写进 B。
 	invalidateXSRF(a.Cookie)
-	_, err = getXSRFSwitch(a.Cookie, a.AuthUser, proxyURL, false)
+	_, err = getXSRFSwitchForAccount(a.Cookie, a.AuthUser, proxyURL, false, a.ID)
 	took := time.Since(t0).Milliseconds()
 	if err != nil {
 		// 断网、被拦这类不是 cookie 的错，不动健康度（也不算成功）
@@ -752,22 +802,151 @@ func explainCookieFailure(err error) string {
 
 // bindAccountProxyLocked 记住这个账号这次用的出口，下次优先复用。
 // 调用方必须持有 claimMu——锁外写库会覆盖 claimAccountProxy 刚仲裁出的胜者。
-func bindAccountProxyLocked(accountID, proxyID int64) {
+// R7-3/R7-4（Reviewer MF-3/MF-4）：严格提交门控——Exec 出错或未写中任何
+// 行（RowsAffected==0：账号已删等）返回 false，调用方（autoBindAccountProxy
+// 等）绝不把未真实落库的绑定事实同步进驻留槽内存。
+// R8-5（Reviewer MF-5）：RowsAffected 自身出错同样返回 false——「驱动拿不到
+// 影响行数」不是已写中目标行的证据，绝不把不明行数当作成功。
+func bindAccountProxyLocked(accountID, proxyID int64) bool {
+	if accountID <= 0 {
+		return false
+	}
+	res, err := getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`, proxyID, accountID)
+	if err != nil {
+		logf("[cookie] 账号 #%d 绑定出口 #%d 落库失败: %v", accountID, proxyID, err)
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		logf("[cookie] 账号 #%d 绑定出口 #%d 影响行数不可知，按未写中处理: %v", accountID, proxyID, err)
+		return false
+	}
+	return n > 0
+}
+
+// autoBoundRecord 是一条可核的自动绑定来源事实（R8-3，Reviewer MF-3）：
+// 记录某账号最近一次经**自动绑定通道**（autoBindAccountProxy/claimAccountProxy
+// 首绑）真实落库的 (proxyID, proxyURL)。用途只有一个：冷建槽步骤 6 对齐与
+// exitCompatCheck 快照一致性复核时区分「并发自动绑定同步」与「管理员手工
+// PATCH 改绑」——手工 PATCH（bindAccountProxy）与账号删除会清除记录，
+// 管理员改绑到恰好等于溢出出口的代理时记录绝不命中，步骤 6 绝不对齐、
+// 下轮保活原样 fail-closed。
+type autoBoundRecord struct {
+	proxyID  int64
+	proxyURL string
+}
+
+// autoBoundProxyByAcct 由 claimMu 保护的 per-account 内存映射。
+var autoBoundProxyByAcct = map[int64]autoBoundRecord{}
+
+// isAutoBoundProxyForURL 只读查询：accountID 最近一次可核自动绑定是否恰好
+// 是 (proxyID, proxyURL)（短持 claimMu，绝不持 m.mu 调用）。
+func isAutoBoundProxyForURL(accountID, proxyID int64, proxyURL string) bool {
+	if accountID <= 0 || proxyID <= 0 || proxyURL == "" {
+		return false
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	rec, ok := autoBoundProxyByAcct[accountID]
+	return ok && rec.proxyID == proxyID && rec.proxyURL == proxyURL
+}
+
+// noteAutoBoundProxyLocked 登记一条可核自动绑定事实。调用方持 claimMu。
+func noteAutoBoundProxyLocked(accountID, proxyID int64, proxyURL string) {
+	if accountID <= 0 || proxyID <= 0 || proxyURL == "" {
+		return
+	}
+	autoBoundProxyByAcct[accountID] = autoBoundRecord{proxyID: proxyID, proxyURL: proxyURL}
+}
+
+// clearAutoBoundProxy 清除该账号的自动绑定来源记录（管理员手工 PATCH/POST
+// 改绑与账号删除调用）：之后的步骤 6 对齐与快照一致性复核绝不把它当作
+// 自动绑定放行。内部自持 claimMu（调用方不得持有）。
+func clearAutoBoundProxy(accountID int64) {
 	if accountID <= 0 {
 		return
 	}
-	_, _ = getDB().Exec(`UPDATE accounts SET proxy_id=? WHERE id=?`, proxyID, accountID)
+	claimMu.Lock()
+	delete(autoBoundProxyByAcct, accountID)
+	claimMu.Unlock()
+}
+
+// clearAutoBoundProxyLocked 是 clearAutoBoundProxy 的锁内版（调用方持 claimMu）。
+func clearAutoBoundProxyLocked(accountID int64) {
+	delete(autoBoundProxyByAcct, accountID)
 }
 
 // bindAccountProxy 是锁外入口（管理员 PATCH/POST 改绑、非严格模式的首绑/重绑落库）：
 // 加 claimMu 后与 claimAccountProxy 完全互斥——手动改绑不能插在「核库→写库」之间。
+// R8-3：手工改绑同时清除该账号的可核自动绑定来源记录——之后的冷建对齐与
+// 快照一致性复核绝不把人工改绑当作自动绑定放行。
 func bindAccountProxy(accountID, proxyID int64) {
 	if accountID <= 0 {
 		return
 	}
 	claimMu.Lock()
 	defer claimMu.Unlock()
-	bindAccountProxyLocked(accountID, proxyID)
+	clearAutoBoundProxyLocked(accountID)
+	if bindAccountProxyLocked(accountID, proxyID) {
+		// R12-2-M1：手工绑定写真实提交后递增驻留槽改绑代际——热注入
+		// 授权复核与提交注入之间的本次改绑必然被检出（锁序 claimMu
+		// -> m.mu 与 SyncAutoBoundProxy 一致）。
+		browserMgr.NoteAccountRebindCommitted(accountID)
+	}
+}
+
+// rebindAccountProxyAtomic 是管理员手工 PATCH 改绑的串行化原子版（R10-2，
+// Reviewer M5/Oracle M5）：「读取实际旧绑定 + 写入新绑定 + 清除自动来源
+// 记录」放进同一个 claimMu 临界区，返回该串行点上的**实际**旧绑定。
+// 调用方按「实际旧值 != 新值」决定是否触发槽位失效摘除——修复前 PATCH
+// 在进入 claimMu 之前提前读 before 快照算 proxyChanged：等待期间并发
+// 配额自动重绑提交后，PATCH 把 DB 从 P2 实际改回 P1 却按早先的
+// proxyChanged=false 跳过失效，旧 P2 槽及在途流继续存活。串行化后判定
+// 永远基于真实发生的改写，同值 PATCH（old == new）依旧不拆槽。
+//
+// R11-6（Oracle A7/Reviewer #5）：严格提交门控——仅当 UPDATE 真实命中
+// 目标行（Exec 无错且 RowsAffected > 0）才算改绑提交成功：先写库、确认
+// 成功后才清除自动来源记录并返回 updated=true。行不存在（并发 DELETE）
+// 或写库出错时返回 updated=false 与错误，调用方如实回面板错误且**绝不**
+// 按「已改绑」拆槽/中断在途流——修复前丢弃 bindAccountProxyLocked 的
+// false/错误且提前清来源：DELETE 抢先删行后绑定 UPDATE 命中 0 行，单字段
+// PATCH 仍回 200 ok:true 并拆掉健康槽，DB 实际从未改绑。
+func rebindAccountProxyAtomic(accountID, proxyID int64) (oldProxyID int64, updated bool, err error) {
+	if accountID <= 0 {
+		return 0, false, fmt.Errorf("account id required")
+	}
+	claimMu.Lock()
+	defer claimMu.Unlock()
+	// R12-5（Oracle S1/Reviewer #7）同值幂等：先在 claimMu 临界区内查询
+	// 目标行是否存在与当前实际旧绑定，按三种事实分支裁决——
+	//   - 行不存在（并发 DELETE）：明确 not found 错误，不清来源不拆槽；
+	//   - 行存在且旧值==新值：合法同值幂等成功——不依赖 MySQL 默认
+	//     clientFoundRows=false 下同值 UPDATE 的 RowsAffected()==0（它
+	//     返回的是**实际改变**行数而非匹配行数，同值 UPDATE 合法却命中
+	//     0 行被误当不存在回 400），直接清除残留自动来源记录返回成功；
+	//   - 行存在且值变更：执行 UPDATE 并严格确认命中后才清来源返回成功。
+	a := accountByID(accountID)
+	if a == nil {
+		return 0, false, fmt.Errorf(
+			"账号 #%d 不存在（未执行任何改绑）", accountID)
+	}
+	oldProxyID = a.ProxyID
+	if oldProxyID == proxyID {
+		clearAutoBoundProxyLocked(accountID)
+		return oldProxyID, true, nil
+	}
+	// 严格提交门控：写库未真实命中目标行（0 行：行已被并发删除；或
+	// Exec 出错/行数不明）时改绑事实不成立——不清除自动来源记录、
+	// 不向调用方谎报已改绑。
+	if !bindAccountProxyLocked(accountID, proxyID) {
+		return oldProxyID, false, fmt.Errorf(
+			"账号 #%d 绑定出口 #%d 落库失败或账号行已不存在（未执行任何改绑）", accountID, proxyID)
+	}
+	clearAutoBoundProxyLocked(accountID)
+	// R12-2-M1：改绑真实提交后递增驻留槽改绑代际（手工改绑必摘槽，
+	// 代际递增使提交前热注入复核绑定事实必然过期——双保险）。
+	browserMgr.NoteAccountRebindCommitted(accountID)
+	return oldProxyID, true, nil
 }
 
 // autoBindAccountProxy 是**非管理员自动写绑**的统一入口：在 claimMu 锁内先
@@ -792,7 +971,29 @@ func autoBindAccountProxy(accountID, proxyID int64) {
 	if a.ProxyID > 0 && proxyUsableByID(a.ProxyID) {
 		return // 已有仍有效的启用代理绑定：不打散粘性
 	}
-	bindAccountProxyLocked(accountID, proxyID)
+	// R7-3/R7-4：严格提交门控——只有真实写中目标行（Exec 无错且
+	// RowsAffected > 0）才允许同步驻留槽内存事实；写库失败/0 行命中时
+	// 绝不把未落库的绑定事实写进内存（否则 DB 与槽事实永久不一致）。
+	if !bindAccountProxyLocked(accountID, proxyID) {
+		return
+	}
+	// R12-2-M1：自动绑定真实提交后递增驻留槽改绑代际——驻留槽实际出口
+	// 与新绑定不符时 SyncAutoBoundProxy 不动槽事实，热注入授权复核仅靠
+	// (bcID, exitSyncVer) 对该交错不可见；rebindGen 使其必然被检出。
+	browserMgr.NoteAccountRebindCommitted(accountID)
+	// R8-3（Reviewer MF-3）：真实写中目标行后才登记可核的自动绑定来源——
+	// 冷建槽步骤 6 对齐与 exitCompatCheck 快照一致性复核只认这条记录
+	//（管理员手工 PATCH 会清掉它，绝不命中）。
+	url := proxyURLByID(proxyID)
+	noteAutoBoundProxyLocked(accountID, proxyID, url)
+	// R6-4（Reviewer MF-4）：合法自动首绑（0 -> P）/合法自动重绑
+	//（P旧 -> P新）落库后，把实际出口与新绑定一致的驻留槽绑定事实
+	// 同步更新——下轮保活续期照常放行；管理员手工 PATCH 改绑不经此
+	// 入口，驻留槽 orig 保持旧值仍严格拦截（负对照不变）。
+	// 锁序：claimMu -> m.mu（m.mu 出度为 0，无任何反向获取路径）。
+	if shouldUseBrowserTransport() && url != "" {
+		browserMgr.SyncAutoBoundProxy(accountID, proxyID, url)
+	}
 }
 
 // claimMu 把「查当前绑定 → 决定胜者 → 必要时写库」串成原子操作。
@@ -809,9 +1010,15 @@ var claimMu sync.Mutex
 //     这是显式的「绝不走代理」承诺，仲裁也不能把它改成别的出口；
 //   - 未绑定 / 绑定已失效（删除或禁用）：把 candidateProxyID 写库并返回它（本次请求胜出）。
 //
+// 返回 (winner, ok)：R8-5（Reviewer MF-5）严格提交门控贯穿仲裁调用方——
+// 写库未真实命中目标行（0 行：账号在核库与 UPDATE 之间被并发删除等；或
+// RowsAffected 出错的不明行数）时 ok=false，调用方绝不把候选出口当作
+// 已赢得仲裁（严格仲裁须显式传播失败/释放槽位并拒绝继续外发，绝不能
+// 落到匿名/直连）。ok=false 时 winner 无意义。
+//
 // 调用方在拿到 slot 后、发任何出站请求之前调；返回值 != 手上的 picked.ID 时
 // 必须释放手上的 slot、按返回值重新 acquireSlot——胜者是别的并发请求绑的。
-func claimAccountProxy(accountID, candidateProxyID int64) int64 {
+func claimAccountProxy(accountID, candidateProxyID int64) (int64, bool) {
 	claimMu.Lock()
 	defer claimMu.Unlock()
 	cur := int64(0)
@@ -819,13 +1026,36 @@ func claimAccountProxy(accountID, candidateProxyID int64) int64 {
 		cur = a.ProxyID
 	}
 	if cur == proxyIDDirect {
-		return proxyIDDirect // 锁定直连：任何候选出口都不得覆写
+		return proxyIDDirect, true // 锁定直连：任何候选出口都不得覆写
 	}
 	if cur > 0 && proxyEnabledByID(cur) {
-		return cur
+		return cur, true
 	}
-	bindAccountProxyLocked(accountID, candidateProxyID)
-	return candidateProxyID
+	// R8-5：写库真实命中才算本次请求胜出——0 行/行数不明时不返回候选代理，
+	// 严格仲裁调用方据此 fail-closed（释放槽位拒绝外发）。
+	if !bindAccountProxyLocked(accountID, candidateProxyID) {
+		return 0, false
+	}
+	// R8-3：严格模式首绑同样是自动绑定通道——登记可核来源（proxyID>0 且
+	// URL 非空才登记；直连候选不产生可核代理绑定事实）。
+	url := proxyURLByID(candidateProxyID)
+	noteAutoBoundProxyLocked(accountID, candidateProxyID, url)
+	// R12-2-M1：仲裁绑定真实提交后递增驻留槽改绑代际（热注入复核
+	// 与提交之间的本次首绑必然被检出）。
+	browserMgr.NoteAccountRebindCommitted(accountID)
+	// R11-1（Oracle A1）：严格仲裁写库成功后必须同步推进驻留槽事实——
+	// 此前严格首绑登记来源后直接返回、不调 SyncAutoBoundProxy，驻留槽的
+	// exitSyncVer 不推进：复核已确认漂移、暂停在版本值守卫之前的请求，
+	// 在严格仲裁把账号实际绑到本槽出口（合法恢复）之后，仍按旧版本提交
+	// 摘除，误杀刚恢复的合法槽并终止在途流。与非严格 autoBindAccountProxy
+	// 完全同构：仅当驻留槽实际出口正是候选出口时同步 orig/bound 并递增
+	// exitSyncVer（版本失配使悬挂的摘除决定自动放弃）。锁序合法：
+	// claimMu → m.mu（m.mu 出度为 0，与 autoBindAccountProxy 同序，无
+	// m.mu → claimMu 反取路径）。
+	if shouldUseBrowserTransport() && url != "" {
+		browserMgr.SyncAutoBoundProxy(accountID, candidateProxyID, url)
+	}
+	return candidateProxyID, true
 }
 
 // accountDisplayName 面板/记录里显示的账号名，没填标签就用 #id。
@@ -1031,19 +1261,59 @@ func mergeSetCookie(cookie string, setCookie []string) string {
 	return strings.Join(parts, "; ")
 }
 
+// cookieValuesEqual 按解析后的实际有序 (name, value) 列表逐项比对两份
+// Cookie 串是否等价（R9-7 初版、R10-8 修正，Reviewer S2）：仅忽略纯
+// 分隔符格式差异（"; " 与 ";" / 首尾空白），其余差异一律算变化：
+//   - 空值键 k= 与缺失键严格区分（mergeSetCookie 会保留非过期的空值
+//     键、cookieToCDP 也会播种空值——二者混同会让 Jar 新增的 k= 静默
+//     丢失写库）；
+//   - 同名多项全部保留逐项比对（裸串导入允许重名：DB k=x;k=y、Jar
+//     k=x 合并后两项均为 x，只认首值会误判净零跳过写库，尾部旧票永
+//     不更新）；
+//   - 键序差异算变化：mergeSetCookie 合并本身保序（cur 顺序 + 新键
+//     追加），纯重排在真实合并路径不存在，线性比较即充分（Reviewer
+//     S2 判据）。
+func cookieValuesEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	pa, pb := splitCookiePairs(a), splitCookiePairs(b)
+	if len(pa) != len(pb) {
+		return false
+	}
+	for i := range pa {
+		if pa[i] != pb[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // cookieIdentity 取能代表"这是哪个账号"的那几项。
 //
 // SAPISID 用来算授权头、__Secure-1PSID 是会话主键，两者都不随刷新变化（2 小时
 // 抓包里 0 次变动，变的只有 *SIDCC 和 *SIDTS 那两族）。所以它们变了就说明这份
 // cookie 已经不是原来那个账号了。
+//
+// R11-8（Oracle B4）重复主键口径统一：重名多项取**首个非空值**，与
+// cookieSubset（换发请求实际带出的子集——seen 去重后只有首个非空项被发出）
+// 严格一致。此前 cookieIdentity 取末项而 cookieSubset 取首个非空项：输入
+// `SAPISID=x; SAPISID=y` 时授权身份按 y 裁决，实际送出的却是 x——同一身份
+// 键的共享缓存与热注入可能领取不对应自己会话的票。统一后同一份输入在
+// 「身份裁决」与「实际换发请求」两侧永远指向同一个值；首项非空时口径与
+// 末项无关，正常（无重复）输入行为完全不变。
 func cookieIdentity(cookie string) string {
 	var sapisid, psid string
 	for _, kv := range splitCookiePairs(cookie) {
 		switch kv[0] {
 		case "SAPISID":
-			sapisid = kv[1]
+			if sapisid == "" {
+				sapisid = kv[1]
+			}
 		case "__Secure-1PSID":
-			psid = kv[1]
+			if psid == "" {
+				psid = kv[1]
+			}
 		}
 	}
 	return sapisid + "|" + psid
@@ -1087,6 +1357,147 @@ func updateAccountCookie(id int64, cookie string) {
 	if bump && shouldUseBrowserTransport() {
 		browserMgr.InvalidateAccount(id, false, "cookie rotated")
 	}
+}
+
+// mergeAccountSetCookie 把一次响应的增量 Set-Cookie 并发安全地合并进账号
+// Cookie 并落库（替代调用方在锁外算好整串再 updateAccountCookie 的旧路径）。
+//
+// 为什么必须存在：旧路径在流开始前取快照、流结束锁外算 merged 再整串覆写——
+// 流持续期间后台保活刚刷新过 DB 中的 __Secure-1PSIDTS 时，整串覆写会把它
+// 倒退回旧值（丢失刚续期的短命票）。本函数在 L1 acctCookieLock 内重读 DB
+// 最新 cur、在锁内基于最新 cur 增量合并，只更新本次 Set-Cookie 实际下发的键，
+// 绝不触碰并发刷新的其它键。
+//
+// expectedIdentity 是**请求发出时**的 cookieIdentity（调用方在发出请求前从
+// 当时的 Cookie 算出）：长流持续期间同 ID 账号可能已被 accountSync 换绑到
+// 另一个会话——此时 cookieIdentity(cur) 已变，本次响应的增量（旧会话 A 的
+// SIDCC）绝不能合并进已换绑为会话 B 的同 ID 账号，直接丢弃整个回写。
+// 空串与 "|" 视为无可核身份（R7-2，Reviewer MF-2）：整个跳过写回——
+// --cookie-file 等缺身份字段的合法旧配置在等待写回期间可能已被换绑到新
+// 会话，无可核身份就没有任何手段分辨「旧会话派生票据」与「新会话票据」，
+// fail-closed 绝不碰 DB（导入/检测旧配置的兼容读不受影响）。
+//
+// R6-2（Reviewer MF-2）：expectedAuthuser 是**请求发出时**的账号序号
+// （调用方按 /u/N 发出，恒知该值）：纯 Go 长流在飞期间管理员 PATCH 只改
+// 序号不改 cookie 时，/u/0 的 SIDCC 绝不能写进已变为 /u/1 的同一行——
+// L1 锁内重读 cur.AuthUser 校验，且 SQL CAS 同样追加 authuser 谓词。
+// 与 mergeAccountSetCookieIfNoActiveBrowser 对齐。
+//
+// 仅在 merged != cur 且 CAS 写库真实成功时 BumpAccountEpoch + 放锁后
+// InvalidateAccount（同 updateAccountCookie 的既有语义）。
+func mergeAccountSetCookie(id int64, setCookie []string, sourceURL, expectedIdentity string, expectedAuthuser int) {
+	if id <= 0 || len(setCookie) == 0 {
+		return
+	}
+	// R7-2：无可核身份一律跳过写回——旧配置缺身份串的票绝不能污染
+	// 同 ID 换绑后的新会话。
+	if expectedIdentity == "" || expectedIdentity == "|" {
+		return
+	}
+	unlock, err := acquireAcctCookieLock(context.Background(), id)
+	if err != nil {
+		return
+	}
+	cur := accountByID(id)
+	if cur == nil || cur.Status != "enabled" {
+		unlock()
+		return
+	}
+	// 请求身份守卫：发请求时的身份与 L1 内重读的最新身份不符——会话已换绑，
+	// 本次旧会话派生票据绝不写回新会话所在行。
+	if cookieIdentity(cur.Cookie) != expectedIdentity {
+		unlock()
+		return
+	}
+	// R6-2 请求序号守卫：持锁等待/长流期间管理员 PATCH 改了 authuser 时
+	// 整个跳过（/u/0 的票据绝不写进已变为 /u/1 的账号）。
+	if cur.AuthUser != expectedAuthuser {
+		unlock()
+		return
+	}
+	merged := mergeSetCookieForHost(cur.Cookie, setCookie, sourceURL, geminiCookieTargetHost)
+	if merged == cur.Cookie {
+		unlock()
+		return
+	}
+	written := updateAccountCookieCASLockedAuthuser(id, cur.Cookie, merged, expectedAuthuser)
+	bump := written
+	if bump {
+		browserMgr.BumpAccountEpoch(id)
+	}
+	unlock()
+	if bump && shouldUseBrowserTransport() {
+		browserMgr.InvalidateAccount(id, false, "cookie rotated")
+	}
+}
+
+// mergeAccountSetCookieIfNoActiveBrowser 是辅助 /app 回收路径专用的严格守卫
+// 增量写回（fix #4）：把「同账号/同 cookieIdentity 无任何活跃或 creating
+// 浏览器槽」的原子检查与写库放进同一个 L1 临界区，消除锁外
+// HasActiveAccountOrIdentity 检查与 L1 内写库之间的 TOCTOU 窗口——检查与
+// 写库之间绝不可能插进一个已注册未播种的建槽。
+//
+// 守卫命中（存在活跃/creating 槽）时整个跳过：不写库、不 BumpAccountEpoch、
+// 不 InvalidateAccount——该号 jar 由 SyncAccountCookiesBack 负责。守卫放行时
+// 才走 mergeAccountSetCookie 同构的增量合并 + CAS 写库 + BumpAccountEpoch；
+// 刻意**不** InvalidateAccount：此刻无槽可拆，而检查之后才新建的槽播种的
+// 已是本次写库后的新 Cookie，绝不能按 ID 无条件拆掉它。锁序遵守 L1→L2：
+// acctCookieLock 内短持 browserMgr.mu（m.mu 出度为 0，无反向获取）。
+func mergeAccountSetCookieIfNoActiveBrowser(id int64, setCookie []string, sourceURL, expectedIdentity string, expectedAuthuser int) {
+	if id <= 0 || len(setCookie) == 0 {
+		return
+	}
+	// R7-2（Reviewer MF-2）：无可核身份（""/"|"）一律跳过写回——缺身份
+	// 字段的旧配置（--cookie-file 合法接纳）在等待写回期间被换绑到新会话时，
+	// 没有任何手段分辨新旧会话票据，fail-closed 绝不把旧票落进新会话行。
+	if expectedIdentity == "" || expectedIdentity == "|" {
+		return
+	}
+	unlock, err := acquireAcctCookieLock(context.Background(), id)
+	if err != nil {
+		return
+	}
+	cur := accountByID(id)
+	if cur == nil || cur.Status != "enabled" {
+		unlock()
+		return
+	}
+	if cookieIdentity(cur.Cookie) != expectedIdentity {
+		unlock()
+		return
+	}
+	// R5-3（Reviewer MF-3）：持锁等待期间管理员可能已 PATCH 改了
+	// authuser——锁内重读的 cur.AuthUser 与本次请求点名的序号不符时
+	// 整个跳过：/u/0 的票据绝不能写进已变为 /u/1 的账号。
+	if cur.AuthUser != expectedAuthuser {
+		unlock()
+		return
+	}
+	// 原子守卫：L1 临界区内检查**本账号自身**的活跃与 creating 槽——锁外检查
+	// 与 L1 内写库之间的建槽注册窗口在此被彻底关闭。
+	// Oracle MF-1：守卫粒度必须与写库粒度一致（都只针对本账号 id 自身）。
+	// 同身份兄弟号有活跃槽绝不是本账号跳过写库的理由——本账号的 SIDCC 只能
+	// 由它自己的回收路径落库，否则兄弟号驻留会让本账号的新票永久不进 DB
+	// （静默失效）。
+	if shouldUseBrowserTransport() && browserMgr.HasActiveOrCreatingAccount(id) {
+		unlock()
+		return
+	}
+	merged := mergeSetCookieForHost(cur.Cookie, setCookie, sourceURL, geminiCookieTargetHost)
+	if merged == cur.Cookie {
+		unlock()
+		return
+	}
+	// R5-3：SQL CAS 同样带 authuser 谓词——上游 /app I/O 发生在持锁之前，
+	// 等待 L1 期间管理员 PATCH 改了 authuser 的行 0 行命中，绝不落库。
+	written := updateAccountCookieCASLockedAuthuser(id, cur.Cookie, merged, expectedAuthuser)
+	if written {
+		browserMgr.BumpAccountEpoch(id)
+		invalidateXSRF(cur.Cookie)
+	}
+	unlock()
+	// 绝不 InvalidateAccount：守卫已确认无活跃/creating 槽，检查之后新建的槽
+	// 播种的是新 Cookie，按 ID 拆槽只会误杀它。
 }
 
 // accountSyncResult 是 accountSync 的结果：动作是 added / updated / unchanged。
@@ -1245,7 +1656,7 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	}
 	// MF-6：真实写库成功后在 L1 内 BumpAccountEpoch（无条件推进，不门控
 	// shouldUseBrowserTransport），杜绝新 cookie 与并发回写交错时代际漂移。
-	browserMgr.BumpAccountEpoch(hitID)
+	newEpoch := browserMgr.BumpAccountEpoch(hitID)
 	unlock()
 
 	if reenabled {
@@ -1257,7 +1668,12 @@ func accountSync(label string, authuser int, cookie string) (accountSyncResult, 
 	invalidateXSRF(c)
 	recordAccountReqSuccess(hitID, nextClientReqID())
 	if shouldUseBrowserTransport() {
-		browserMgr.InvalidateAccount(hitID, false, "cookie synced")
+		// R12-4（Oracle M7/Reviewer #5）代际条件失效：L1 释放后的锁外窗口
+		// 内，新身份 Y 的前台请求可能已建好并发布健康 Y 槽（epoch 严格大于
+		// 本次 Bump 值）并开始使用——按账号 ID 无条件摘除会把新 Y 槽连同
+		// 在途流一起误杀。仅摘除旧代际（epoch < newEpoch）驻留槽：本就是
+		// 换身份目标的旧 X 槽被清理，新 Y 槽及其在途流绝不受损。
+		browserMgr.InvalidateAccountIfEpochBefore(hitID, newEpoch, "cookie synced")
 	}
 	return accountSyncResult{ID: hitID, Action: "updated"}, nil
 }
