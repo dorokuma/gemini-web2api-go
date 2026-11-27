@@ -3,6 +3,8 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,9 +117,9 @@ const (
 // 没有冷却、面板上看不到任何状态。池子里放一个，处处严格更好。
 //
 // 现在请求路径只认池子，这个函数负责把旧入口的值搬进来。
-func seedProxiesFromConfig() {
+func seedProxiesFromConfig() error {
 	migrateLegacyStaticProxy()
-	syncSeededProxy()
+	return syncSeededProxy()
 }
 
 // migrateLegacyStaticProxy 一次性把 kv 里遗留的静态代理搬进池子。
@@ -171,33 +173,47 @@ func legacyStaticProxy() string {
 // 继续接流量，成了一条谁也不知道还在用的僵尸出口。
 //
 // 值没变时**完全不碰池子**：用户在面板上对这条记录的增删改停用，都以面板为准。
-func syncSeededProxy() {
+//
+// R12-1（Oracle M4/Reviewer #1）fail-closed：非空的 --proxy 必须先通过严格
+// 校验才能触碰池子——此前顺序相反（先 dropSeededProxy 撤掉旧播种行，再入池），
+// 新值非法时旧行已删、新行入池失败仅记日志：显式要求代理的部署静默退化为
+// 池空直连（或后台轮转拿到空 URL），把非法显式配置解释成用户选择直连。
+// 修复后：非空且非法直接返回配置错误（旧播种行原样保留，绝不先删），由
+// 启动入口 fail-closed 终止；DB 写入类的入池失败（非校验错误）沿用旧的
+// 「记日志、下次重试」语义返回 nil。
+func syncSeededProxy() error {
 	url := strings.TrimSpace(cfg.Proxy)
 	prev := kvGet(kvSeededProxyURL)
 	if url == prev {
-		return
+		return nil
+	}
+	if url != "" {
+		if err := validateProxyURL(url); err != nil {
+			return fmt.Errorf("--proxy 配置的代理 URL 非法（%v），拒绝启动（绝不静默退化直连）", err)
+		}
 	}
 	dropSeededProxy(prev)
 	if url == "" {
 		_ = kvSet(kvSeededProxyURL, "")
 		_ = kvSet(kvSeededProxyID, "")
 		logf("[proxy] --proxy 已从启动参数移除，对应的池子记录一并撤下")
-		return
+		return nil
 	}
 	if poolHasProxyURL(url) {
 		// 用户自己已经在面板加过同一个出口，不重复建，只记下来
 		_ = kvSet(kvSeededProxyURL, url)
 		_ = kvSet(kvSeededProxyID, "")
-		return
+		return nil
 	}
 	id, err := proxyCreate("启动参数", url, 1)
 	if err != nil {
 		logf("[proxy] --proxy 入池失败: %v", err)
-		return // 不记 URL，下次启动还会再试
+		return nil // 不记 URL，下次启动还会再试
 	}
 	_ = kvSet(kvSeededProxyURL, url)
 	_ = kvSet(kvSeededProxyID, strconv.FormatInt(id, 10))
 	logf("[proxy] --proxy / config.json 的代理已加入代理池")
+	return nil
 }
 
 // dropSeededProxy 撤掉上一次由启动参数建的那条。
@@ -368,23 +384,58 @@ func proxyCreate(name, url string, weight int) (int64, error) {
 	return id, nil
 }
 
-// validateProxyURL 校验代理 URL 协议。
+// validateProxyURL 严格校验代理 URL（R11-4，Oracle A5）：
 // 支持 http / https / socks5 / socks5h。
+//
+// 除 scheme 前缀外还必须通过 net/url.Parse 完整解析且 Host 非空——
+// 此前只查前缀：带合法前缀但解析失败的录入错误（如 `http://user:pa ss@host`
+// 或控制字符）能进入启用池，而 stdlibClientWithin 对解析失败的 URL 会退回
+// Transport.Proxy == nil 的**直连** transport（携 Cookie 静默直出本机 IP）。
+// 严格校验把这类值挡在录入/更新边界；存量非法库值由使用侧
+// （stdlibClientWithin / rotateProxyURL 等）在使用时明确报错拒绝，同样绝不
+// 静默直连。
 //
 // scheme 按大小写不敏感比：URL 的 scheme 本来就不区分大小写，url.Parse 会统一转小写，
 // 所以 HTTP:// 在 4.0.0 那条不做校验的静态代理路径上是能正常工作的。校验若大小写
 // 敏感，升级时就会把这种值拦下来 —— 用户什么都没改，代理却不工作了。
 func validateProxyURL(s string) error {
 	low := strings.ToLower(s)
+	schemeOK := false
 	for _, p := range []string{"http://", "https://", "socks5://", "socks5h://"} {
 		if strings.HasPrefix(low, p) {
-			return nil
+			schemeOK = true
+			break
 		}
 	}
-	return errors.New("代理 URL 必须以 http:// / https:// / socks5:// / socks5h:// 开头")
+	if !schemeOK {
+		return errors.New("代理 URL 必须以 http:// / https:// / socks5:// / socks5h:// 开头")
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		// R12-1（Oracle M5/Reviewer #1）：net/url 的 *url.Error 会把**原始
+		// 输入串**放进 URL 字段并格式化进错误文本——带认证信息或私有路径
+		// 的代理一旦录入出错，原串会越过配置边界进入错误/运行日志。此处
+		// 统一返回脱敏占位原因，绝不含原始 URL 字符串或其任何片段。
+		return errors.New("代理 URL 解析失败（绝不静默直连）")
+	}
+	// R12-1（Oracle S4/Reviewer #1）：必须核 Hostname 而非 Host——
+	// `http://:8080` 这类仅端口无主机名的 authority 解析出非空 Host
+	// 但空 Hostname，照样能逃过 Host 检查进入启用池。
+	if u.Hostname() == "" {
+		return errors.New("代理 URL 缺少主机名（绝不静默直连）")
+	}
+	return nil
 }
 
 func proxyUpdate(id int64, name, url string, enabled *bool, weight *int) error {
+	// R11-4（Oracle A5）：更新同样严格校验 URL——此前只校验新增，存量
+	// 记录可经 PATCH 写入解析失败的 URL 进入启用池，使用侧静默直连。
+	// 非法值直接报错零写库（不改名称/权重/启用态的任何组合写入）。
+	if url != "" {
+		if err := validateProxyURL(url); err != nil {
+			return err
+		}
+	}
 	// 快照旧值：InvalidateByProxy 按 oldURL/oldEnabled 精准判定（仅删除、
 	// URL 变更或禁用时失效；仅改名称/权重不打断在途流）。
 	old := proxyByID(id)
@@ -623,4 +674,25 @@ func proxyURLByID(id int64) string {
 		}
 	}
 	return ""
+}
+
+// proxyAtomicSnapshot 在**单次** proxyMu.RLock 内原子读取代理的存在性、
+// 启用态与 URL（R10-3，Reviewer M3）：rotateProxyURL 此前分两次独立
+// RLock 分别读 enabled 与 URL——两次读取之间代理被删除时会拼出
+// 「enabled=true 但 url=\"\"」的 (\"\", nil)，该组合在前后任何一个真实
+// 状态中都不存在，下游 rotateDo 把空串当直连，携 Cookie 静默直出。
+// 单次原子快照彻底杜绝该组合：返回的 (found, enabled, url) 必然来自
+// 同一时刻的同一行。
+func proxyAtomicSnapshot(id int64) (found, enabled bool, url string) {
+	if id <= 0 {
+		return false, false, ""
+	}
+	proxyMu.RLock()
+	defer proxyMu.RUnlock()
+	for _, p := range proxyCache {
+		if p.ID == id {
+			return true, p.Enabled, p.URL
+		}
+	}
+	return false, false, ""
 }

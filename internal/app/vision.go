@@ -155,7 +155,11 @@ func fetchImage(src, proxyURL string, idx int) (pendingUpload, error) {
 			return pendingUpload{}, err
 		}
 		applyChromeHeaders(req)
-		resp, err := getStdlibClient(proxyURL).Do(req)
+		sc, cerr := getStdlibClient(proxyURL)
+		if cerr != nil {
+			return pendingUpload{}, fmt.Errorf("image %d: fetch failed: %w", idx, cerr)
+		}
+		resp, err := sc.Do(req)
 		if err != nil {
 			return pendingUpload{}, fmt.Errorf("image %d: fetch failed: %w", idx, err)
 		}

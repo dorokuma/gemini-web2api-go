@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -45,8 +46,8 @@ func TestClaimAccountProxyLockedDirect(t *testing.T) {
 	id := addTestAccount(t, "lockedDirect")
 	bindAccountProxy(id, proxyIDDirect)
 	// 候选是代理 B 也必须返回 -1，绝不覆写绑定
-	if got := claimAccountProxy(id, b); got != proxyIDDirect {
-		t.Fatalf("锁定直连被覆写成 %d", got)
+	if got, ok := claimAccountProxy(id, b); !ok || got != proxyIDDirect {
+		t.Fatalf("锁定直连被覆写成 %d（ok=%v）", got, ok)
 	}
 	if a := accountByID(id); a == nil || a.ProxyID != proxyIDDirect {
 		t.Fatalf("库中绑定被改：%+v", a)
@@ -303,4 +304,218 @@ func TestProbeGeminiWithAccountStrictAnonymity(t *testing.T) {
 		t.Fatalf("严格匿名探测绝不许带池里账号的 Cookie：%q", sawCookie)
 	}
 	_ = res
+}
+
+// （原 R10-3 的 TestRotateProxyURLAtomicSnapshotInvariant 静态四态断言已按
+// Reviewer #5/B3 移除：依次设置四个静态状态的断言对旧两次 RLock 实现同样
+// 成立，不能证明单次快照原子性——由本文件下方
+// TestRotateProxyURLConcurrentSnapshotNeverHalfState 并发行为压测替代。）
+
+// TestProxyURLStrictValidation 复核 R11-4（Oracle A5）：代理新增与更新均执行
+// 严格 url.Parse 校验（scheme 合法且 host 非空）；存量非法库值在使用侧
+// （stdlibClientWithin / rotateProxyURL）明确报错——绝不构造 Transport.Proxy
+// == nil 的可直发 transport（nil Proxy 即直连，与 fallback_direct 无关，携
+// Cookie 静默直出本机 IP）。全部离线断言，无需发送任何请求。
+func TestProxyURLStrictValidation(t *testing.T) {
+	t.Run("录入与更新拒绝解析失败的URL", func(t *testing.T) {
+		// url.Parse 明确拒绝但带受支持 scheme 前缀的合成录入错误：
+		// userinfo 里的空格触发 parse 错误，修复前只查前缀能入池。
+		bad := "http://user:pa ss@127.0.0.1:8080"
+		if err := validateProxyURL(bad); err == nil {
+			t.Fatal("解析失败的代理 URL 必须被录入校验拒绝")
+		}
+		if _, err := proxyCreate("badentry", bad, 1); err == nil {
+			t.Fatal("proxyCreate 必须拒绝解析失败的 URL")
+		}
+		// 合法 URL 正常入池。
+		id, err := proxyCreate("okentry", "http://user:pass@127.0.0.1:18080", 1)
+		if err != nil {
+			t.Fatalf("合法代理必须能入池: %v", err)
+		}
+		defer func() { _ = proxyDelete(id) }()
+		// 更新路径同样严格校验（修复前 proxyUpdate 零校验）。
+		if err := proxyUpdate(id, "", bad, nil, nil); err == nil {
+			t.Fatal("proxyUpdate 必须拒绝解析失败的 URL")
+		}
+		if p := proxyByID(id); p == nil || p.URL != "http://user:pass@127.0.0.1:18080" {
+			t.Fatalf("被拒的更新绝不能写库: %+v", p)
+		}
+		// 缺主机名的 URL 同样拒绝。
+		if err := validateProxyURL("http://"); err == nil {
+			t.Fatal("缺主机名的代理 URL 必须被拒绝")
+		}
+		if err := proxyUpdate(id, "", "http://", nil, nil); err == nil {
+			t.Fatal("缺主机名的更新必须被拒绝")
+		}
+	})
+
+	t.Run("stdlibClientWithin对非法URL明确报错绝不直连", func(t *testing.T) {
+		// 修复前：url.Parse 失败静默退回 Transport.Proxy == nil 的普通
+		// client（直连）。修复后必须明确返回错误；合法 URL 的 transport
+		// Proxy 必非 nil。
+		if _, err := stdlibClientWithin("http://user:pa ss@127.0.0.1:8080", 0); err == nil {
+			t.Fatal("解析失败的代理 URL 必须明确报错（绝不直连回退）")
+		}
+		if _, err := stdlibClientWithin("", 0); err == nil {
+			t.Fatal("空代理串不属于 stdlibClientWithin 契约，必须报错防御")
+		}
+		c, err := stdlibClientWithin("http://127.0.0.1:18099", 0)
+		if err != nil {
+			t.Fatalf("合法代理必须能构造 client: %v", err)
+		}
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok || tr.Proxy == nil {
+			t.Fatal("合法代理 client 的 Transport.Proxy 必须非 nil（绝不直连）")
+		}
+		u, err2 := tr.Proxy(nil)
+		_ = err2
+		_ = u
+	})
+
+	t.Run("存量非法库值在保活解析时明确拒绝", func(t *testing.T) {
+		// 覆盖已有库值：手工把非法 URL 直接写进内存池（绕过录入校验，
+		// 模拟升级前已入库的存量数据）——rotateProxyURL 必须明确报错，
+		// 绝不静默直发。
+		proxyMu.Lock()
+		oldProxies := proxyCache
+		proxyCache = append(append([]Proxy{}, proxyCache...),
+			Proxy{ID: 999001, Name: "legacybad", URL: "http://user:pa ss@10.0.0.1:8080", Enabled: true})
+		proxyMu.Unlock()
+		defer func() { proxyMu.Lock(); proxyCache = oldProxies; proxyMu.Unlock() }()
+		u, err := rotateProxyURL(CookieAccount{ID: 20, ProxyID: 999001})
+		if err == nil {
+			t.Fatal("存量非法库值在保活解析时必须明确报错")
+		}
+		if u != "" {
+			t.Fatalf("非法库值绝不放行出口 URL: %q", u)
+		}
+	})
+}
+
+// TestRotateProxyURLConcurrentSnapshotNeverHalfState 替换原静态四态测试
+// （Reviewer #5/B3）：依次设置四个静态状态的断言对旧两次 RLock 实现同样
+// 成立，不能证明 M3 回归。本测试以并发切换代理快照的行为压测替代：副
+// 协程在 enabled/disabled/删除/URL 变更之间真实并发切换，主循环持续按
+// 绑定解析出口——任何一次返回都只能是「完整代理事实（非空 URL + nil）」
+// 或「明确错误 + 空 URL」，半态 ("", nil) 在任一快照组合下都绝不可能
+// 出现（旧两次读实现在两次读之间切换时会拼出它，本测试随机命中即红）。
+func TestRotateProxyURLConcurrentSnapshotNeverHalfState(t *testing.T) {
+	proxyMu.Lock()
+	oldProxies := proxyCache
+	base := []Proxy{
+		{ID: 910001, Name: "cc1", URL: "http://cc1:8080", Enabled: true},
+		{ID: 910002, Name: "cc2", URL: "http://cc2:8080", Enabled: true},
+	}
+	proxyCache = append([]Proxy{}, base...)
+	proxyMu.Unlock()
+	defer func() { proxyMu.Lock(); proxyCache = oldProxies; proxyMu.Unlock() }()
+	setRuntimeCfg(t, func(c *RuntimeConfig) { c.FallbackDirect = false })
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				i++
+				proxyMu.Lock()
+				switch i % 4 {
+				case 0: // 完整启用
+					proxyCache = append([]Proxy{}, base...)
+				case 1: // 目标禁用
+					proxyCache = []Proxy{
+						{ID: 910001, Name: "cc1", URL: "http://cc1:8080", Enabled: false},
+						{ID: 910002, Name: "cc2", URL: "http://cc2:8080", Enabled: true},
+					}
+				case 2: // 目标删除
+					proxyCache = []Proxy{
+						{ID: 910002, Name: "cc2", URL: "http://cc2:8080", Enabled: true},
+					}
+				case 3: // URL 变更（仍启用）
+					proxyCache = []Proxy{
+						{ID: 910001, Name: "cc1", URL: "http://cc1b:8080", Enabled: true},
+						{ID: 910002, Name: "cc2", URL: "http://cc2:8080", Enabled: true},
+					}
+				}
+				proxyMu.Unlock()
+			}
+		}
+	}()
+
+	for i := 0; i < 20000; i++ {
+		u, err := rotateProxyURL(CookieAccount{ID: 30, ProxyID: 910001})
+		// 不变式：err != nil XOR url == ""——("", nil) 半态绝不存在；
+		// 且成功时的 URL 必然属于某一真实快照状态（cc1 或 cc1b）。
+		if err == nil {
+			if u == "" {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("并发快照切换中出现 ('', nil) 半态（两次读拼装事故，M3 回归）")
+			}
+			if u != "http://cc1:8080" && u != "http://cc1b:8080" {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("成功出口必须来自某一真实快照状态，得到 %q", u)
+			}
+		} else if u != "" {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("错误时出口必为空串，得到 %q", u)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestProxyURLSanitizedErrorsAndHostname 复核 R12-1（Oracle M5/S4/Reviewer #1）：
+//
+//	① 解析失败错误绝不回显原始 URL——net/url 的 *url.Error 会把输入串（含
+//	   userinfo 认证/私有路径）格式化进错误文本，代理凭据或路径标记越过配置
+//	   边界进入错误与运行日志。合成审计标记 AUDIT-MARK 仅存在于原始串中，
+//	   两个入口（validateProxyURL / stdlibClientWithin）返回的错误都绝不含它；
+//	② 仅端口无主机名的 authority（http://:8080）解析出非空 Host 但空
+//	   Hostname——必须按缺主机拒绝（修复前只查 u.Host 漏过）。
+//	③ logf 记录同样不含标记（globalLogBuffer 无脱敏）。
+func TestProxyURLSanitizedErrorsAndHostname(t *testing.T) {
+	const marked = "http://proxy.invalid/AUDIT-MARK/%zz"
+	t.Run("校验与构造入口错误均脱敏", func(t *testing.T) {
+		err1 := validateProxyURL(marked)
+		if err1 == nil {
+			t.Fatal("解析失败的代理 URL 必须被拒")
+		}
+		if strings.Contains(err1.Error(), "AUDIT-MARK") {
+			t.Fatalf("validateProxyURL 错误绝不能回显原始 URL 片段: %q", err1.Error())
+		}
+		_, err2 := stdlibClientWithin(marked, 0)
+		if err2 == nil {
+			t.Fatal("stdlibClientWithin 对解析失败 URL 必须报错（绝不直连回退）")
+		}
+		if strings.Contains(err2.Error(), "AUDIT-MARK") {
+			t.Fatalf("stdlibClientWithin 错误绝不能回显原始 URL 片段: %q", err2.Error())
+		}
+		// 经 validateProxyURL 的录入/保活路径：proxyCreate 的错误同样脱敏。
+		if _, err3 := proxyCreate("auditmark", marked, 1); err3 == nil {
+			t.Fatal("proxyCreate 必须拒绝解析失败 URL")
+		} else if strings.Contains(err3.Error(), "AUDIT-MARK") {
+			t.Fatalf("proxyCreate 错误绝不能回显原始 URL 片段: %q", err3.Error())
+		}
+	})
+
+	t.Run("仅端口无主机名必须拒绝", func(t *testing.T) {
+		if err := validateProxyURL("http://:8080"); err == nil {
+			t.Fatal("http://:8080（仅端口无主机名）必须被校验拒绝")
+		}
+		if _, err := stdlibClientWithin("http://:8080", 0); err == nil {
+			t.Fatal("stdlibClientWithin 必须拒绝仅端口无主机名的代理")
+		}
+		// 合法含主机名的对照不受影响。
+		if err := validateProxyURL("http://user:pass@127.0.0.1:8080"); err != nil {
+			t.Fatalf("合法带认证代理必须照常通过校验: %v", err)
+		}
+	})
 }

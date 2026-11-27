@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -181,21 +182,43 @@ var (
 
 // getStdlibClient returns an http.Client routed through proxyURL.
 // proxyURL must not be empty (caller checks).
-func getStdlibClient(proxyURL string) *http.Client {
+// R11-4（Oracle A5）：非空但解析失败的代理 URL 明确返回错误——存量非法
+// 库值在使用侧被拒，绝不构造 Transport.Proxy == nil 的直连 transport。
+func getStdlibClient(proxyURL string) (*http.Client, error) {
 	return stdlibClientWithin(proxyURL, rtCfg().RequestTimeout)
 }
 
 // getStdlibStreamClient 同 getStdlibClient，但不限整次请求的时长（见 getTLSStreamClient）。
-func getStdlibStreamClient(proxyURL string) *http.Client {
+func getStdlibStreamClient(proxyURL string) (*http.Client, error) {
 	return stdlibClientWithin(proxyURL, 0)
 }
 
 // stdlibClientWithin 是走 proxyURL、整次请求限时 timeout 秒（0 = 不限）的 http.Client。
-func stdlibClientWithin(proxyURL string, timeout int) *http.Client {
+// R11-4（Oracle A5）：url.Parse 失败的非空代理串**明确返回错误**——修复前
+// 解析失败静默退回 Transport.Proxy == nil 的普通 client（nil Proxy 即直连，
+// 与 fallback_direct 无关），携 Cookie 的请求静默直出本机 IP；此处缓存的
+// 任何一个 transport 都必须真正绑定代理（Proxy 非 nil）。空串不属于本函数
+// 契约（调用方已判空走直连路径），同样报错防御。
+func stdlibClientWithin(proxyURL string, timeout int) (*http.Client, error) {
+	if proxyURL == "" {
+		return nil, errors.New("proxy url required for stdlib proxied client")
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		// R12-1（Oracle M5/Reviewer #1）：net/url 的 *url.Error 会把原始
+		// 输入串格式化进错误文本（含 userinfo 认证/私有路径）——绝不拼进
+		// 对外错误，统一脱敏占位。
+		return nil, errors.New("invalid proxy url: parse error (refusing direct fallback)")
+	}
+	// R12-1（Oracle S4/Reviewer #1）：核 Hostname 而非 Host——`http://:8080`
+	// 这类仅端口的 authority 有非空 Host 但空 Hostname，必须拒绝。
+	if u.Hostname() == "" {
+		return nil, errors.New("invalid proxy url: missing host (refusing direct fallback)")
+	}
 	// 同 getTLSClient：超时进 key，面板改超时后换新客户端。
 	key := fmt.Sprintf("%s|%d", proxyURL, timeout)
 	if cached, ok := stdlibClientCache.Load(key); ok {
-		return cached.(*http.Client)
+		return cached.(*http.Client), nil
 	}
 	t := &http.Transport{
 		// 跟 Google 的 TLS 握手限时，同 tlsDialer：对话请求不限整次时长，握手没回音时
@@ -208,9 +231,7 @@ func stdlibClientWithin(proxyURL string, timeout int) *http.Client {
 		DisableCompression:  false,
 		// 走代理时不强求 HTTP/2，部分代理不支持。
 		ForceAttemptHTTP2: false,
-	}
-	if u, err := url.Parse(proxyURL); err == nil {
-		t.Proxy = http.ProxyURL(u)
+		Proxy:             http.ProxyURL(u),
 	}
 	c := &http.Client{
 		Timeout:   time.Duration(timeout) * time.Second,
@@ -221,7 +242,7 @@ func stdlibClientWithin(proxyURL string, timeout int) *http.Client {
 		},
 	}
 	stdlibClientCache.Store(key, c)
-	return c
+	return c, nil
 }
 
 // loadCookie reads the cookie file (Netscape one-line format or JSON).

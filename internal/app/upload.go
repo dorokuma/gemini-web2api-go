@@ -26,7 +26,15 @@ func uploadBytes(cookie string, authuser int, proxyURL string, data []byte, file
 
 // uploadBytesCtx 同 uploadBytes，ctx 取消（客户端断开）时中止上传。
 func uploadBytesCtx(ctx context.Context, cookie string, authuser int, proxyURL string, data []byte, filename string) (string, error) {
-	pushID, pctx, err := getUploadTokens(cookie, authuser, proxyURL)
+	return uploadBytesCtxForAccount(ctx, cookie, authuser, proxyURL, data, filename, 0)
+}
+
+// uploadBytesCtxForAccount 是 uploadBytesCtx 的账号透传版（R7-1）：
+// targetAccountID > 0 时上传 token 抓取 miss 的 /app Set-Cookie 回收只校验
+// 该行（停用/删除不写），绝不反查同身份同序号启用兄弟行；== 0 保持唯一
+// 反查兼容读（无归属上传入口）。
+func uploadBytesCtxForAccount(ctx context.Context, cookie string, authuser int, proxyURL string, data []byte, filename string, targetAccountID int64) (string, error) {
+	pushID, pctx, err := getUploadTokensForAccount(cookie, authuser, proxyURL, targetAccountID)
 	if err != nil {
 		return "", fmt.Errorf("取上传页面参数失败: %w", err)
 	}
@@ -172,7 +180,11 @@ func uploadPostCtxAux(ctx context.Context, url string, headers map[string]string
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		resp, err := getStdlibClient(proxyURL).Do(req)
+		sc, cerr := getStdlibClient(proxyURL)
+		if cerr != nil {
+			return 0, nil, nil, cerr
+		}
+		resp, err := sc.Do(req)
 		if err != nil {
 			return 0, nil, nil, err
 		}

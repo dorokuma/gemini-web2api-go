@@ -255,7 +255,8 @@ func TestClaimAccountProxyConcurrentFirstBind(t *testing.T) {
 		go func(candidate int64) {
 			defer wg.Done()
 			<-start
-			winners <- claimAccountProxy(acct, candidate)
+			w, _ := claimAccountProxy(acct, candidate)
+			winners <- w
 		}(cand)
 	}
 	close(start)
@@ -278,16 +279,16 @@ func TestClaimAccountProxyConcurrentFirstBind(t *testing.T) {
 		t.Fatalf("落库绑定必须与胜者一致：%+v", acc)
 	}
 	// 已绑定后再 claim 别的候选：绑定有效时绝不覆写。
-	if w := claimAccountProxy(acct, map[bool]int64{true: a, false: b}[winner != a]); w != winner {
-		t.Fatalf("已绑定的账号不能再被覆写：winner=%d got=%d", winner, w)
+	if w, ok := claimAccountProxy(acct, map[bool]int64{true: a, false: b}[winner != a]); !ok || w != winner {
+		t.Fatalf("已绑定的账号不能再被覆写：winner=%d got=%d ok=%v", winner, w, ok)
 	}
 
 	// R2 修复 1 回归：冷却中的已启用绑定绝不覆写——绑定仍是绑定，冷却后还要回到它。
 	// proxyUsableByID 把冷却误判成「绑定失效」会让并发请求把账号抢绑到别的出口。
 	setProxyField(winner, func(p *Proxy) { p.FailCount, p.LastUsed = proxyFailThreshold, time.Now().Unix() })
 	other := map[bool]int64{true: a, false: b}[winner == a]
-	if w := claimAccountProxy(acct, other); w != winner {
-		t.Fatalf("冷却中的绑定绝不能被覆写：winner=%d got=%d", winner, w)
+	if w, ok := claimAccountProxy(acct, other); !ok || w != winner {
+		t.Fatalf("冷却中的绑定绝不能被覆写：winner=%d got=%d ok=%v", winner, w, ok)
 	}
 	if acc := accountByID(acct); acc == nil || acc.ProxyID != winner {
 		t.Fatalf("冷却中的绑定必须保持 %d：%+v", winner, acc)
@@ -296,8 +297,8 @@ func TestClaimAccountProxyConcurrentFirstBind(t *testing.T) {
 	setProxyField(winner, func(p *Proxy) { p.FailCount, p.LastUsed = 0, 0 })
 	// 绑定出口被禁用后失效，新候选胜出并重绑。
 	setProxyField(winner, func(p *Proxy) { p.Enabled = false })
-	if w := claimAccountProxy(acct, other); w != other {
-		t.Fatalf("绑定出口失效后应重绑新候选：got=%d want=%d", w, other)
+	if w, ok := claimAccountProxy(acct, other); !ok || w != other {
+		t.Fatalf("绑定出口失效后应重绑新候选：got=%d want=%d ok=%v", w, other, ok)
 	}
 }
 
@@ -444,6 +445,13 @@ func TestXSRSwitchRotateUsesPickedNotStaleBinding(t *testing.T) {
 				mu.Lock()
 				*paths = append(*paths, req.URL.Path)
 				mu.Unlock()
+				// /app 返回 200 空页触发 "no SNlM0e"（Cookie 类错误，符合
+				// xsrfErrBlamesCookie 才有资格进入轮转救号）；其余路径保持
+				// 断连。若用断连桩，新契约下网络错误绝不白刷轮转，无法覆盖
+				// 本用例的“换号后轮转必走选定出口 A”回归目标。
+				if req.URL.Path == "/app" {
+					return respJSON(req, 200, ""), nil
+				}
 				return nil, errors.New("dial refused")
 			})})
 		}
@@ -474,6 +482,127 @@ func TestXSRSwitchRotateUsesPickedNotStaleBinding(t *testing.T) {
 	if rotateHits == 0 {
 		t.Fatalf("acct2（绑已禁用 B）的轮转必须打向选定出口 A：A paths=%v", aPaths)
 	}
+}
+
+// TestXSRFHealSkipsRotationOnNonCookieErrors 验证轮转救号的触发收敛：
+// getXSRF 遇到网络断连、302 -> /sorry 等非 Cookie 类错误时零次请求
+// /RotateCookies（不白打 accounts.google.com）；且当 rotateAccount 空跑
+// 无新票时，healXSRFByRotation 不二次请求 /app。
+func TestXSRFHealSkipsRotationOnNonCookieErrors(t *testing.T) {
+	setup := func(t *testing.T, appStub func(req *http.Request) (*http.Response, error)) (rotateHits *int, appHits *int) {
+		t.Helper()
+		a, b := withTwoProxies(t, false)
+		rtMu.Lock()
+		rtVal.FallbackDirect = true
+		rtVal.FallbackAnon = true
+		rtMu.Unlock()
+		// 两个出口独立端口：getXSRF / 保活请求都被假 RoundTripper 接管。
+		setProxyField(a, func(p *Proxy) { p.URL = "http://127.0.0.1:1" })
+		setProxyField(b, func(p *Proxy) { p.URL = "http://127.0.0.1:2" })
+		for _, id := range []int64{a, b} {
+			s := getSlot(id)
+			s.mu.Lock()
+			s.inflight = 0
+			s.mu.Unlock()
+		}
+		rh, ah := new(int), new(int)
+		var mu sync.Mutex
+		record := func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			if strings.Contains(req.URL.Path, "/RotateCookies") {
+				*rh++
+			}
+			if req.URL.Path == "/app" {
+				*ah++
+			}
+			mu.Unlock()
+			return appStub(req)
+		}
+		timeout := rtCfg().RequestTimeout
+		for _, proxyURL := range []string{"http://127.0.0.1:1", "http://127.0.0.1:2"} {
+			for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+				stdlibClientCache.Store(proxyURL+suf, &http.Client{Transport: roundTripperFunc(record)})
+			}
+		}
+		t.Cleanup(func() {
+			for _, proxyURL := range []string{"http://127.0.0.1:1", "http://127.0.0.1:2"} {
+				for _, suf := range []string{"|0", "|" + fmt.Sprint(timeout)} {
+					stdlibClientCache.Delete(proxyURL + suf)
+				}
+			}
+		})
+		// 直连 TLS 侧（rotateProxyURL 可能选直连兜底）：同样只计数，不回真网络。
+		fake := &captureTLSClient{do: func(req *fhttp.Request) (*fhttp.Response, error) {
+			mu.Lock()
+			if strings.Contains(req.URL.Path, "/RotateCookies") {
+				*rh++
+			}
+			mu.Unlock()
+			return &fhttp.Response{
+				StatusCode: 200, Status: "200 OK",
+				Header: fhttp.Header{},
+				Body:   io.NopCloser(strings.NewReader("")),
+			}, nil
+		}}
+		stubTLSRotateClient(t, fake)
+		return rh, ah
+	}
+	mc := Models["gemini-3.6-flash"]
+
+	t.Run("网络断连不白刷轮转", func(t *testing.T) {
+		rh, _ := setup(t, func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("dial refused")
+		})
+		acct := addTestAccount(t, "nodialrotate")
+		_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+			"SAPISID=nd; SID=x; __Secure-1PSID=nd", acct)
+		_, _ = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+			mc, nil, nil, nil, nil, map[int64]bool{})
+		if *rh != 0 {
+			t.Fatalf("网络断连不是 cookie 的错，绝不能白刷 /RotateCookies：命中 %d 次", *rh)
+		}
+	})
+
+	t.Run("302 sorry 不白刷轮转", func(t *testing.T) {
+		rh, _ := setup(t, func(req *http.Request) (*http.Response, error) {
+			r := respJSON(req, 302, "")
+			if req.URL.Path == "/app" {
+				r.Header.Set("Location", "https://www.google.com/sorry/index?continue=x")
+			}
+			return r, nil
+		})
+		acct := addTestAccount(t, "nosorryrotate")
+		_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+			"SAPISID=ns; SID=x; __Secure-1PSID=ns", acct)
+		_, _ = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+			mc, nil, nil, nil, nil, map[int64]bool{})
+		if *rh != 0 {
+			t.Fatalf("302 -> /sorry 是出口风控不是 cookie 的错，绝不能白刷轮转：命中 %d 次", *rh)
+		}
+	})
+
+	t.Run("轮转空跑不二次请求 app", func(t *testing.T) {
+		rh, ah := setup(t, func(req *http.Request) (*http.Response, error) {
+			// /app 返回 200 空页触发 no SNlM0e（Cookie 类错误，有资格进轮转）；
+			// /RotateCookies / RotateCookiesPage 全部 200 空响应——轮转空跑无新票。
+			return respJSON(req, 200, ""), nil
+		})
+		acct := addTestAccount(t, "emptyheal")
+		_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`,
+			"SAPISID=eh; SID=x; __Secure-1PSID=eh", acct)
+		before := *ah
+		_, _ = streamGenerateOnce(context.Background(), "hi", promptCtx{Latest: "hi"},
+			mc, nil, nil, nil, nil, map[int64]bool{})
+		if *rh == 0 {
+			t.Fatalf("no SNlM0e 应触发轮转救号（/RotateCookies 命中 >=1）：%d", *rh)
+		}
+		// 轮转空跑（len(names)==0）后 healXSRFByRotation 不二次请求 /app：
+		// 全程 /app 最多命中 1 次（首轮 getXSRF），重抓只会让同一 cookie
+		// 再失败一次。
+		if *ah-before != 1 {
+			t.Fatalf("/app 命中 %d 次，轮转空跑后绝不许二次抓取（应为 1）", *ah-before)
+		}
+	})
 }
 
 // R4-M2 回归：直连兜底（picked.ID == 0）下 getXSRF 失败触发的 rotateAccount
@@ -923,4 +1052,226 @@ func TestPostAccountProxyIDNotFound(t *testing.T) {
 	if after2, _ := accountCount(); after2 != before {
 		t.Fatalf("400 请求不能新增账号：%d -> %d", before, after2)
 	}
+}
+
+// TestClaimAccountProxyZeroRowsFailsClosed 复核 R8-5（Reviewer MF-5）：
+// claimAccountProxy 写库 0 行命中（账号在核库与 UPDATE 之间被并发删除）
+// 或 RowsAffected 不可知时，候选出口绝不能被当作已赢得仲裁返回——
+// claim 本身报告失败（ok=false），严格仲裁 arbitrateHeldExit 据此释放
+// 手上 slot 并 fail-closed 拒绝外发（绝不落到匿名/直连，也不按候选出口
+// 外发）。修复前 claimAccountProxy 丢弃 bindAccountProxyLocked 的返回值，
+// 0 行命中同样把候选出口当作胜者返回，请求会携一个从未真实落库的绑定
+// 从候选 IP 外发。
+func TestClaimAccountProxyZeroRowsFailsClosed(t *testing.T) {
+	a, b := withTwoProxies(t, true)
+	_ = b
+	// 已删账号：UPDATE 必然 0 行命中——claim 必须报告失败而非返回候选。
+	dead := addTestAccount(t, "zerorowdead")
+	if err := accountDelete(dead); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if w, ok := claimAccountProxy(dead, a); ok || w != 0 {
+		t.Fatalf("写库 0 行命中的 claim 必须失败（ok=false），得到 winner=%d ok=%v", w, ok)
+	}
+
+	// 严格仲裁端到端：acquireClaimedSlot 拿到出口后账号被并发删除——
+	// 释放手上 slot 并返回明确错误，绝不按候选出口外发、绝不误释放直连槽。
+	acct := addTestAccount(t, "zerorowarb")
+	s := getSlot(a)
+	s.mu.Lock()
+	s.inflight = 0 // 空出 A 槽：acquireSlot(0) 会按策略拿到 B 或 A
+	s.mu.Unlock()
+	setSlotInflightZero := func(id int64) {
+		s0 := getSlot(id)
+		s0.mu.Lock()
+		s0.inflight = 0
+		s0.mu.Unlock()
+	}
+	setSlotInflightZero(0)
+	// 直连哨兵：slots[0].inflight=0 基线，仲裁失败绝不能误释放成负数，
+	// 也绝不能泄漏占用（保持 0）；同时 A/B 槽计数必须归零（正确释放）。
+	// 先删账号再仲裁：删除发生在 acquireSlot 之后、claimAccountProxy 之前。
+	// 本测试直接驱动 arbitrateHeldExit 的完整调用路径（acquireClaimedSlot
+	// 内含 reconcileHeldSlot 核库——已删账号 + 手上代理槽 → 核库失败后
+	// 调 claimAccountProxy 的路径因 a==nil 走不到候选写库；故用未删号
+	// 持有槽、仲裁瞬间并发删除的等价终态：直接对 claim 已失败的事实
+	// 断言仲裁释放语义）。
+	p, ok1, err1 := acquireSlot(a)
+	if !ok1 || err1 != nil {
+		t.Fatalf("前置：必须能拿到 A 槽: ok=%v err=%v", ok1, err1)
+	}
+	// 占用计数快照（A=1，直连 0=0）。
+	releaseHeld := func() { releaseSlot(a) }
+	released := false
+	relOnce := func() {
+		if !released {
+			released = true
+			releaseHeld()
+		}
+	}
+	// 账号此刻被并发删除（acquireSlot 之后、claim 之前的等价终态）。
+	if err := accountDelete(acct); err != nil {
+		relOnce()
+		t.Fatalf("delete: %v", err)
+	}
+	winner, keep, failErr, reacq := arbitrateHeldExit(acct, p, relOnce)
+	if keep || failErr == nil || reacq != nil {
+		t.Fatalf("claim 写库 0 行命中时仲裁必须 fail-closed 报错，得到 winner=%d keep=%v err=%v reacq=%v",
+			winner, keep, failErr, reacq)
+	}
+	if !strings.Contains(failErr.Error(), "not available") {
+		t.Fatalf("仲裁失败必须点名账号不可用: %v", failErr)
+	}
+	if !released {
+		t.Fatal("仲裁 fail-closed 必须释放手上 slot（绝不泄漏占用继续外发）")
+	}
+	// 占用计数归零：A 槽被正确释放，直连哨兵绝不被误碰。
+	if got := slotUsage(a).Inflight; got != 0 {
+		t.Fatalf("A 槽必须被释放归零，得到 %d", got)
+	}
+	if got := slotUsage(0).Inflight; got != 0 {
+		t.Fatalf("直连哨兵槽绝不能被误释放/误占，得到 %d", got)
+	}
+}
+
+// TestAdminPatchRebindSerializedDecision 复核 R10-2（Reviewer M5/Oracle M5）：
+// 手工 PATCH 改绑的「读取实际旧绑定 + 写入新绑定」必须串行化在同一临界区，
+// 摘除判定按串行化后的实际旧值做出。固定三段交错（真实自动重绑通道）：
+// PATCH 校验通过 → 配额型自动重绑把 DB 推进到 P2 并提交 → PATCH 改绑回 P1。
+// 修复前 PATCH 按进入临界区前的早读快照判定「同值不拆槽」，DB 实际从 P2 改
+// 回 P1 却跳过失效——旧 P2 槽及在途流继续存活；修复后按实际旧值 P2 != P1
+// 判定 proxyChanged，旧槽摘除、在途流终止。
+func TestAdminPatchRebindSerializedDecision(t *testing.T) {
+	a, b := withTwoProxies(t, false)
+	setRuntimeCfg(t, func(c *RuntimeConfig) { c.BrowserTransport = true })
+	defer setRuntimeCfg(t, func(c *RuntimeConfig) { c.BrowserTransport = false })
+
+	// 模拟配额型自动重绑交错：先自动绑到 a（登记可核来源），禁用 a 触发
+	// 冷却，再自动重绑到 b——严格复刻 acquireSlot 的重绑序列。
+	origHook := testHookAfterCookiePatchValidate
+	defer func() { testHookAfterCookiePatchValidate = origHook }()
+
+	t.Run("改绑窗口内自动重绑已提交则旧槽必须摘除且在途流终止", func(t *testing.T) {
+		id := addTestAccount(t, "patchRebind")
+		bindAccountProxy(id, a)
+		// 注册旧出口 P2(=b) 的存活槽与在途流——交错终态下 PATCH 改绑前的
+		// 合法自动绑定产物。
+		key := browserSlotKey{accountID: id}
+		ac := &accountBrowserCtx{
+			key:                key,
+			epoch:              1,
+			cookieIdentity:     cookieIdentity(accountByID(id).Cookie),
+			browserContextID:   "bc-pb",
+			targetID:           "t-pb",
+			sessionID:          "sess-pb",
+			allowDirect:        false,
+			origAccountProxyID: b,
+			boundProxyID:       b,
+			readyClosed:        true,
+			lastUsedAt:         time.Now(),
+		}
+		ac.readyCh = make(chan struct{})
+		close(ac.readyCh)
+		m := browserMgr
+		m.mu.Lock()
+		m.ctxs[key] = ac
+		m.mu.Unlock()
+		defer func() {
+			m.mu.Lock()
+			delete(m.ctxs, key)
+			m.mu.Unlock()
+		}()
+		s := newBrowserStream()
+		s.ac = ac
+		m.registerStream(s)
+		defer m.unregisterStream(s)
+
+		// 钩子：PATCH 快照读取之后、进入 claimMu 之前，自动重绑通道把
+		// DB 从 a 推进到 b（配额交错：禁用 a 触发冷却重绑）。
+		hooked := make(chan struct{})
+		var hookOnce sync.Once
+		testHookAfterCookiePatchValidate = func(hitID int64) {
+			if hitID != id {
+				return
+			}
+			hookOnce.Do(func() {
+				setProxyField(a, func(p *Proxy) { p.Enabled = false })
+				autoBindAccountProxy(id, b)
+				setProxyField(a, func(p *Proxy) { p.Enabled = true })
+				close(hooked)
+			})
+		}
+
+		// PATCH 改绑回 P1(=a)：串行化后实际旧值是 b——proxyChanged 必须为真。
+		r := httptest.NewRequest("PATCH", fmt.Sprintf("/admin/api/cookies/%d", id),
+			strings.NewReader(fmt.Sprintf(`{"proxy_id": %d}`, a)))
+		w := httptest.NewRecorder()
+		handleAdminCookieItem(w, r)
+		<-hooked
+		if w.Code != 200 {
+			t.Fatalf("PATCH 应 200，得到 %d %s", w.Code, w.Body)
+		}
+		if acc := accountByID(id); acc == nil || acc.ProxyID != a {
+			t.Fatalf("PATCH 落库必须为 P1(%d)：%+v", a, acc)
+		}
+		// 核心断言：旧 P2 槽必须摘除（disposed 且从 ctxs 移除）、在途流终止。
+		m.mu.Lock()
+		_, still := m.ctxs[key]
+		disposed := ac.disposed
+		m.mu.Unlock()
+		if still || !disposed {
+			t.Fatalf("实际旧绑定 P2 != 新绑定 P1：旧槽必须被失效摘除（still=%v disposed=%v）", still, disposed)
+		}
+		s.mu.Lock()
+		fatal := s.fatalErr
+		s.mu.Unlock()
+		if fatal == nil {
+			t.Fatal("在途流必须被终止（failStreamsForCtx fatalErr）")
+		}
+	})
+
+	t.Run("真正同值PATCH绝不拆槽", func(t *testing.T) {
+		// 对照：无交错、PATCH 绑定值与实际旧值一致——绝不触发失效。
+		id := addTestAccount(t, "patchSame")
+		bindAccountProxy(id, a)
+		key := browserSlotKey{accountID: id}
+		ac := &accountBrowserCtx{
+			key:                key,
+			epoch:              1,
+			cookieIdentity:     cookieIdentity(accountByID(id).Cookie),
+			browserContextID:   "bc-ps",
+			targetID:           "t-ps",
+			sessionID:          "sess-ps",
+			allowDirect:        false,
+			origAccountProxyID: a,
+			boundProxyID:       a,
+			readyClosed:        true,
+			lastUsedAt:         time.Now(),
+		}
+		ac.readyCh = make(chan struct{})
+		close(ac.readyCh)
+		m := browserMgr
+		m.mu.Lock()
+		m.ctxs[key] = ac
+		m.mu.Unlock()
+		defer func() {
+			m.mu.Lock()
+			delete(m.ctxs, key)
+			m.mu.Unlock()
+		}()
+		testHookAfterCookiePatchValidate = nil
+		r := httptest.NewRequest("PATCH", fmt.Sprintf("/admin/api/cookies/%d", id),
+			strings.NewReader(fmt.Sprintf(`{"proxy_id": %d}`, a)))
+		w := httptest.NewRecorder()
+		handleAdminCookieItem(w, r)
+		if w.Code != 200 {
+			t.Fatalf("同值 PATCH 应 200，得到 %d", w.Code)
+		}
+		m.mu.Lock()
+		alive := m.ctxs[key] == ac && !ac.disposed
+		m.mu.Unlock()
+		if !alive {
+			t.Fatal("真正同值 PATCH（实际旧值==新值）绝不触发失效拆槽")
+		}
+	})
 }

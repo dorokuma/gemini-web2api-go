@@ -77,6 +77,14 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 	}
 }
 
+// testHookAfterCookiePatchValidate 仅供测试注入（生产恒为 nil），在
+// PATCH 快照读取之后、claimMu 串行化改绑之前触发。
+var testHookAfterCookiePatchValidate func(id int64)
+
+// testHookBeforeCookiePatchRebind 仅供测试注入（生产恒为 nil）：在
+// PATCH 的非绑定字段（含停用）已提交之后、绑定写之前触发。
+var testHookBeforeCookiePatchRebind func(id int64)
+
 // handleAdminCookies — GET 列出池 / POST 新增一条。
 func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -201,7 +209,9 @@ func handleAdminCookiePost(w http.ResponseWriter, id int64, action string) {
 			if a.ID == id {
 				iv, names, err := rotateAccount(a)
 				if err != nil {
-					writeJSON(w, 200, map[string]interface{}{"ok": false, "detail": err.Error()})
+					// 部分失败（如 1PSIDTS 401 但 SIDCC 已刷）与空跑都如实透出
+					// refreshed——前端据 ok=false 显示错误详情，绝不谎报成功。
+					writeJSON(w, 200, map[string]interface{}{"ok": false, "detail": err.Error(), "refreshed": names})
 					return
 				}
 				detail := "保活成功"
@@ -303,17 +313,29 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 		writeJSON(w, 400, map[string]string{"error": msg})
 		return
 	}
-	// before 快照：精准失效钩子（browserMgr.InvalidateAccount）按
-	// (before.ProxyID != *p.ProxyID) 或 (status -> disabled) 判定——只改
-	// priority/label/note/authuser（即使表单附带未变的 proxy_id）绝不
-	// 触发失效，在途流 0 中断。
+	// R10-2（Reviewer M5/Oracle M5）：改绑的「读实际旧值 + 写新绑定 +
+	// 清自动来源」由 rebindAccountProxyAtomic 在同一个 claimMu 临界区
+	// 原子完成，proxyChanged 按串行化后的**实际**旧值判定——修复前在
+	// 锁外提前读 before 快照：等待 claimMu 期间并发配额自动重绑提交
+	// 后，PATCH 把 DB 实际改回旧值却按早先的 false 跳过失效，旧出口
+	// 槽及在途流继续存活。真正同值 PATCH（old == new）依旧不拆槽。
 	before := accountByID(id)
-	proxyChanged := p.ProxyID != nil && before != nil && *p.ProxyID != before.ProxyID
+	// 测试钩子（生产恒 nil）：仅在快照读取之后触发一次，供回归测试
+	// 确定性构造「PATCH 已读快照、进入 claimMu 前的窗口内并发配额自
+	// 动重绑已提交」的交错终态。生产路径绝不经由它做任何判断，绝不
+	// 改变生产行为。
+	if hook := testHookAfterCookiePatchValidate; hook != nil {
+		hook(id)
+	}
+	proxyChanged := false
 	disabling := p.Status != nil && *p.Status == "disabled" &&
 		(before == nil || before.Status != "disabled")
-	if p.ProxyID != nil {
-		bindAccountProxy(id, *p.ProxyID)
-	}
+	// R11-6（Oracle A7-1/Reviewer #5）字段顺序保证失败闭环：**先写全部非
+	// 绑定字段，最后才提交绑定**——任一非绑定字段写失败时绑定尚未发生，
+	// 不存在「P2 已提交但失效被跳过、DB=P2 而旧 P1 在途流继续存活」的半
+	// 态（等效于绑定操作的原子回滚）；绑定自身写失败时后续字段未写，面板
+	// 拿到如实错误。修复前绑定最先提交，后续字段写错直接返回跳过失效，
+	// 重试同值 PATCH 又因实际同值不拆槽，旧出口流永久存活。
 	if p.AuthUser != nil {
 		if err := accountSetAuthUser(id, *p.AuthUser); err != nil {
 			writeCookiePatchErr(w, err)
@@ -326,10 +348,24 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 			return
 		}
 	}
+	// R12-5（Oracle M8/Reviewer #6）停用失效闭环：status 一旦成功提交为
+	// disabled，无论后续字段（尤其是最后的 proxy_id 绑定写）是否失败，
+	// 已提交的停用都必须完成 InvalidateAccount——否则错误返回后 DB 已
+	// disabled 而旧槽在途流继续存活，且原样重试时 before.Status 已是
+	// disabled，停用失效永远不会补做。未提交的改绑不作为拆槽理由（不变）。
+	statusBecameDisabled := false
 	if p.Status != nil {
 		if err := accountSetStatus(id, *p.Status); err != nil {
 			writeCookiePatchErr(w, err)
 			return
+		}
+		statusBecameDisabled = disabling
+	}
+	// invalidateCommittedDisable 在任一后续失败返回路径上补做已提交停用
+	// 的失效——只针对本 PATCH 已成功提交的停用，绝不为未提交的改绑拆槽。
+	invalidateCommittedDisable := func() {
+		if statusBecameDisabled && shouldUseBrowserTransport() {
+			browserMgr.InvalidateAccount(id, false, "disabled")
 		}
 	}
 	if p.Label != nil || p.Note != nil {
@@ -348,12 +384,38 @@ func handleAdminCookiePatch(w http.ResponseWriter, r *http.Request, id int64) {
 			curNote = *p.Note
 		}
 		if err := accountUpdateMeta(id, curLabel, curNote); err != nil {
+			invalidateCommittedDisable()
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
 	}
-	if shouldUseBrowserTransport() && (proxyChanged || disabling) {
-		browserMgr.InvalidateAccount(id, !disabling, "patched")
+	// 绑定最后提交：R11-6（Oracle A7-2）rebindAccountProxyAtomic 严格检
+	// 查 UPDATE 真实命中目标行——行不存在/写库失败时如实返回面板错误，
+	// 绝不按「已改绑」拆槽或中断在途流；仅确认提交成功后才按实际旧值
+	// 判定失效。真正同值 PATCH（old == new）依旧不拆槽。
+	if p.ProxyID != nil {
+		// 测试钩子（生产恒 nil）：在停用/元数据已提交、绑定写之前的
+		// 精确交错点执行一次——回归测试借此确定性构造「停用已提交但
+		// 绑定写失败」的 Oracle M8 部分提交事故。生产路径绝不经由它
+		// 做任何判断，绝不改变生产行为。
+		if hook := testHookBeforeCookiePatchRebind; hook != nil {
+			hook(id)
+		}
+		actualOld, updated, rerr := rebindAccountProxyAtomic(id, *p.ProxyID)
+		if rerr != nil || !updated {
+			if rerr == nil {
+				rerr = fmt.Errorf("账号 #%d 的绑定未能落库（未执行任何改绑）", id)
+			}
+			// R12-5：绑定写失败不影响已提交停用的失效义务——先补做停用
+			// 失效再如实返回错误，绝不留下已停用账号的在途流。
+			invalidateCommittedDisable()
+			writeCookiePatchErr(w, rerr)
+			return
+		}
+		proxyChanged = before != nil && *p.ProxyID != actualOld
+	}
+	if shouldUseBrowserTransport() && (proxyChanged || statusBecameDisabled) {
+		browserMgr.InvalidateAccount(id, !statusBecameDisabled, "patched")
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }

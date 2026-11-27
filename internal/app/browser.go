@@ -59,6 +59,24 @@ func browserErr(format string, args ...interface{}) error {
 	return &browserLocalError{err: fmt.Errorf(format, args...)}
 }
 
+// 浏览器传输层三层超时预算（严格递增，不得倒挂）：
+//
+//	browserAppNavTimeout < browserCtxBuildTimeout < browserFetchTokensTimeout。
+//
+// 首航卡死时内层先到期并经 readyCh 向外层传递真实导航超时错，外层留足余量，
+// 绝不提前截胡吐出裸 context.DeadlineExceeded。三者是可覆写变量：单测换短
+// 时钟值才能离线断言「超时不倒挂、无 probe 拖尾」。
+var (
+	// browserAppNavTimeout：最内层 navigateAndWaitAppCookie 首航 /app 超时。
+	browserAppNavTimeout = 18 * time.Second
+	// browserCtxBuildTimeout：acquireClaimCreateLocked 与 recreateAccountTab 的
+	// 独立 buildCtx 兜底总超时（不连坐短命客户端 ctx，又有界回收孤儿构建）。
+	browserCtxBuildTimeout = 25 * time.Second
+	// browserFetchTokensTimeout：xsrf.go fetchAppTokens 传入的预算，以及
+	// fetchAppTokensViaBrowserCtx 在调用方 ctx 未设 deadline 时的兜底超时。
+	browserFetchTokensTimeout = 30 * time.Second
+)
+
 // errBrowserSkipAux 是辅助/管理入口（allowSwitch=false）的专用哨兵：
 // 「这条请求不该借驻留槽，请回退纯 Go HTTP」。它**刻意不是**
 // browserLocalError——浏览器本身没有坏，只是辅助入口点名了未建槽位/
@@ -691,6 +709,40 @@ func browserAccountFromHeaders(headers map[string]string) *CookieAccount {
 	return fallback
 }
 
+// enabledAccountByCookieAndAuthuser 是有副作用写回路径专用的**精确匹配**
+// 账号查找（R4-3，Reviewer MF-3）：仅当存在 status=="enabled" 且
+// cookieIdentity 与 AuthUser 同时精确命中的行才返回——绝不 fallback 到同
+// 身份不同 authuser 的兄弟行。读路径 browserAccountFromHeaders 的兼容
+// fallback 不受影响（读 token 借用兄弟行无害）；写回必须精确，否则目标
+// 账号停用/删除时会把 /u/N 的票据写进另一行。
+func enabledAccountByCookieAndAuthuser(cookie string, authuser int) *CookieAccount {
+	ident := cookieIdentity(cookie)
+	if ident == "|" {
+		return nil
+	}
+	// R5-3（Reviewer MF-3）：手工添加允许同一身份/序号并存两行——
+	// 命中两行以上时无法确定归属，直接返回 nil（绝不猜首行把票据
+	// 写进错误的账号）。
+	var hit *CookieAccount
+	matches := 0
+	for _, a := range accountList() {
+		if a.Status != "enabled" || cookieIdentity(a.Cookie) != ident {
+			continue
+		}
+		if a.AuthUser == authuser {
+			matches++
+			if hit == nil {
+				cp := a
+				hit = &cp
+			}
+		}
+	}
+	if matches != 1 {
+		return nil
+	}
+	return hit
+}
+
 // shutdownBrowser 回收常驻浏览器。saveRuntimeConfig 在 browser_transport 被
 // 关掉时异步调用（关掉就该立刻释放内存，不该等下次进程重启）。
 func shutdownBrowser() {
@@ -995,12 +1047,87 @@ func (m *browserManager) waitPageLoad(ctx context.Context, client *cdpClient, se
 }
 
 // navigateAndWaitApp 导航到 https://gemini.google.com/app 并等它真正就绪，
-// 严格 fail-closed 返回 error。
+// 严格 fail-closed 返回 error。薄包装转调 navigateAndWaitAppCookie（匿名/旧
+// 调用点无账号 Cookie 上下文，cookie 传空——跨源快速失败照常生效，仅
+// MissingOSID 判定恒 false）。
 func (m *browserManager) navigateAndWaitApp(ctx context.Context, client *cdpClient, sess string) error {
+	return m.navigateAndWaitAppCookie(ctx, client, sess, "")
+}
+
+// evalNavProbeResult 判定一次导航探针（location.origin/readyState + href）
+// 的四态：
+//   - done=true, err=nil：已在 https://gemini.google.com 且 readyState 完成；
+//   - done=false：about:blank / 重定向中间态 / 未识别状态，继续等待；
+//   - done=true, err=*appPageStatusError：跨源终态拦截页（accounts.google.com
+//     或 (www.)google.com/sorry）快速失败，cookie 用于 MissingOSID 判定。
+func evalNavProbeResult(val, cookie string) (done bool, observed string, err error) {
+	if val == "" {
+		return false, "", nil
+	}
+	originReady, href, _ := strings.Cut(val, "\n")
+	// R4-4（Reviewer MF-4）：href 仅在函数内部用于判定；一切诊断输出
+	//（observed / lastObserved / 超时报错）只留 origin/readyState 白名单——
+	// href 的 query/fragment 可能带敏感参数，绝不能进错误串、请求表或
+	// 客户端 502。
+	observed = originReady
+	i := strings.LastIndexByte(originReady, '/')
+	if i < 0 {
+		return false, observed, nil
+	}
+	origin, readyState := originReady[:i], originReady[i+1:]
+	// 态 1：成功就绪。
+	if origin == "https://gemini.google.com" && readyState == "complete" {
+		return true, observed, nil
+	}
+	// 态 1.5（R3-8 / Oracle OBS-1）：chrome-error:// 快速失败——导航落在
+	// chrome-error://chromewebdata/（代理/网络错误且 Page.navigate 未返回
+	// errorText 时）是 opaque origin（origin=="null"）且 readyState 恒为
+	// complete，若按态 2 继续等待会白等 18s navCtx 超时。排在态 2 之前
+	// 显式识别：返回页内上游网络错（非 browserLocalError，可计代理健康度
+	// 快速换号），与 errorText 分支归类完全一致。about:blank 不受此分支
+	// 影响（href 不以 chrome-error: 前缀开头）。
+	if readyState == "complete" && strings.HasPrefix(href, "chrome-error:") {
+		return true, originReady, pageFetchErr("navigate /app: chrome-error")
+	}
+	// 态 2：空白页或跳转未定局，必须继续等待（守住 about:blank 与 302 中间态）。
+	if origin == "null" || strings.HasPrefix(href, "about:") || readyState != "complete" {
+		return false, observed, nil
+	}
+	// 态 3：跨源终态拦截页快速失败——只在 readyState=="complete" 时判定。
+	target := href
+	if target == "" {
+		target = origin + "/"
+	}
+	u, perr := url.Parse(target)
+	if perr != nil || u.Hostname() == "" {
+		return false, observed, nil
+	}
+	if strings.EqualFold(u.Hostname(), "accounts.google.com") {
+		return true, observed, appPageError(302, target, cookie)
+	}
+	if (strings.EqualFold(u.Hostname(), "www.google.com") || strings.EqualFold(u.Hostname(), "google.com")) &&
+		(u.Path == "/sorry" || strings.HasPrefix(u.Path, "/sorry/")) {
+		return true, observed, appPageError(302, target, cookie)
+	}
+	// 态 4：其它未识别同/跨源状态继续等待，直至切回目标源或 navCtx 超时。
+	return false, observed, nil
+}
+
+// navProbeExpr 是导航探针 JS：首行 <origin>/<readyState>（保留 "location.origin"
+// 子串，fakeCDPServer 与存量单测按它路由桩应答），第二行带 location.href
+// 供跨源重定向快速失败精确判定。
+const navProbeExpr = `location.origin + "/" + document.readyState + "\n" + (typeof location.href === "string" ? location.href : "")`
+
+// navigateAndWaitAppCookie 是 navigateAndWaitApp 的 Cookie 感知版：除原契约
+// 外，跨源落地 accounts.google.com / (www.)google.com/sorry 毫秒级快速失败
+// 返回 *appPageStatusError（含 Location 与 MissingOSID），不再死等导航超时；
+// navCtx 到期后 0ms 返回，绝不再发任何 Runtime.evaluate RPC（消除 5s probe
+// 拖尾——探测子上下文从 navCtx 派生，绝不越过其截止线）。
+func (m *browserManager) navigateAndWaitAppCookie(ctx context.Context, client *cdpClient, sess, cookie string) error {
 	if client == nil {
 		return browserErr("cdp client gone")
 	}
-	navCtx, navCancel := context.WithTimeout(ctx, 25*time.Second)
+	navCtx, navCancel := context.WithTimeout(ctx, browserAppNavTimeout)
 	defer navCancel()
 	loadCh := make(chan struct{}, 1)
 	cancelOnce := client.OnceSession(sess, "Page.loadEventFired", func(evt cdpEvent) {
@@ -1015,11 +1142,25 @@ func (m *browserManager) navigateAndWaitApp(ctx context.Context, client *cdpClie
 	}
 	if err := client.Call(navCtx, sess, "Page.navigate",
 		map[string]interface{}{"url": "https://gemini.google.com/app"}, &navRes); err != nil {
+		// RPC 自身超时（未及时返回）：连接仍存活且非主动取消时，这不是本地
+		// 浏览器故障而是页内上游超时——返回非 browserLocalError（不带 browser:
+		// 前缀）且 %w 保留 context.DeadlineExceeded 链，isUpstreamTimeout 判真、
+		// 可计代理健康度。真断连/主动取消保持原 browserLocalError 语义不扣代理分。
+		if client != nil && !client.Closed() && !errors.Is(ctx.Err(), context.Canceled) &&
+			(errors.Is(err, context.DeadlineExceeded) || navCtx.Err() == context.DeadlineExceeded) {
+			return fmt.Errorf("page fetch error: navigate /app: %w", err)
+		}
 		return browserErr("navigate /app: %w", err)
 	}
 	if navRes.ErrorText != "" {
-		return browserErr("navigate /app: %s", navRes.ErrorText)
+		// 代理/网络错误（net::ERR_PROXY_CONNECTION_FAILED 等）：页内上游故障，
+		// 非 browserLocalError——与 Go 侧 client.Do 网络错同义，计代理健康度
+		// 不伤账号、可换号重试。
+		return pageFetchErr(fmt.Sprintf("navigate /app: %s", navRes.ErrorText))
 	}
+	lastObserved := "no load event"
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-client.Done():
@@ -1034,29 +1175,47 @@ func (m *browserManager) navigateAndWaitApp(ctx context.Context, client *cdpClie
 					}
 				})
 			}
+		case <-ticker.C:
+			// 兜底周期探测：防 OnceSession 重注册的微秒窗口漏掉 load 事件；
+			// navCtx 已到期时绝不发（下方 Done 分支先返回）。
+			if navCtx.Err() != nil {
+				continue
+			}
 		case <-navCtx.Done():
+			// 0ms 立即返回，绝不在超时后再发任何 Runtime.evaluate RPC。
+			if client.Closed() || errors.Is(ctx.Err(), context.Canceled) {
+				// 停机/拆槽主动取消：browserLocalError，归本地终止不记上游。
+				return browserErr("navigate /app: %w", navCtx.Err())
+			}
+			// 真导航超时：非 browserLocalError，且 %w 包裹 DeadlineExceeded——
+			// isUpstreamTimeout 判真、可计代理健康度、classNetFail。
+			return fmt.Errorf("page fetch error: navigate /app did not reach gemini.google.com origin (got %q): %w",
+				lastObserved, context.DeadlineExceeded)
+		}
+		if navCtx.Err() != nil {
+			continue
 		}
 		var out struct {
 			Result struct {
 				Value string `json:"value"`
 			} `json:"result"`
 		}
-		rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
-		err := client.Call(rctx, sess, "Runtime.evaluate",
+		// 探测子上下文必须从 navCtx 派生：绝不越过 navCtx 截止线再拖 5s。
+		rctx, rcancel := context.WithTimeout(navCtx, 5*time.Second)
+		evalErr := client.Call(rctx, sess, "Runtime.evaluate",
 			map[string]interface{}{
-				"expression":   `location.origin + "/" + document.readyState`,
+				"expression":   navProbeExpr,
 				"awaitPromise": false,
 			}, &out)
 		rcancel()
-		if err == nil && out.Result.Value == "https://gemini.google.com/complete" {
-			return nil
-		}
-		if navCtx.Err() != nil {
-			got := out.Result.Value
-			if err != nil {
-				got = "origin probe failed"
+		if evalErr == nil {
+			done, observed, probeErr := evalNavProbeResult(out.Result.Value, cookie)
+			lastObserved = observed
+			if done {
+				return probeErr
 			}
-			return browserErr("navigate /app did not reach gemini.google.com origin (got %q)", got)
+		} else {
+			lastObserved = "origin probe failed"
 		}
 	}
 }
@@ -1385,22 +1544,50 @@ func (m *browserManager) doBrowserStreamRequestCtx(ctx context.Context, proxyURL
 			!strings.EqualFold(u.Hostname(), "gemini.google.com") {
 			stopWatch()
 			s.Abort(m)
-			return 0, nil, newAppPageStatusError(302, hdr.url)
+			// 跨源终态带上账号 Cookie 判定 MissingOSID（登录页/sorry 拦截页
+			// 走完整失效 Cookie 逻辑）。
+			return 0, nil, appPageError(302, hdr.url, accountCookieSnapshot(account))
 		}
 	}
 	delivered = true
 	releaseHeld = false
-	return hdr.status, &streamReadCloser{s: s, m: m, stopWatch: stopWatch, release: release}, nil
+	return hdr.status, &streamReadCloser{s: s, m: m, stopWatch: stopWatch, release: release,
+		location: headerValueCI(hdr.headers, "location")}, nil
+}
+
+// headerValueCI 取响应头（键大小写不敏感），取不到返回空串。
+func headerValueCI(headers map[string]string, name string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
+
+// accountCookieSnapshot 取账号当前 Cookie 串用于 MissingOSID 判定：优先
+// accountByID 的库内最新值（在飞期间可能已被保活刷新），兜底传入快照。
+func accountCookieSnapshot(account *CookieAccount) string {
+	if account == nil {
+		return ""
+	}
+	if account.ID > 0 {
+		if fresh := accountByID(account.ID); fresh != nil && fresh.Cookie != "" {
+			return fresh.Cookie
+		}
+	}
+	return account.Cookie
 }
 
 // streamReadCloser 把 PipeReader + Abort + release 租约绑成一个 io.ReadCloser。
 // Close 无条件：关 pipeR、本地 fail、注销、停 ctx 盯梢、异步 Abort、归还
-// inFlight 租约。
+// inFlight 租约。location 记响应的 Location 头（重定向诊断透传用）。
 type streamReadCloser struct {
 	s         *browserStream
 	m         *browserManager
 	stopWatch func() bool
 	release   func()
+	location  string
 	once      sync.Once
 }
 
@@ -1489,10 +1676,15 @@ func (m *browserManager) fetchAppTokensViaBrowser(ctx context.Context,
 }
 
 // fetchAppTokensViaBrowserCtx 同 fetchAppTokensViaBrowser，额外收 proxyURL
-// 供槽位分键。
+// 供槽位分键。超时预算严格外宽内窄：仅当调用方 ctx 未设 deadline 时才套
+// browserFetchTokensTimeout（30s）兜底——此前无条件 20s 会在 18s 首航超时
+// 传出来之前反向截胡，吐出裸 context.DeadlineExceeded。
 func (m *browserManager) fetchAppTokensViaBrowserCtx(ctx context.Context, proxyURL string,
 	account *CookieAccount, allowSwitch bool, exclude map[int64]bool) (xsrfEntry, error) {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	var cancel context.CancelFunc = func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		ctx, cancel = context.WithTimeout(ctx, browserFetchTokensTimeout)
+	}
 	defer cancel()
 	// 辅助入口（allowSwitch=false）前置守卫：槽位未就绪一律
 	// errBrowserSkipAux——辅助入口既无权拉起浏览器，也无权借用别的号的 jar。
@@ -1525,7 +1717,11 @@ func (m *browserManager) fetchAppTokensViaBrowserCtx(ctx context.Context, proxyU
 		return xsrfEntry{}, err
 	}
 	if status != 200 {
-		return xsrfEntry{}, newAppPageStatusError(status, "")
+		loc := ""
+		if src, ok := body.(*streamReadCloser); ok {
+			loc = src.location
+		}
+		return xsrfEntry{}, appPageError(status, loc, accountCookieSnapshot(account))
 	}
 	e := xsrfEntry{fetched: time.Now()}
 	if m := snlm0eRe.FindSubmatch(data); m != nil {
@@ -1652,10 +1848,11 @@ func (m *browserManager) stopImpl(ctx context.Context, final bool) {
 		if !ac.disposed && !ac.creating && ac.key.accountID > 0 &&
 			ac.browserContextID != "" {
 			syncTargets = append(syncTargets, cookieSyncTarget{
-				bcID:  ac.browserContextID,
-				accID: ac.key.accountID,
-				epoch: ac.epoch,
-				ident: ac.cookieIdentity,
+				bcID:     ac.browserContextID,
+				accID:    ac.key.accountID,
+				epoch:    ac.epoch,
+				ident:    ac.cookieIdentity,
+				authuser: ac.authuser,
 			})
 		}
 		if snap := m.detachSnapLocked(ac, browserErr("browser shut down")); snap.ac != nil {

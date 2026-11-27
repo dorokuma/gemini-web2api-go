@@ -92,7 +92,12 @@ func Run() {
 	getDB()
 	initRuntimeConfig() // 面板改过的运行时配置盖在启动配置之上
 	loadProxies()
-	seedProxiesFromConfig() // --proxy / 遗留静态代理并进代理池
+	// R12-1（Oracle M4）fail-closed：非空但非法的 --proxy 是显式配置错误，
+	// 必须终止启动——继续跑会把非法显式代理静默解释为直连（池空退化）。
+	if err := seedProxiesFromConfig(); err != nil { // --proxy / 遗留静态代理并进代理池
+		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		os.Exit(1)
+	}
 	seedCookiesFromConfig() // --cookie-file / 遗留单 cookie 并进 cookie 池
 	resolvedAPIKey := initAPIKey(*apiKey)
 	initTokenizer()

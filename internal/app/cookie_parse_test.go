@@ -218,3 +218,39 @@ func TestCookieAcctViewHasOSID(t *testing.T) {
 		t.Error("缺 OSID 的账号 has_osid 应为 false")
 	}
 }
+
+// TestCookieValuesEqualOrderedList 复核 R10-8（Reviewer S2/Oracle S2）：
+// cookieValuesEqual 必须按解析后的实际有序 (name, value) 列表逐项比对——
+// 仅忽略纯分隔符格式差异，空值键与缺失严格区分、同名多项逐项保留比对、
+// 键序差异算变化。表驱动同一用例覆盖全部五类判据（单一修复单元的回归）。
+func TestCookieValuesEqualOrderedList(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		// 纯分隔符格式差异（"; " vs ";" / 首尾空白）：忽略——等价。
+		{"分隔符空格差异忽略", "k=v; x=y", "k=v;x=y", true},
+		{"逐字节相同", "k=v; x=y", "k=v; x=y", true},
+		// 空值键 k= 与缺失键严格区分——绝不能让 Jar 新增的 k= 静默丢失写库。
+		{"空值键与缺失区分", "k=", "x=y", false},
+		{"空值键与缺失区分2", "a=1; k=", "a=1", false},
+		{"双侧同位空值键等价", "a=1; k=", "a=1;k=", true},
+		// 同名多项逐项保留比对——DB k=x;k=y、Jar k=x 合并两项皆 x，
+		// 只认首值会误判净零跳过写库，尾部旧票永不更新。
+		{"同名多项值变化检出", "k=x; k=y", "k=x; k=x", false},
+		{"同名多项逐项相同等价", "k=x; k=y", "k=x;k=y", true},
+		// 键序差异算变化——merge 保序下纯重排在真实路径不存在。
+		{"键序差异算变化", "a=1; b=2", "b=2; a=1", false},
+		// 长度差异直接不等。
+		{"项数差异不等", "a=1", "a=1; b=2", false},
+		// 值差异检出。
+		{"值差异检出", "k=x", "k=y", false},
+	}
+	for _, tc := range cases {
+		if got := cookieValuesEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: cookieValuesEqual(%q, %q) = %v, want %v",
+				tc.name, tc.a, tc.b, got, tc.want)
+		}
+	}
+}

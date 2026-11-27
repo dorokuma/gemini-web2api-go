@@ -767,7 +767,10 @@ func classifyError(errStr string) string {
 		// 45s 防雪崩短冷却：不是上游故障也不是限流满，面板单列一类——
 		// 连续出现说明这批账号在被上游集中拒绝（多半 cookie 过期或被风控）。
 		return "accounts_cooling_down"
-	case strings.Contains(errStr, "upstream HTTP"):
+	case strings.Contains(errStr, "upstream HTTP"), strings.Contains(errStr, "[upstream_http]"):
+		// [upstream_http] 是落库错误串的 reason 前缀（recordUpstreamFailure）：
+		// "fetch /app: HTTP 302" 类导航/页内重定向不含 "upstream HTTP" 子串，
+		// 登录 302 / 401 必须归 upstream_http_error 而不是误落 network 兜底。
 		return "upstream_http_error"
 	case strings.Contains(errStr, "unknown model"), strings.Contains(errStr, "not supported"):
 		return "bad_request"

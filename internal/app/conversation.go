@@ -214,7 +214,11 @@ func getAnonSession(proxyURL string) (string, error) {
 			for k, v := range appPageHeaders() {
 				r.Header.Set(k, v)
 			}
-			resp, err := getStdlibClient(proxyURL).Do(r)
+			sc, cerr := getStdlibClient(proxyURL)
+			if cerr != nil {
+				return nil, nil, nil, cerr
+			}
+			resp, err := sc.Do(r)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -290,7 +294,9 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 		if conv.fstate != nil {
 			conv.fstate.markTouched(conv.accountID)
 		}
-		if tok, err := getXSRF(conv.cookie, conv.authuser, proxyURL); err == nil {
+		// R7-1：多轮会话已知 conv.accountID 必须透传到底——纯 Go /app 回收
+		// 写回只校验该行（停用/删除不写），绝不反查同身份同序号启用兄弟行。
+		if tok, err := getXSRFForAccount(conv.cookie, conv.authuser, proxyURL, conv.accountID); err == nil {
 			xsrf = tok
 		} else {
 			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID},
@@ -406,8 +412,20 @@ func streamGenerateConv(ctx context.Context, prompt string, mc ModelConfig, conv
 			lastTTFB = ttfb
 		}
 		if len(setCookie) > 0 && conv.cookie != "" {
+			// 请求身份快照：发请求当时的身份（在多轮重试头同步合并前算出）。
+			expectedIdent := cookieIdentity(conv.cookie)
 			if merged := mergeSetCookieForHost(conv.cookie, setCookie, endpoint, geminiCookieTargetHost); merged != conv.cookie {
 				conv.cookie = merged
+				// 当前重试头同步带新值，并持久化写回 accounts 表（登录态多轮
+				// 会话，accountID==0 的匿名会话载体无账号可写）。BrowserTransport
+				// 开启时浏览器流的 setCookie 为 nil，此处仅纯 Go/回退流触发。
+				geminiHeaders["Cookie"] = merged
+				if conv.isLogin && conv.accountID > 0 {
+					// R6-2：多轮会话整条按 conv.authuser（/u/N）发出——序号
+					// 一并传入，长流期间管理员 PATCH 只改序号时旧序号
+					// 票据绝不写进新序号行。
+					mergeAccountSetCookie(conv.accountID, setCookie, endpoint, expectedIdent, conv.authuser)
+				}
 			}
 		}
 		// Argon 身份缺失修正归类（同 streamGenerateOnce）：出错话术 →
